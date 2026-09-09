@@ -460,7 +460,8 @@ def constValue (name : String) (ll : Nat := Numfmt.defaultLLDigits) (fileName : 
   | "bitswidth" => .int 32 | "longbitswidth" => .int 64 | "byteswidth" => .int 32 | "maxabschar" => .int 255
   | "intlengths" => .int 3 | "intshorths" => .int 1 | "reallengths" => .int 3 | "realshorths" => .int 1
   | "bitslengths" => .int 3 | "byteslengths" => .int 2
-  | "nullcharacter" => .char 0 | "blank" => .char 32 | "flip" => .char 84 | "flop" => .char 70
+  | "nullcharacter" | "nullchar" => .char 0 | "blank" => .char 32 | "flip" => .char 84 | "flop" => .char 70
+  | "maxbits" => .bits 4294967295 | "bitsshorths" => .int 1
   | "errorchar" => .char 42
   | "standout" => .file 0 | "standin" => .file 1 | "standerror" => .file 2 | "standback" => .file 3
   | "standoutchannel" => .int 0 | "standinchannel" => .int 1 | "standbackchannel" => .int 3

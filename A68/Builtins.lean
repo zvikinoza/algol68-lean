@@ -33,7 +33,8 @@ def consts : List (String × Mode) :=
    ("bitswidth", INT), ("longbitswidth", INT), ("byteswidth", INT), ("maxabschar", INT),
    ("intlengths", INT), ("intshorths", INT), ("reallengths", INT), ("realshorths", INT),
    ("bitslengths", INT), ("byteslengths", INT),
-   ("nullcharacter", char), ("blank", char), ("flip", char), ("flop", char), ("errorchar", char),
+   ("nullcharacter", char), ("nullchar", char), ("blank", char), ("flip", char), ("flop", char), ("errorchar", char),
+   ("maxbits", bits 0), ("bitsshorths", INT),
    ("standout", REFFILE), ("standin", REFFILE), ("standerror", REFFILE), ("standback", REFFILE),
    ("standoutchannel", channel), ("standinchannel", channel), ("standbackchannel", channel),
    ("newline", PROCFILE), ("newpage", PROCFILE), ("space", PROCFILE), ("backspace", PROCFILE),
@@ -90,6 +91,7 @@ def procs : List (String × Mode) :=
    ("associate", proc [REFFILE, ref STRING] void), ("reset", proc [REFFILE] void),
    ("lock", proc [REFFILE] void), ("scratch", proc [REFFILE] void),
    ("onlogicalfileend", proc [REFFILE, proc [REFFILE] bool] void),
+   ("onphysicalfileend", proc [REFFILE, proc [REFFILE] bool] void),
    ("onfileend", proc [REFFILE, proc [REFFILE] bool] void),
    ("onlineend", proc [REFFILE, proc [REFFILE] bool] void),
    ("onpageend", proc [REFFILE, proc [REFFILE] bool] void),
@@ -101,7 +103,7 @@ def procs : List (String × Mode) :=
    ("system", proc [STRING] INT), ("argc", proc [] INT), ("argv", proc [INT] STRING),
    ("bitspack", proc [row 1 false bool] (bits 0)), ("bytespack", proc [STRING] (bytes 0)),
    ("charnumber", proc [REFFILE] INT), ("linenumber", proc [REFFILE] INT), ("pagenumber", proc [REFFILE] INT),
-   ("makeconv", proc [REFFILE] void)]
+   ("makeconv", proc [REFFILE] void), ("maketerm", proc [REFFILE, STRING] void)]
 
 def lookup (name : String) : Option Mode :=
   (consts.lookup name).orElse fun _ => procs.lookup name

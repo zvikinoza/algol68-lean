@@ -45,6 +45,7 @@ structure FileSt where
   assoc   : Option Value := none             -- REF STRING for associated files
   onEnd   : Option Value := none             -- PROC (REF FILE) BOOL, on logical file end
   onValue : Option Value := none             -- PROC (REF FILE) BOOL, on value error
+  onLine  : Option Value := none             -- PROC (REF FILE) BOOL, on line end
   term    : List Nat := []                   -- string terminators (make term)
   writing : Bool := false
   reading : Bool := false
@@ -1261,6 +1262,23 @@ partial def valueError (fid : Nat) (msg : String) : M Unit := do
     | _ => rtErr msg
   | none => rtErr msg
 
+/-- Skip one character; at the end of a line this is a line-end event: the mender (if any)
+    is called and, when it returns TRUE (or when there is none), reading continues on the
+    next line. -/
+partial def skipChar (fid : Nat) : M Unit := do
+  match (← peekChar fid) with
+  | some 10 =>
+    let f ← getFile fid
+    match f.onLine with
+    | some h =>
+      let r ← callValue h [.file fid]
+      match r with
+      | .bool true => let _ ← readChar fid
+      | _ => rtErr "end of line reached while reading"
+    | none => let _ ← readChar fid
+  | some _ => let _ ← readChar fid
+  | none => pure ()   -- a68g: skipping a character at end of file is not an event
+
 /-- Reload an associated file from its string if the string changed. -/
 partial def refreshAssoc (fid : Nat) : M Unit := do
   let f ← getFile fid
@@ -1390,7 +1408,7 @@ partial def readInto (fid : Nat) (m : Mode) (r : Value) : M Unit := do
     match r with
     | .builtin "newline" => skipLine fid
     | .builtin "newpage" => skipLine fid
-    | .builtin "space" => let _ ← readChar fid
+    | .builtin "space" => skipChar fid
     | _ => pure ()
   | _ => rtErr s!"cannot read into a value of mode {modeName m}"
 
@@ -1422,7 +1440,7 @@ partial def readInsertion (fid : Nat) (s : String) : M Unit := do
   -- insertions are skipped on input, character by character
   for c in s.toList do
     if c == '\n' then skipLine fid
-    else let _ ← readChar fid
+    else skipChar fid
 
 partial def readScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (r : Value) : M FmtState := do
   -- pull the next pattern, consuming insertions from the input
@@ -1728,7 +1746,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let fs ← getFile fid
     setFile fid { fs with term := ts.toList.map (·.toNat) }
     return .void
-  | "onlogicalfileend", [f, h] | "onfileend", [f, h] =>
+  | "onlogicalfileend", [f, h] | "onfileend", [f, h] | "onphysicalfileend", [f, h] =>
     let fid ← fileIdOf f
     let fs ← getFile fid
     setFile fid { fs with onEnd := some h }
@@ -1737,6 +1755,11 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let fid ← fileIdOf f
     let fs ← getFile fid
     setFile fid { fs with onValue := some h }
+    return .void
+  | "onlineend", [f, h] =>
+    let fid ← fileIdOf f
+    let fs ← getFile fid
+    setFile fid { fs with onLine := some h }
     return .void
   | "whole", [x, w] =>
     let width ← expectInt w
@@ -1885,7 +1908,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let a := (← read).args
     if k < 1 || k > a.size then return Value.ofString ""
     return Value.ofString a[(k - 1).toNat]!
-  | "onlineend", [_, _] | "onpageend", [_, _]
+  | "onpageend", [_, _]
   | "onformatend", [_, _] | "onformaterror", [_, _] | "ontransputerror", [_, _] =>
     return .void
   | "makeconv", [_] => return .void
