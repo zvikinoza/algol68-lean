@@ -28,26 +28,32 @@ and the program's own directory as working directory) and compares the bytes.
 
 | corpus | golden programs | byte-identical |
 |---|---|---|
-| Rosetta Code, ALGOL 68 solutions (1,328 files) | 729 | RESULT_RC |
-| Algol 68 Genie bundled test set (39 files) | 31 | RESULT_A68GSET |
+| Rosetta Code, ALGOL 68 solutions (1,328 files) | 729 | 651 |
+| Algol 68 Genie bundled test set (39 files) | 31 | 17 |
 
 Non-passing programs are classified by `tests/classify.sh`:
 
-* **random-seeded** (RESULT_RANDOM programs): they call `random` without
+* **random-seeded** (27 programs): they call `random` without
   `first random`. a68g seeds its generator from the wall clock, so the recorded
   reference output is a snapshot of one second; it cannot be reproduced by a68g
   itself either. (Programs that seed with `first random` are reproduced
   exactly: a68lean implements a68g's taus113 generator.)
-* **LONG REAL** (RESULT_LREAL programs): output depends on a68g's 42/70-digit
+* **LONG REAL** (18 programs): output depends on a68g's 42/70-digit
   multi-precision reals, which a68lean does not implement.
-* **other** (RESULT_OTHER programs): a68g-specific extensions (refinements,
-  `evaluate`, `DOUBLE`, C-style formats, partial parametrisation, `system`,
-  date/time and file-system enquiries) and a few remaining gaps, listed by
-  `classify.sh`.
+* **other** (33 programs): mostly a68g-specific extensions that are out of
+  scope — `evaluate` (run-time evaluation of source text), `system`, `fork`,
+  `execve child pipe`, `getenv`, `local time`, `get directory`,
+  `file is directory`, `grep in string`, `rewind`, `reset possible`, and
+  `BYTES` — plus a few genuine gaps: rowing a scalar into a
+  multi-dimensional row (2 programs), reading into a `UNION`, one
+  format-purge corner case, one `COMPL` printing layout, two programs whose
+  expected output relies on `INT`/`LONG INT` overflow behaviour that differs,
+  and 4 programs that exceed the 90-second time limit (a68lean interprets
+  roughly ten times slower than a68g on tight numeric loops).
 
 The a68g test set relies heavily on optional libraries (GSL, MPFR, plotutils,
 R, the network) and on `LONG LONG REAL`; the 31 programs that run on a plain
-a68g were used, of which RESULT_A68GSET are reproduced exactly.
+a68g were used, of which 17 are reproduced exactly.
 
 ## 4. Differential fuzzing (`fuzz/`)
 
@@ -62,8 +68,9 @@ bounds), so that mismatches point at the implementation rather than at the
 generator. `fuzz/run.sh START COUNT` runs both implementations on each program
 and keeps any mismatch in `fuzz/failures/`.
 
-Result: RESULT_FUZZ of 1,000 generated programs (seeds 1–1000) produce
-identical output and exit status. Fuzzing found two real defects during
+Result: 1,000 of 1,000 generated programs (seeds 1–1000) produce
+identical output and exit status with the final binary; a further 1,500
+programs (seeds 1001–2500) agreed with earlier builds. Fuzzing found two real defects during
 development (a missing uninitialised-value check on identity declarations and
 a generator-independent format bug), both fixed.
 

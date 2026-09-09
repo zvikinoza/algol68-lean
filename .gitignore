@@ -3,3 +3,4 @@ fuzz/cases/
 fuzz/failures/
 tests/corpus/
 *.tmp
+fuzz/*.log

@@ -15,10 +15,10 @@ machine-checked theorems (see [docs/VERIFICATION.md](docs/VERIFICATION.md)).
 
 | Test suite | Programs | Byte-identical to a68g |
 |---|---|---|
-| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic) | 729 | RESULT_RC |
-| Algol 68 Genie bundled test set (a68g-runnable) | 31 | RESULT_A68GSET |
+| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic) | 729 | 651 |
+| Algol 68 Genie bundled test set (a68g-runnable) | 31 | 17 |
 | In-repo regression cases | 7 | 7 |
-| Random programs (grammar-based fuzzing, seeds 1–1000) | 1000 | RESULT_FUZZ |
+| Random programs (grammar-based fuzzing, seeds 1–1000) | 1,000 | 1,000 |
 
 The corpus failures fall into three groups (see [docs/TESTING.md](docs/TESTING.md)):
 programs that use `random` without seeding it (a68g seeds from the clock, so the
