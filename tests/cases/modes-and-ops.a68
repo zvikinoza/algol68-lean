@@ -1,0 +1,22 @@
+print((int width, " ", real width, " ", exp width, " ", long int width, " ", long real width, " ", long exp width, " ", bits width, " ", long max int, " ", long long max int, newline));
+print(("c", newline));
+[]INT a = (1,2,3); print((a, newline));
+[]REAL b = (1.5, 2); print((b, newline));
+STRUCT(INT i, REAL r, STRING s) st := (1, 2.0, "hi"); print((st, newline));
+print((LONG 1, newline)); print((LONG 1.5, newline));
+print((LENG 3, newline));
+print((2r1010, newline)); print((BIN 10, newline)); print((16rff, newline));
+print((ABS 2r1010, newline));
+print(("a" + "b", newline));
+print(("ab" * 3, newline)); print((3 * "ab", newline));
+print(("a" < "b", "a" = "a", newline));
+print((LWB a, UPB a, newline));
+[1:3, 1:2]INT m; print((UPB m, 2 UPB m, newline));
+print((sin(1), cos(1), tan(1), arctan(1), ln(2), log(100), newline));
+print((1.0e300 * 1.0e300, newline));
+print((ENTIER 2.5, newline));
+print(("x", 1, "y", newline));
+print((newline, "z", newline));
+print((1 ELEM 2r1010, newline));
+print((ODD 3, newline));
+print((ODD 3, newline))

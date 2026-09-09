@@ -1,0 +1,37 @@
+BEGIN
+  PROC fact = (INT n) INT: IF n <= 1 THEN 1 ELSE n * fact(n - 1) FI;
+  PROC ack = (INT m, n) INT: IF m = 0 THEN n + 1 ELSE (n = 0 | ack(m - 1, 1) | ack(m - 1, ack(m, n - 1))) FI;
+  PRIO MAX = 7;
+  OP MAX = (INT a, b) INT: (a > b | a | b);
+  OP SQ = (REAL x) REAL: x * x;
+  OP +:= = (REF STRING s, INT n) REF STRING: s +:= whole(n, 0);
+  PROC (INT) INT twice := (INT x) INT: 2 * x;
+  PROC apply = (PROC (INT) INT f, INT v) INT: f(v);
+  STRING acc := "n=";
+  acc +:= 12;
+  print((fact(10), ack(2, 3), 3 MAX 9, SQ 1.5, twice(21), apply((INT y) INT: y - 1, 5), acc, newline));
+  MODE POINT = STRUCT(REAL x, y);
+  OP + = (POINT a, b) POINT: (x OF a + x OF b, y OF a + y OF b);
+  POINT p := (1.5, 2), q := (0.5, 1);
+  POINT r = p + q;
+  print((x OF r, y OF r, newline));
+  [1:3, 1:2] INT m := ((1, 2), (3, 4), (5, 6));
+  print((m[2, 1], m[3, ], 2 UPB m, newline));
+  [] INT a = (5, 3, 9, 1);
+  [] INT b = a[2:3];
+  print((LWB b, UPB b, b, a[@0][0], newline));
+  FLEX [1:0] INT f;
+  f := (7, 8); f := (1, 2, 3);
+  print((UPB f, f, newline));
+  STRING s := "hello world";
+  s[1] := "H"; s[7:] := "there";
+  INT pos;
+  print((s, char in string("w", pos, "hello world"), pos, newline));
+  print((REPR 65, ABS "z", "abc" < "abd", 3 * "ab", "x" + "y", newline));
+  BITS bits := BIN 10;
+  print((bits, ABS (bits OR BIN 5), 2 ELEM BIN 4, newline));
+  LONG INT big := LONG 123456789012345678;
+  print((big * big, SHORTEN (big MOD LONG 1000), newline));
+  COMPL z := (1, 2);
+  print((z * z, re OF z, ABS z, newline))
+END

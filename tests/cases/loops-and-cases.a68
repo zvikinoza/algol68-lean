@@ -1,0 +1,19 @@
+BEGIN
+  INT s := 0;
+  FOR i FROM 10 BY -3 TO 1 DO s +:= i; print((i, " ")) OD; print((newline, s, newline));
+  FOR i WHILE i < 4 DO print(i) OD; print(newline);
+  INT k := 0; WHILE k +:= 1; k < 5 DO SKIP OD; print((k, newline));
+  TO 3 DO print("x") OD; print(newline);
+  INT n := 2;
+  CASE n IN print("one"), print("two"), print("three") OUT print("other") ESAC; print(newline);
+  print(((n | "a", "b", "c" | "d"), newline));
+  UNION(INT, REAL, STRING) u := 2.5;
+  CASE u IN (INT i): print(("int", i)), (REAL r): print(("real", r)), (STRING s): print(("str", s)) ESAC;
+  print(newline);
+  u := "hello"; print((u, newline));
+  INT i := 0;
+  DO i +:= 1; IF i = 7 THEN GOTO done FI OD;
+  done: print((i, newline));
+  IF INT c = 42; c > 40 THEN print(("enquiry ", c, newline)) FI;
+  print((BEGIN 1 EXIT l: 2 END, newline))
+END

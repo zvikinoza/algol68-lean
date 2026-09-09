@@ -1,0 +1,11 @@
+MODE DL = STRUCT( INT divisor, REF DL next );
+REF DL nil dl = REF DL(NIL);
+REF DL result := nil dl;
+result := HEAP DL := DL( 7, result );
+print(("a", divisor OF result, newline));
+REF DL divisors := result;
+WHILE divisors ISNT nil dl DO
+    print( ( " ", whole( divisor OF divisors, 0 ) ) );
+    divisors := next OF divisors
+OD;
+print(("done", newline))

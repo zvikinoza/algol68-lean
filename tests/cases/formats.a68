@@ -1,0 +1,17 @@
+BEGIN
+  printf(($"int: "5d" "zzd" "-3d" "+d"."l$, 42, 7, -5, 3));
+  printf(($"real: "d.2d" "zd.3d" "-d.de2d" "+3d.2de+2d"l$, 3.14159, 2.5, 314.0, 314.159));
+  printf(($g(0)" "g(-6)" "g(0,3)" "g(-12,4)" "g(10,3,2)l$, 42, 42, 3.14159, 3.14159, 3.14159));
+  printf(($b" "b("yes","no")" "c("one","two","three")l$, TRUE, FALSE, 2));
+  printf(($3(g(0)", ")l$, 1, 2, 3));
+  printf(($n(2)(d",")"|"5k"x"l$, 1, 2));
+  printf(($"["g"]"l$, "str", 'a', 1 I 2));
+  printf(($2d" "3d","3dl$, 12, 1, 2));
+  FORMAT f = $"v="g(0)$;
+  printf(($"a: "f(f)" b: "f(f)l$, 1, 2));
+  [] INT a = (10, 20, 30);
+  printf(($g(0)" "$, a)); print(newline);
+  print((whole(5, -3), whole(-5, 3), whole(12345, 3), fixed(0.5, 0, 2), fixed(0.5, 5, 2), fixed(9.996, 0, 2),
+         fixed(123.456, 5, 1), float(1.5, 12, 3, 2), float(-0.001234, 12, 4, 3), float(1.0, 5, 0, 2), newline));
+  print((1e10, 123456789.0, 0.000123, max real, small real, -2.0 ** 3, 2.0 ** 0.5, 7 / 2, newline))
+END

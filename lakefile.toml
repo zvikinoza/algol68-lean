@@ -1,0 +1,10 @@
+name = "algol68"
+version = "0.1.0"
+defaultTargets = ["a68lean"]
+
+[[lean_lib]]
+name = "A68"
+
+[[lean_exe]]
+name = "a68lean"
+root = "Main"
