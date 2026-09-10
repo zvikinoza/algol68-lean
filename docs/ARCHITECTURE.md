@@ -175,8 +175,23 @@ applied to the core representation before either back end runs:
   depth of each name that reaches past the removed frame — the same de Bruijn
   shift a compiler performs when it drops a scope.
 
-`-O0` disables the passes, `-O1` (the default) runs them once, `-O2` twice.
+`-O2` adds three more:
+
+* **Constant propagation.** An identity declaration binds a value once; if that
+  value is a scalar literal and no `refCell` ever names the cell, the uses of the
+  cell become the literal, wherever they are nested.
+* **Common subexpression elimination.** An expression evaluated twice in
+  straight-line order inside one block is evaluated once, into a slot added to
+  that block's frame. Only expressions that read cells and nothing else are
+  shared, and never across an assignment that could change what they read.
+* **Algebraic simplification.** `x + 0`, `x * 1`, `x OVER 1`, `x / 1.0`, `x ** 1`
+  and their mirrors, where the discarded operand is a literal.
+
+`-O0` disables the passes, `-O1` (the default) runs the cheap ones once, `-O2`
+runs everything three times (a propagated literal is folded on the next round).
 `A68.Verified.Opt` proves the same rewrites correct over the formal core.
+[OPTIMISATION.md](OPTIMISATION.md) describes each pass, what it is allowed to
+assume, and which parts are proved.
 
 ## C back end (`A68/CodeGen.lean`, `A68/Runtime.lean`, `A68/Serial.lean`)
 

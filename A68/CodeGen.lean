@@ -85,13 +85,28 @@ def cstring (s : String) : String :=
       "\\x" ++ String.singleton (d.get ⟨n / 16⟩) ++ String.singleton (d.get ⟨n % 16⟩)
     else String.singleton c) ++ "\""
 
-/-- Render a `Float` as a C double literal that reads back exactly. -/
+/-- One lower-case hexadecimal figure. -/
+def hexFig (n : Nat) : Char := if n < 10 then Char.ofNat (48 + n) else Char.ofNat (87 + n)
+
+/-- A `REAL` literal as C source.  Lean's `toString` on a `Float` keeps six decimals,
+    which is far short of a double, so the literal is written as a C99 hexadecimal
+    floating constant: that is the bit pattern itself, and the C compiler cannot round
+    it.  A compiled program therefore sees exactly the value the evaluator computed. -/
 def creal (x : Float) : String :=
   if x.isNaN then "(0.0/0.0)"
   else if x.isInf then (if x > 0 then "(1.0/0.0)" else "(-1.0/0.0)")
   else
-    let s := toString x
-    if s.contains '.' || s.contains 'e' || s.contains 'E' then s else s ++ ".0"
+    let b := x.toBits
+    let sign := if b >>> 63 == 1 then "-" else ""
+    let e := (b >>> 52) &&& 0x7FF
+    let m := b &&& 0xFFFFFFFFFFFFF
+    let figs := String.ofList ((List.range 13).map fun i =>
+      hexFig (((m >>> (48 - 4 * i).toUInt64) &&& 0xF).toNat))
+    if e == 0 then
+      if m == 0 then sign ++ "0.0" else sign ++ "0x0." ++ figs ++ "p-1022"
+    else
+      let ex : Int := (e.toNat : Int) - 1023
+      sign ++ "0x1." ++ figs ++ "p" ++ (if ex < 0 then toString ex else "+" ++ toString ex)
 
 /-- Labels declared directly in this function (not inside nested routine texts). -/
 partial def labelsOf : Core → List Nat
@@ -240,7 +255,7 @@ partial def genLit (v : Value) : M Unit := do
   match v with
   | .int n =>
     if n ≥ -2147483647 && n ≤ 2147483647 then emit s!"a68_v(a68rt_push_int({n}LL, W));"
-    else emit s!"a68rt_push_bigint({← putStr (toString n)});"
+    else emit s!"a68_v(a68rt_push_bigint({← putStr (toString n)}, W));"
   | .real x => emit s!"a68_v(a68rt_push_real({creal x}, W));"
   | .bool b => emit s!"a68_v(a68rt_push_bool({if b then 1 else 0}, W));"
   | .char c => emit s!"a68_v(a68rt_push_char({c}, W));"

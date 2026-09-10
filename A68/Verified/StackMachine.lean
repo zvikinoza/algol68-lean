@@ -23,7 +23,7 @@ inductive Expr where
   | mul (a b : Expr)
   | neg (a : Expr)
   | letE (a b : Expr)
-  deriving Repr
+  deriving Repr, DecidableEq
 
 /-- Denotational semantics. Unknown identifiers evaluate to 0 (the elaborator
     rejects them statically; this keeps `eval` total). -/

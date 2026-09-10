@@ -1,0 +1,13 @@
+BEGIN
+  INT n := 7, m := 3;
+  INT a := (n * m + 1) * (n * m + 1);
+  n := n + 1;
+  INT c := (n * m + 1) + (n * m + 1);
+  REAL p := 1.5, q := 2.5;
+  REAL r := (p * q - p) / (p * q - p) + (p * q - p);
+  print((a, c, r, newline));
+  FOR i TO 3 DO
+    INT u = (n + m) * (n + m) + (n + m);
+    print((u, newline))
+  OD
+END

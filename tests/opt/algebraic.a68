@@ -1,0 +1,10 @@
+BEGIN
+  INT n := 7;
+  REAL x := 2.5;
+  LONG INT b := LONG 123456789;
+  print((n + 0, 0 + n, n - 0, n * 1, 1 * n, n OVER 1, n ** 1, newline));
+  print((x - 0.0, x * 1.0, 1.0 * x, x / 1.0, x ** 1, newline));
+  print((b ** 1, newline));
+  print((n MOD 1, n * 0, newline));
+  print((n / 1, newline))
+END
