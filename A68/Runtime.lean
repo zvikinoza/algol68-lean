@@ -41,12 +41,21 @@ structure Sta where
   stack : IO.Ref (Array Value)
   envs  : IO.Ref (Array (Array Nat))
   saved : IO.Ref (Array (Array (Array Nat)))
-  jump  : IO.Ref UInt32
 
 /-- The state, fetched from the C variable the program stores it in.  `Option` keeps the
     declaration trivially non-empty; the C side always supplies `some`. -/
 @[extern "a68_get_state"]
 opaque getState (u : Unit) : BaseIO (Option Sta)
+
+/-- The pending jump, held in a C variable rather than in the state.  Compiled code tests
+    it after every call, so reading it has to cost a load and nothing more; a runtime
+    entry point would allocate an `IO` result for each test. -/
+@[extern "a68_get_jump"]
+opaque getJump (u : Unit) : BaseIO UInt32
+
+/-- Record the pending jump, returning what was stored. -/
+@[extern "a68_set_jump"]
+opaque setJump (v : UInt32) : BaseIO UInt32
 
 @[inline] private def state : IO Sta := do
   match (← getState ()) with
@@ -85,7 +94,7 @@ private def die (msg : String) : IO α := do
     IO.eprintln s!"a68lean: runtime error: {p.line}: {msg}."
     IO.Process.exit 1
   | .error .stop => do flushOut; IO.Process.exit 0
-  | .error (.jump l) => do (← state).jump.set (UInt32.ofNat (l + 1)); pure dflt
+  | .error (.jump l) => do let _ ← setJump (UInt32.ofNat (l + 1)); pure dflt
   | .error (.fileEnd _) => pure dflt
 
 @[inline] private def go (act : IO Unit) : IO Unit := act
@@ -126,13 +135,14 @@ private def popN (n : Nat) : IO (Array Value) := do
 @[export a68rt_boot]
 def boot (blob : String) (ll : UInt32) (regression : UInt8) (args : Array String) : IO Sta := do
   let tab0 := Serial.parse blob
+  let _ ← setJump 0
   let rt : Rt := {
     heap := ← IO.mkRef #[], out := ← IO.mkRef ByteArray.empty, pos := ← IO.mkRef {},
     modes := tab0.decls.foldl (fun t (n, m) => t.insert n m) {},
     files := ← IO.mkRef #[{}, {}, {}, {}], rng := ← IO.mkRef (Interp.tausSet 1),
     args := args, ll := ll.toNat, regression := regression != 0, col := ← IO.mkRef 0 }
   return { rt := rt, tab := tab0, stack := ← IO.mkRef #[], envs := ← IO.mkRef #[],
-           saved := ← IO.mkRef #[], jump := ← IO.mkRef 0 }
+           saved := ← IO.mkRef #[] }
 
 /-- Flush output and write out any files the program left open. -/
 @[export a68rt_finish]
@@ -157,13 +167,13 @@ def doStop : IO Unit := go do
 -- ## Jumps
 
 @[export a68rt_jump_pending]
-def jumpPending : IO UInt32 := val (do (← state).jump.get) 0
+def jumpPending : IO UInt32 := val (do getJump ()) 0
 
 @[export a68rt_jump_clear]
-def jumpClear : IO Unit := go do ((← state).jump.set 0)
+def jumpClear : IO Unit := go (do let _ ← setJump 0)
 
 @[export a68rt_raise_jump]
-def raiseJump (l : UInt32) : IO Unit := go do ((← state).jump.set (l + 1))
+def raiseJump (l : UInt32) : IO Unit := go (do let _ ← setJump (l + 1))
 
 -- ## Environments
 

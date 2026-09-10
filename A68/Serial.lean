@@ -235,8 +235,7 @@ def parse (blob : String) : Reader := Id.run do
     else if kind == "k" then
       let n := field fs 1
       l := (List.range n).map fun k => r.fmts[field fs (2 + k)]!
-    r := { modes := r.modes.push m, fmts := r.fmts.push f, lists := r.lists.push l,
-           cores := r.cores.push c, strs := r.strs.push s }
+    r := { r with modes := r.modes.push m, fmts := r.fmts.push f, lists := r.lists.push l, cores := r.cores.push c, strs := r.strs.push s }
   return r
 
 end A68.Serial

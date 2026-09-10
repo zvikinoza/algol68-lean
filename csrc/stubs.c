@@ -51,3 +51,19 @@ lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_obj
   fprintf(stderr, "a68lean: internal: compiled format hole reached in interpreted mode\n");
   exit(1);
 }
+
+/* The label a compiled program is jumping to, plus one; zero when no jump is pending.
+   Every call site in compiled code tests this, so it lives here as a plain variable that
+   the generated C reads directly, rather than behind a runtime entry point that would
+   allocate an IO result for each test. */
+uint32_t a68_jump_flag = 0;
+
+uint32_t a68_get_jump(lean_object* u) {
+  (void) u;
+  return a68_jump_flag;
+}
+
+uint32_t a68_set_jump(uint32_t v) {
+  a68_jump_flag = v;
+  return v;
+}

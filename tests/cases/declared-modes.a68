@@ -1,0 +1,15 @@
+# Values of declared modes.  The compiled runtime once had no table of mode      #
+# declarations, so a value of mode YEAR could not be printed or formatted.        #
+MODE YEAR = INT, DAY = INT, TYPE = INT;
+MODE POINT = STRUCT (REAL x, y);
+PROC days in = (YEAR y) DAY: (y MOD 4 = 0 AND y MOD 100 /= 0 OR y MOD 400 = 0 | 366 | 365);
+PROC sum = (REF [] TYPE l) TYPE: ( TYPE s := 0; FOR k FROM LWB l TO UPB l DO s +:= l[k] OD; s );
+[5] INT a := (1, 2, 3, 4, 5);
+FOR i FROM 1999 TO 2001 DO
+  YEAR y = i;
+  print((y, days in(y), newline));
+  printf(($g(0)" has "g(0)" days"l$, y, days in(y)))
+OD;
+print((sum(a), newline));
+POINT p := (1.5, -2.25);
+print((x OF p, y OF p, newline))

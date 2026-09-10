@@ -1,0 +1,16 @@
+# Subscripts through a name of a row, as REF STRING and REF [] INT parameters are. #
+# The compiled runtime once sliced the cell holding the name instead of the row.   #
+PROC scan = (REF STRING s, INT hi) INT:
+  BEGIN
+    INT i := 0;
+    WHILE i +:= 1; i <= hi AND s[i] < "m" DO SKIP OD;
+    i
+  END;
+PROC swap ends = (REF [] INT v) VOID:
+  BEGIN INT t = v[LWB v]; v[LWB v] := v[UPB v]; v[UPB v] := t END;
+STRING t := "abcxyz";
+print((scan(t, 6), newline));
+[4] INT w := (10, 20, 30, 40);
+swap ends(w);
+FOR k TO 4 DO print((w[k])) OD;
+print(newline)

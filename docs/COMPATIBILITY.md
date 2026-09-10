@@ -151,5 +151,10 @@ reported separately by the test scripts.
   is right: a display has no a priori mode, so it cannot be the operand of a
   union coercion. This can only affect programs a68g refuses outright, so it
   cannot change the output of a program a68g accepts.
+* **A declaration after a labelled unit** is accepted here and rejected by
+  a68g with "declaration cannot follow a labeled unit". a68g is right: the
+  Revised Report allows labels only in a serial clause's units after its last
+  declaration. As with the display coerced to a union, this can only affect
+  programs a68g refuses, so it cannot change the output of one it accepts.
 * **Runtime error messages** are not byte-identical; only standard output
   and the non-zero exit status are.

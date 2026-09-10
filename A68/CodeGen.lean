@@ -1107,7 +1107,9 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
           | none => do gen e; produced := true
         else genVoid e
       | .label id =>
-        emit s!"L{id}: a68_v(a68rt_env_truncate(e{n}+{if fr.pushed then 1 else 0}, W)); a68_v(a68rt_stack_truncate(s{n}, W));"
+        -- landing here ends the jump that brought us, so the pending flag is cleared: left
+        -- set, the next call site would read it and jump away again
+        emit s!"L{id}: a68_jump_clear(); a68_v(a68rt_env_truncate(e{n}+{if fr.pushed then 1 else 0}, W)); a68_v(a68rt_stack_truncate(s{n}, W));"
         if onStack then emit "a68_v(a68rt_push_void(W));"
       | .exit => emit s!"goto B{n};"
     if wantValue && !onStack && !produced && dest.isNone then emit "a68_v(a68rt_push_void(W));"
@@ -1276,6 +1278,7 @@ lean_object* a68rt_line(uint32_t l, lean_object* w);
 extern uint32_t a68_line_no;
 #define a68_line(n) (a68_line_no = (n))
 lean_object* a68rt_jump_pending(lean_object* w);
+extern uint32_t a68_jump_flag;
 lean_object* a68rt_jump_clear(lean_object* w);
 lean_object* a68rt_raise_jump(uint32_t l, lean_object* w);
 lean_object* a68rt_stop(lean_object* w);
@@ -1367,7 +1370,8 @@ static inline uint8_t a68_u8(lean_object* r) {
   lean_dec_ref(r);
   return v;
 }
-#define a68_jump()        a68_u32(a68rt_jump_pending(W))
+#define a68_jump()        a68_jump_flag
+#define a68_jump_clear()  (a68_jump_flag = 0)
 #define a68_env_depth()   a68_u32(a68rt_env_depth(W))
 #define a68_stack_depth() a68_u32(a68rt_stack_depth(W))
 #define a68_bool()        (a68_u8(a68rt_pop_bool(W)) != 0)

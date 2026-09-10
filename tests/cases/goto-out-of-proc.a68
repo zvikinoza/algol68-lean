@@ -1,0 +1,20 @@
+# A jump from inside a routine to a label of the enclosing serial clause.  The   #
+# compiled program once left the pending jump set after landing, so the next call #
+# jumped away again and the program never finished.                              #
+BEGIN
+  INT n := 0;
+  PROC q = INT: 42;
+  PROC p = VOID: GO TO out;
+  FOR i TO 3 DO n +:= 1; p OD;
+out:
+  print((n, newline));
+  print((q, newline));
+  FOR k TO 2 DO
+    PROC r = VOID: GO TO next;
+    r;
+    print(("unreachable", newline));
+  next:
+    print((k, newline))
+  OD;
+  print(("done", newline))
+END

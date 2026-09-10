@@ -45,7 +45,10 @@ for d in out/*/ a68gset/*/; do
   d=${d%/}
   errs=$(grep -v '^\[.*\]$' "$d/err1.txt" | wc -c | tr -d ' ')
   if [ "$(cat "$d/rc1.txt")" = "0" ] && [ "$errs" -eq 0 ] && cmp -s "$d/out1.txt" "$d/out2.txt" \
-     && ! grep -q "exiting graciously" "$d/out1.txt"; then
+     && ! grep -q "exiting graciously" "$d/out1.txt" \
+     && ! { grep -qi 'random' "$d/prog.a68" && ! grep -qi 'first random' "$d/prog.a68"; }; then
+    # a68g seeds `random` from the clock, so an unseeded program is only reproducible by
+    # accident, when both runs above happen to land in the same second
     echo "$CORPUS/$d" >> golden.txt
   fi
 done
