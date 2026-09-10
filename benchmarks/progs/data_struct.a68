@@ -1,0 +1,18 @@
+# STRUCT field access and update: 1000 particles stepped 8000 times, each #
+# step reading two fields and updating two more in place.                 #
+# ops: 4.8e7  (six selections per particle per step)                      #
+BEGIN
+  MODE PARTICLE = STRUCT (INT x, INT y, INT vx, INT vy);
+  INT n = 1000;
+  [1:n] PARTICLE p;
+  FOR i TO n DO p[i] := (i MOD 10007, (i * 3) MOD 10007, 1 + i MOD 7, 1 + i MOD 5) OD;
+  FOR step TO 8000 DO
+    FOR i TO n DO
+      x OF p[i] := (x OF p[i] + vx OF p[i]) MOD 10007;
+      y OF p[i] := (y OF p[i] + vy OF p[i]) MOD 10007
+    OD
+  OD;
+  INT total := 0;
+  FOR i TO n DO total := (total + x OF p[i] + y OF p[i]) MOD 1000003 OD;
+  print((total, newline))
+END

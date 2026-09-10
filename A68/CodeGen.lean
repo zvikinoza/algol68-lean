@@ -181,23 +181,28 @@ def cstring (s : String) : String :=
       "\\x" ++ String.singleton (d.get ⟨n / 16⟩) ++ String.singleton (d.get ⟨n % 16⟩)
     else String.singleton c) ++ "\""
 
-/-- Render a `Float` as a C literal that reads back bit for bit.  A decimal rendering has
-    to be rounded somewhere, and a rounded constant is a different program: `1.0e-7`
-    printed to six places is zero.  A hexadecimal float literal is exact by construction,
-    and the C compiler folds it like any other constant. -/
+/-- One lower-case hexadecimal figure. -/
+def hexFig (n : Nat) : Char := if n < 10 then Char.ofNat (48 + n) else Char.ofNat (87 + n)
+
+/-- A `REAL` literal as C source.  Lean's `toString` on a `Float` keeps six decimals,
+    which is far short of a double, so the literal is written as a C99 hexadecimal
+    floating constant: that is the bit pattern itself, and the C compiler cannot round
+    it.  A compiled program therefore sees exactly the value the evaluator computed. -/
 def creal (x : Float) : String :=
   if x.isNaN then "(0.0/0.0)"
   else if x.isInf then (if x > 0 then "(1.0/0.0)" else "(-1.0/0.0)")
   else
     let b := x.toBits
     let sign := if b >>> 63 == 1 then "-" else ""
-    let expo := ((b >>> 52) &&& 0x7FF).toNat
-    let man := (b &&& 0xFFFFFFFFFFFFF).toNat
-    let d := "0123456789abcdef"
-    let hex : String := String.ofList ((List.range 13).map fun i => d.get ⟨(man >>> (48 - 4 * i)) % 16⟩)
-    if expo == 0 && man == 0 then sign ++ "0.0"
-    else if expo == 0 then sign ++ "0x0." ++ hex ++ "p-1022"
-    else sign ++ "0x1." ++ hex ++ "p" ++ toString ((expo : Int) - 1023)
+    let e := (b >>> 52) &&& 0x7FF
+    let m := b &&& 0xFFFFFFFFFFFFF
+    let figs := String.ofList ((List.range 13).map fun i =>
+      hexFig (((m >>> (48 - 4 * i).toUInt64) &&& 0xF).toNat))
+    if e == 0 then
+      if m == 0 then sign ++ "0.0" else sign ++ "0x0." ++ figs ++ "p-1022"
+    else
+      let ex : Int := (e.toNat : Int) - 1023
+      sign ++ "0x1." ++ figs ++ "p" ++ (if ex < 0 then toString ex else "+" ++ toString ex)
 
 /-- Labels declared directly in this function (not inside nested routine texts). -/
 partial def labelsOf : Core → List Nat

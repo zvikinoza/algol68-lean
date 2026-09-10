@@ -1,0 +1,23 @@
+# Multi-way dispatch: a CASE clause with twelve alternatives in a hot loop. #
+# ops: 8e6  (one CASE dispatch per op)                                      #
+BEGIN
+  INT s := 1;
+  FOR i TO 8000000 DO
+    s := CASE i MOD 12 + 1 IN
+           (s + i) MOD 1000003,
+           (s + 2 * i) MOD 1000003,
+           (s * 3 + 1) MOD 1000003,
+           (s + (i MOD 1000) * (i MOD 1000)) MOD 1000003,
+           (s + 17) MOD 1000003,
+           (s * 5 + i) MOD 1000003,
+           (s + i OVER 3) MOD 1000003,
+           (1000003 - s) MOD 1000003,
+           (s * 7 + 3) MOD 1000003,
+           (s + i MOD 251) MOD 1000003,
+           (s * 11 + i) MOD 1000003,
+           (s + 1000000) MOD 1000003
+         OUT 0
+         ESAC
+  OD;
+  print((s, newline))
+END

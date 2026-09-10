@@ -1,0 +1,21 @@
+# Hot-path control flow: a WHILE whose condition and body do real work        #
+# (Collatz), short-circuit ANDF/OREL guards, and a GO TO that leaves the loop #
+# early.  The x < 100000000 guard keeps every value inside 32-bit INT.        #
+# ops: 9.7e6  (one Collatz step per op)                                       #
+BEGIN
+  PROC steps = (INT n) INT:
+    BEGIN
+      INT x := n, c := 0;
+      WHILE x /= 1 ANDF x < 100000000 DO
+        IF x MOD 2 = 0 THEN x := x OVER 2 ELSE x := 3 * x + 1 FI;
+        c +:= 1;
+        IF c >= 250 OREL (c > 100 ANDF x MOD 16 = 0) THEN GO TO done FI
+      OD;
+      done: c
+    END;
+  INT t := 0;
+  FOR rep TO 6 DO
+    FOR n FROM 2 TO 20000 DO t := (t + steps(n)) MOD 1000003 OD
+  OD;
+  print((t, newline))
+END

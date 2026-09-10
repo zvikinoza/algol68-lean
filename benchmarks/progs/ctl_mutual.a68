@@ -1,0 +1,10 @@
+# Mutual recursion: a three-way f/g/h cycle, 200 to 300 frames deep. #
+# ops: 1e7  (one mutually recursive call per op)                     #
+BEGIN
+  PROC f = (INT n) INT: IF n = 0 THEN 1 ELSE (n + g(n - 1)) MOD 1000003 FI,
+       g = (INT n) INT: IF n = 0 THEN 2 ELSE (n + h(n - 1)) MOD 1000003 FI,
+       h = (INT n) INT: IF n = 0 THEN 3 ELSE (n + f(n - 1)) MOD 1000003 FI;
+  INT s := 0;
+  FOR i TO 40000 DO s := (s + f(200 + i MOD 101)) MOD 1000003 OD;
+  print((s, newline))
+END

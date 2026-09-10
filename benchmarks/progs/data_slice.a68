@@ -1,0 +1,17 @@
+# Row slicing and trimming: a sliding 500-element window taken 40000 times, #
+# re-indexed with [@0], plus a write through a REF slice of the same row.   #
+# ops: 2e7  (one element access per window element)                         #
+BEGIN
+  INT n = 1000;
+  [1:n] INT a;
+  FOR i TO n DO a[i] := i MOD 251 OD;
+  INT total := 0;
+  FOR r TO 40000 DO
+    INT lo = 1 + r MOD 101;
+    [] INT w = a[lo : lo + 499][@0];
+    FOR i FROM 0 TO 499 DO total := (total + w[i]) MOD 1000003 OD;
+    REF [] INT v = a[lo : lo + 499];
+    v[1] := (total + r) MOD 251
+  OD;
+  print((total, newline))
+END

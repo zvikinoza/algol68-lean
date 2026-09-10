@@ -1,0 +1,11 @@
+# Standard-prelude maths: sqrt, sin, exp and ln over 6 million points. #
+# ops: 2.4e7  (four transcendental / sqrt calls per iteration)         #
+BEGIN
+  INT n = 6000000;
+  REAL s := 0.0;
+  FOR i TO n DO
+    REAL t = i / n;
+    s := s + sqrt(t) + sin(t) * exp(-t) + ln(t + 1.0)
+  OD;
+  print((ROUND (s / n * 1000000.0), newline))
+END

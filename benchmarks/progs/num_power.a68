@@ -1,0 +1,10 @@
+# Exponentiation: INT ** INT with both a constant and a varying exponent, 5 million times. #
+# ops: 1.5e7  (three ** operations per iteration)                                          #
+BEGIN
+  INT n = 5000000;
+  INT s := 0;
+  FOR i TO n DO
+    s := (s + (i MOD 10) ** 3 + (i MOD 5 + 2) ** 4 + 2 ** (i MOD 20)) MOD 1000003
+  OD;
+  print((s, newline))
+END

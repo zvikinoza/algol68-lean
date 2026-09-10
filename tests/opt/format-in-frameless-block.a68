@@ -1,0 +1,7 @@
+BEGIN
+  INT k := 5;
+  INT x := 42;
+  BEGIN
+    printf(($n(k)d l$, x))
+  END
+END

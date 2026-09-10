@@ -1,0 +1,22 @@
+BEGIN
+  INT k = 7;                       # propagated: no name is ever taken of the cell #
+  INT big = 1000000;
+  REAL c = 2.5;
+  INT n := 3;                      # a variable: assigned, so never propagated #
+  n := n + k;
+  print((k, k * k, big, c, n, newline));
+  # the same name at several frame depths #
+  PROC f = (INT x)INT: x + k;
+  print((f(1), newline));
+  FOR i TO 2 DO
+    BEGIN
+      INT j = k + i;
+      print((j, newline))
+    END
+  OD;
+  # a name of the cell blocks propagation of m #
+  INT m := k;
+  REF INT r = m;
+  r := 99;
+  print((m, newline))
+END

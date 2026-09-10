@@ -1,0 +1,23 @@
+# Mandelbrot: total escape-iteration count over a 400 x 300 grid, cap 200. #
+# A branchy REAL kernel: three multiplies and three adds per iteration.    #
+# ops: 5.4e6  (one z := z^2 + c iteration per op)                          #
+BEGIN
+  INT w = 400, h = 300, maxit = 200;
+  INT total := 0;
+  FOR py FROM 0 TO h - 1 DO
+    REAL y0 = -1.25 + py * 2.5 / h;
+    FOR px FROM 0 TO w - 1 DO
+      REAL x0 = -2.2 + px * 3.0 / w;
+      REAL x := 0.0, y := 0.0;
+      INT it := 0;
+      WHILE (x * x + y * y <= 4.0) AND (it < maxit) DO
+        REAL xt = x * x - y * y + x0;
+        y := 2.0 * x * y + y0;
+        x := xt;
+        it +:= 1
+      OD;
+      total +:= it
+    OD
+  OD;
+  print((total, newline))
+END

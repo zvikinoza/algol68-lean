@@ -12,6 +12,7 @@ import A68.Serial
 import A68.Runtime
 import A68.CodeGen
 import A68.Verified.StackMachine
+import A68.Verified.Opt
 import A68.Verified.Numfmt
 
 /-!

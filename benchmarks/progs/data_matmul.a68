@@ -1,0 +1,24 @@
+# Two-dimensional row indexing: a 250x250 modular integer matrix multiply. #
+# ops: 3.125e7  (two element accesses per multiply-accumulate step)        #
+BEGIN
+  INT n = 250;
+  [1:n, 1:n] INT a, b, c;
+  FOR i TO n DO
+    FOR j TO n DO
+      a[i, j] := (i * 3 + j) MOD 97;
+      b[i, j] := (i + j * 5) MOD 89
+    OD
+  OD;
+  FOR i TO n DO
+    FOR j TO n DO
+      INT s := 0;
+      FOR k TO n DO s := (s + a[i, k] * b[k, j]) MOD 1000003 OD;
+      c[i, j] := s
+    OD
+  OD;
+  INT total := 0;
+  FOR i TO n DO
+    FOR j TO n DO total := (total + c[i, j]) MOD 1000003 OD
+  OD;
+  print((total, newline))
+END

@@ -1,0 +1,18 @@
+# Linked structure: 40000 HEAP nodes chained through REF NODE, walked end #
+# to end 250 times, dereferencing a field and a link at every node.       #
+# ops: 1e7  (one node visit per step: one val OF and one next OF)         #
+BEGIN
+  MODE NODE = STRUCT (INT val, REF NODE next);
+  INT n = 40000;
+  REF NODE head := NIL;
+  FOR i TO n DO head := HEAP NODE := ((i * 7) MOD 1009, head) OD;
+  INT total := 0;
+  FOR r TO 250 DO
+    REF NODE p := head;
+    WHILE p ISNT REF NODE (NIL) DO
+      total := (total + val OF p) MOD 1000003;
+      p := next OF p
+    OD
+  OD;
+  print((total, newline))
+END

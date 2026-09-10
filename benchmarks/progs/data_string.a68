@@ -1,0 +1,25 @@
+# STRING building and comparison: 15000 rounds, each appending 120 chars #
+# to two strings, comparing them, then scanning one of them.             #
+# ops: 5.4e6  (per round: 240 appends and 120 subscripts)                #
+BEGIN
+  INT reps = 15000, len = 120;
+  INT a0 = ABS "a";
+  INT total := 0;
+  FOR r TO reps DO
+    STRING s := "", t := "";
+    FOR i TO len DO
+      CHAR c = REPR (a0 + (i * 7 + r) MOD 26);
+      s +:= c;
+      t +:= IF i = 60 AND r MOD 5 = 0
+            THEN REPR (a0 + (ABS c - a0 + 1) MOD 26)
+            ELSE c
+            FI
+    OD;
+    IF s = t THEN total +:= 1
+    ELIF s < t THEN total +:= 2
+    ELSE total +:= 3
+    FI;
+    FOR i TO len DO total := (total + ABS s[i]) MOD 1000003 OD
+  OD;
+  print((total, newline))
+END

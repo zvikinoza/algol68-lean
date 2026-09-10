@@ -1,0 +1,16 @@
+# Mixed INT/REAL: Horner evaluation of a degree-15 polynomial with INT coefficients. #
+# Both the INT / INT quotient and the INT operand of p * x + c widen to REAL.        #
+# ops: 2.0e7  (one REAL multiply-and-add per op)                                     #
+BEGIN
+  INT n = 650000, deg = 15;
+  REAL total := 0.0;
+  FOR i TO n DO
+    REAL x = i / n;
+    REAL p := 0.0;
+    FOR k TO deg DO
+      p := p * x + (k MOD 7 + 1)
+    OD;
+    total := total + p
+  OD;
+  print((ROUND (total / n * 1000000.0), newline))
+END

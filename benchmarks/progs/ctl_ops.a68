@@ -1,0 +1,15 @@
+# User-defined operators: two dyadic and one monadic OP in a hot loop. #
+# ops: 1.76e7  (one user-defined operator application per op)          #
+BEGIN
+  OP ROT = (INT a, INT b) INT: (a * 31 + b) MOD 1000003;
+  OP MASH = (INT a, INT b) INT: (a + b * b) MOD 1000003;
+  OP INV = (INT a) INT: (1000003 - a) MOD 1000003;
+  PRIO ROT = 7;
+  PRIO MASH = 7;
+  INT s := 1;
+  FOR i TO 8000000 DO
+    s := (s ROT i) MASH (i MOD 97);
+    IF i MOD 5 = 0 THEN s := INV s FI
+  OD;
+  print((s, newline))
+END

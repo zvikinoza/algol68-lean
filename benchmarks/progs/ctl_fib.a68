@@ -1,0 +1,8 @@
+# Deep recursion: naive Fibonacci, two self-calls and a branch per node. #
+# ops: 1.8e7  (one recursive procedure call per op)                      #
+BEGIN
+  PROC fib = (INT n) INT: IF n < 2 THEN n ELSE fib(n - 1) + fib(n - 2) FI;
+  INT s := 0;
+  FOR k FROM 25 TO 32 DO s := (s + fib(k)) MOD 1000003 OD;
+  print((s, newline))
+END

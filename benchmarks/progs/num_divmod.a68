@@ -1,0 +1,10 @@
+# Integer division and remainder: OVER and MOD in a tight loop, 8 million times. #
+# ops: 3.2e7  (four integer division or remainder operations per iteration)      #
+BEGIN
+  INT n = 8000000;
+  INT s := 0;
+  FOR i TO n DO
+    s := (s + i OVER 7 + i MOD 13 + (i * 3) OVER 11) MOD 1000003
+  OD;
+  print((s, newline))
+END

@@ -1,0 +1,17 @@
+# Higher order: a procedure passed as a parameter and called in an inner loop. #
+# ops: 1.2e7  (one indirect call through the PROC parameter per op)            #
+BEGIN
+  PROC reduce = (PROC (INT, INT) INT f, INT seed, INT n) INT:
+    BEGIN
+      INT acc := seed;
+      FOR i TO n DO acc := f(acc, i) OD;
+      acc
+    END;
+  PROC step1 = (INT x, INT y) INT: (x + y * 7) MOD 1000003;
+  PROC step2 = (INT x, INT y) INT: (x * 3 + y) MOD 1000003;
+  INT s := 1;
+  FOR r TO 60000 DO
+    s := (reduce(step1, s, 100) + reduce(step2, s, 100)) MOD 1000003
+  OD;
+  print((s, newline))
+END

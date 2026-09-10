@@ -1,0 +1,29 @@
+# UNION values and conformity clauses: a 1000-element row of a four-mode  #
+# UNION, dispatched with a conformity CASE 8000 times over the whole row. #
+# ops: 8e6  (one dispatch and one field extraction per node visit)        #
+BEGIN
+  MODE ITEM = UNION (INT, REAL, BOOL, CHAR);
+  INT n = 1000;
+  [1:n] ITEM a;
+  FOR i TO n DO
+    a[i] :=
+      CASE i MOD 4 + 1
+      IN ITEM (i MOD 1009),
+         ITEM (i / 4),
+         ITEM (ODD i),
+         ITEM (REPR (65 + i MOD 26))
+      ESAC
+  OD;
+  INT total := 0;
+  FOR r TO 8000 DO
+    FOR i TO n DO
+      CASE a[i]
+      IN (INT k):  total := (total + k) MOD 1000003,
+         (REAL x): total := (total + ROUND (x * 4)) MOD 1000003,
+         (BOOL b): total := (total + (b | 3 | 5)) MOD 1000003,
+         (CHAR c): total := (total + ABS c) MOD 1000003
+      ESAC
+    OD
+  OD;
+  print((total, newline))
+END
