@@ -222,7 +222,7 @@ partial def gen (c : Core) : M Unit := do
     gen l
     emit "if (a68_bool()) {"
     indent (gen r)
-    emit "} else { a68_v(a68rt_push_bool(0, W)); }"
+    emit "} else { a68_v(a68rt_push_bool(W)); }"
   | .orElse l r =>
     gen l
     emit "if (a68_bool()) { a68_v(a68rt_push_bool(1, W)); } else {"
@@ -240,7 +240,7 @@ partial def genLit (v : Value) : M Unit := do
   match v with
   | .int n =>
     if n ≥ -2147483647 && n ≤ 2147483647 then emit s!"a68_v(a68rt_push_int({n}LL, W));"
-    else emit s!"a68_v(a68rt_push_bigint({← putStr (toString n)}, W));"
+    else emit s!"a68rt_push_bigint({← putStr (toString n)});"
   | .real x => emit s!"a68_v(a68rt_push_real({creal x}, W));"
   | .bool b => emit s!"a68_v(a68rt_push_bool({if b then 1 else 0}, W));"
   | .char c => emit s!"a68_v(a68rt_push_char({c}, W));"
@@ -297,7 +297,7 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
       if slot.isSome then
         emit "a68_v(a68rt_enter(1, W));"
         emit "a68_v(a68rt_bind_cell(0, 0, W));"
-      else emit "a68_v(a68rt_enter(0, W));"
+      else emit "a68_v(a68rt_enter(W));"
       gen body
       emit "a68_v(a68rt_nip(W));"
       emit "a68_v(a68rt_leave(W));"
@@ -325,7 +325,7 @@ partial def genLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Opti
     | some sl =>
       emit "a68_v(a68rt_enter(1, W));"
       emit s!"a68_v(a68rt_set_int(0, {sl}, i{n}, W));"
-    | none => emit "a68_v(a68rt_enter(0, W));"
+    | none => emit "a68_v(a68rt_enter(W));"
     match w with
     | some wc =>
       gen wc
@@ -396,6 +396,7 @@ def prelude : String := "
 
 #define W lean_io_mk_world()
 
+
 void lean_initialize_runtime_module(void);
 void lean_io_mark_end_initialization(void);
 void lean_init_task_manager(void);
@@ -434,6 +435,7 @@ lean_object* a68rt_push_cell(uint32_t d, uint32_t s, lean_object* w);
 lean_object* a68rt_push_ref(uint32_t d, uint32_t s, lean_object* w);
 lean_object* a68rt_push_proc(uint32_t fn, uint32_t np, lean_object* w);
 lean_object* a68rt_push_format(uint32_t k, lean_object* w);
+lean_object* a68rt_push_array(lean_object* a, lean_object* w);
 lean_object* a68rt_store(uint32_t d, uint32_t s, lean_object* w);
 lean_object* a68rt_bind_cell(uint32_t d, uint32_t s, lean_object* w);
 lean_object* a68rt_set_int(uint32_t d, uint32_t s, int64_t v, lean_object* w);
@@ -443,7 +445,6 @@ lean_object* a68rt_dup(lean_object* w);
 lean_object* a68rt_pop_int(lean_object* w);
 lean_object* a68rt_pop_bool(lean_object* w);
 lean_object* a68rt_take_top(lean_object* w);
-lean_object* a68rt_push_array(lean_object* a, lean_object* w);
 lean_object* a68rt_deref(lean_object* w);
 lean_object* a68rt_deproc(lean_object* w);
 lean_object* a68rt_widen(uint32_t a, uint32_t b, lean_object* w);
@@ -463,10 +464,16 @@ lean_object* a68rt_collateral(uint32_t n, uint8_t st, uint32_t dims, lean_object
 lean_object* a68rt_case_index(uint32_t n, lean_object* w);
 lean_object* a68rt_conform(uint32_t m, uint8_t bind, lean_object* w);
 lean_object* initialize_algol68_A68_Runtime(uint8_t builtin);
+void a68_set_state(lean_object* s);
 
 static void a68_fail(lean_object* r) {
   lean_io_result_show_error(r);
   exit(1);
+}
+static inline lean_object* a68_take(lean_object* r) {
+  if (lean_io_result_is_error(r)) a68_fail(r);
+  lean_object* v = lean_io_result_take_value(r);
+  return v;
 }
 static inline void a68_v(lean_object* r) {
   if (lean_io_result_is_error(r)) a68_fail(r);
@@ -526,13 +533,13 @@ def program (core : Core) (ll : Nat) (regression : Bool) : String := Id.run do
   for i in [0:st.fns.size] do
     out := out ++ s!"    case {i}: a68_fn{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(W);\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   out := out ++ "lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_object* w) {\n"
   out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n  switch (idx) {\n"
   for i in [0:st.holes.size] do
     out := out ++ s!"    case {i}: a68_hole{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(W);\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   -- main
   out := out ++ "int main(int argc, char** argv) {\n"
   out := out ++ "  argv = lean_setup_args(argc, argv);\n  lean_initialize_runtime_module();\n"
@@ -541,7 +548,7 @@ def program (core : Core) (ll : Nat) (regression : Bool) : String := Id.run do
   out := out ++ "  lean_io_mark_end_initialization();\n  lean_init_task_manager();\n"
   out := out ++ "  lean_object* args = lean_mk_empty_array();\n"
   out := out ++ "  for (int i = 0; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));\n"
-  out := out ++ s!"  a68_v(a68rt_boot(lean_mk_string(A68_BLOB), {ll}, {if regression then 1 else 0}, args, W));\n"
+  out := out ++ s!"  a68_set_state(a68_take(a68rt_boot(lean_mk_string(A68_BLOB), {ll}, {if regression then 1 else 0}, args, W)));\n"
   out := out ++ "  a68_fn0();\n"
   out := out ++ "  uint32_t rc = a68_u32(a68rt_finish(W));\n  return (int) rc;\n}\n"
   return out

@@ -47,25 +47,8 @@ def compile (file : String) : IO (Option (Core × Mode.Table × Nat)) := do
       return none
     | .ok (core, modes) => return some (core, modes, ll)
 
-def main (args : List String) : IO UInt32 := do
-  match args with
-  | ["parse", file] =>
-    let src ← readSource file
-    match A68.parse src with
-    | .ok _ => IO.println "OK"; return 0
-    | .error e => IO.println s!"{file}:{e.pos.line}:{e.pos.col}: {e.msg}"; return 1
-  | ["check", file] =>
-    match (← compile file) with
-    | some _ => IO.println "OK"; return 0
-    | none => return 1
-  | "run" :: file :: rest =>
-    match (← compile file) with
-    | some (core, modes, ll) =>
-      let toks := A68.lex (← readSource file)
-      for e in A68.echoesOf toks do IO.println e
-      Interp.run core modes ("a68g" :: file :: rest).toArray ll (A68.isRegression toks)
-    | none => return 1
-  | "compile" :: file :: rest =>
+/-- Compile to C and link a native binary (`a68lean [compile] prog.a68 [-o out] [-c] [-O0|-O1|-O2]`). -/
+def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
     -- a68lean compile prog.a68 [-o out] [-c]   (-c keeps the generated C only)
     let out := match rest.dropWhile (· != "-o") with
       | _ :: o :: _ => o
@@ -109,7 +92,7 @@ def main (args : List String) : IO UInt32 := do
           | some root => pure (root / "lib").toString
           | none => pure ((← IO.currentDir) / ".lake" / "build" / "lib").toString
       let cc := (← IO.getEnv "CC").getD "cc"
-      let args := #[cFile, libDir ++ "/libalgol68_A68.a", "-I" ++ leanPrefix ++ "/include",
+      let args := #[cFile, libDir ++ "/libalgol68_A68.a", libDir ++ "/liba68stubs.a", "-I" ++ leanPrefix ++ "/include",
                     "-L" ++ leanPrefix ++ "/lib/lean", "-L" ++ leanPrefix ++ "/lib",
                     "-lleancpp", "-lInit", "-lStd", "-lLean", "-lleanrt", "-lc++", "-lLake",
                     "-lgmp", "-luv", "-lssl", "-lcrypto", "-w", "-O2", "-o", out]
@@ -119,6 +102,26 @@ def main (args : List String) : IO UInt32 := do
         return 1
       IO.println s!"wrote {out}"
       return 0
+
+def main (args : List String) : IO UInt32 := do
+  match args with
+  | ["parse", file] =>
+    let src ← readSource file
+    match A68.parse src with
+    | .ok _ => IO.println "OK"; return 0
+    | .error e => IO.println s!"{file}:{e.pos.line}:{e.pos.col}: {e.msg}"; return 1
+  | ["check", file] =>
+    match (← compile file) with
+    | some _ => IO.println "OK"; return 0
+    | none => return 1
+  | "run" :: file :: rest =>
+    match (← compile file) with
+    | some (core, modes, ll) =>
+      let toks := A68.lex (← readSource file)
+      for e in A68.echoesOf toks do IO.println e
+      Interp.run core modes ("a68g" :: file :: rest).toArray ll (A68.isRegression toks)
+    | none => return 1
+  | "compile" :: file :: rest => compileToBinary file rest
   | ["dump", file] =>
     match (← compile file) with
     | some (core, _, _) => IO.println (Pretty.program core); return 0
@@ -134,10 +137,6 @@ def main (args : List String) : IO UInt32 := do
       if line ≠ "" then IO.println (fmtLine line)
     return 0
   | file :: rest =>
-    match (← compile file) with
-    | some (core, modes, ll) =>
-      let toks := A68.lex (← readSource file)
-      for e in A68.echoesOf toks do IO.println e
-      Interp.run core modes ("a68g" :: file :: rest).toArray ll (A68.isRegression toks)
-    | none => return 1
-  | _ => IO.println "usage: a68lean [run|check|parse|lex] file.a68"; return 2
+    -- the bare form compiles, as a C compiler would; `run` executes directly
+    compileToBinary file rest
+  | _ => IO.println "usage: a68lean [compile|run|check|dump] file.a68 [-o out] [-c] [-O0|-O1|-O2]"; return 2

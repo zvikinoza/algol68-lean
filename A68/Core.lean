@@ -45,6 +45,12 @@ inductive Value where
   | file (id : Nat)
   deriving Inhabited, Repr
 
+/-- An indexer whose bounds have already been evaluated. -/
+inductive IdxVal where
+  | index (v : Value)
+  | trim (lo hi at_ : Option Value)
+  deriving Inhabited
+
 inductive CoreIdx where
   | index (e : Core)
   | trim (lwb upb : Option Core) (at_ : Option Core)

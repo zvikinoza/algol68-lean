@@ -670,11 +670,7 @@ partial def eval (env : Env) (c : Core) : M Value := do
       i := i + bv
     return .void
   | .goto id => throw (.jump id)
-  | .skip m =>
-    match (← resolveM m) with
-    | .void => return .void
-    | .row d _ _ => return .row (Array.replicate d 1) (Array.replicate d 0) #[]
-    | _ => return .undef
+  | .skip m => defaultOf m
   | .andThen l r =>
     if (← expectBool (← eval env l)) then eval env r else return .bool false
   | .orElse l r =>
@@ -687,16 +683,38 @@ partial def eval (env : Env) (c : Core) : M Value := do
     (← read).pos.set p
     eval env e
 
+/-- The value a `SKIP` of this mode denotes; also the initial value of a generated object.
+    Used by both the evaluator and the runtime of compiled programs. -/
+partial def defaultOf (m : Mode) : M Value := do
+  match (← resolveM m) with
+  | .void => return .void
+  | .row d _ _ => return .row (Array.replicate d 1) (Array.replicate d 0) #[]
+  | _ => return .undef
+
 partial def evalSlice (env : Env) (arr : Core) (idx : List CoreIdx) (viaRef : Bool) : M Value := do
   let base ← eval env arr
+  let mut ivs : List IdxVal := []
+  for ix in idx do
+    match ix with
+    | .index e => ivs := ivs ++ [.index (← eval env e)]
+    | .trim lo hi at_ =>
+      let lo' ← lo.mapM fun e => eval env e
+      let hi' ← hi.mapM fun e => eval env e
+      let at' ← at_.mapM fun e => eval env e
+      ivs := ivs ++ [.trim lo' hi' at']
+  sliceValue base ivs viaRef
+
+/-- Slice or trim a value with already evaluated indexers.  Both the evaluator and the
+    runtime of compiled programs use this; no syntax is involved. -/
+partial def sliceValue (base : Value) (idx : List IdxVal) (viaRef : Bool) : M Value := do
   let rowV ← if viaRef then readRef base else pure base
   let (l, u, es) ← expectRow rowV
   let d := l.size
   -- fast path: one-dimensional subscript
   match idx with
-  | [.index e] =>
+  | [.index iv] =>
     if d == 1 then
-      let i ← expectInt (← eval env e)
+      let i ← expectInt iv
       let lo := l[0]!
       let hi := u[0]!
       if i < lo || i > hi then rtErr s!"index {i} out of bounds [{lo}:{hi}]"
@@ -707,17 +725,17 @@ partial def evalSlice (env : Env) (arr : Core) (idx : List CoreIdx) (viaRef : Bo
         | some v => return v
         | none => rtErr "internal: element offset out of range"
   | _ => pure ()
-  -- evaluate indexers
+  -- collect the indexers
   let mut ixs : Array (Option Int × Option Int × Option Int × Bool) := #[]   -- (lwb, upb, at, isIndex)
   for ix in idx do
     match ix with
-    | .index e =>
-      let i ← expectInt (← eval env e)
+    | .index iv =>
+      let i ← expectInt iv
       ixs := ixs.push (some i, some i, none, true)
     | .trim lo hi at_ =>
-      let lo' ← lo.mapM fun e => do expectInt (← eval env e)
-      let hi' ← hi.mapM fun e => do expectInt (← eval env e)
-      let at' ← at_.mapM fun e => do expectInt (← eval env e)
+      let lo' ← lo.mapM expectInt
+      let hi' ← hi.mapM expectInt
+      let at' ← at_.mapM expectInt
       ixs := ixs.push (lo', hi', at', false)
   -- strides
   let mut strides : Array Nat := Array.replicate d 1
@@ -1946,6 +1964,13 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
 
 -- ### Formatted output
 
+/-- Evaluate an expression embedded in a format text.  In a compiled program these are
+    `hole` nodes that call straight into the compiled code, so no syntax is walked. -/
+partial def evalFmtExpr (env : Env) (e : Core) : M Value := do
+  match e with
+  | .hole fn idx => (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env : IO Value)
+  | _ => eval env e
+
 /-- Expand the format items of a format value into a flat picture list. -/
 partial def expandFormat (env : Env) (items : List CoreFmt) : M (List Pic) := do
   let b ← walkFormat env items {}
@@ -1972,7 +1997,7 @@ partial def walkFormat (env : Env) (items : List CoreFmt) (b0 : FmtBuild) : M Fm
     | .col => b := { pics := b.flush ++ [.col 1] }
     | .rep n dyn inner =>
       let k ← match dyn with
-        | some e => do pure (← expectInt (← eval env e)).toNat
+        | some e => do pure (← expectInt (← evalFmtExpr env e)).toNat
         | none => pure n
       b ← walkFormat env (List.replicate k inner) b
     | .group inner =>
@@ -1981,14 +2006,14 @@ partial def walkFormat (env : Env) (items : List CoreFmt) (b0 : FmtBuild) : M Fm
       b ← walkFormat env inner b
       b := { pics := b.flush }
     | .general args =>
-      let vs ← args.mapM fun a => do expectInt (← eval env a)
+      let vs ← args.mapM fun a => do expectInt (← evalFmtExpr env a)
       b := b.addPic (.general vs)
     | .bool_ f g => b := b.addPic (.bool_ f g)
     | .choice alts => b := b.addPic (.choice alts)
     | .strings => b := { pics := b.flush }
     | .sep => b := { pics := b.flush }
     | .include f =>
-      match (← eval env f) with
+      match (← evalFmtExpr env f) with
       | .fmt fenv fitems => b := b.addPic (.include fitems fenv)
       | _ => rtErr "format expected in f(...)"
   return b
