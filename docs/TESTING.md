@@ -55,6 +55,16 @@ The a68g test set relies heavily on optional libraries (GSL, MPFR, plotutils,
 R, the network) and on `LONG LONG REAL`; the 31 programs that run on a plain
 a68g were used, of which 17 are reproduced exactly.
 
+## 3a. The C back end
+
+Everything above runs the interpreter. `tests/difftest-compiled.sh` runs the
+same corpus through `a68lean compile`, executes the resulting native binaries
+and compares their bytes with a68g's recorded output. Because both back ends
+share `A68.Runtime`, a difference between them can only come from the compiled
+*structure* — frames, control flow, jumps — which is what this test exercises.
+The same script with `-O0` versus `-O2` checks that the optimiser changes no
+observable behaviour.
+
 ## 4. Differential fuzzing (`fuzz/`)
 
 `fuzz/gen.py` is a grammar-based generator of random Algol 68 programs over

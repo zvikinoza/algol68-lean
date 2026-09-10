@@ -1,8 +1,8 @@
 # Architecture
 
-`a68lean` is organised as a classical compiler front end followed by an
-evaluator for the compiled representation. Every stage is a total Lean
-function except where noted.
+`a68lean` is organised as a classical compiler front end, followed by either an
+evaluator for the core representation or a C back end. Every stage is a total
+Lean function except where noted.
 
 ```
 source text
@@ -15,10 +15,18 @@ A68.Syntax  (parse tree)
    │  A68.Elab.elabProgram         (modes, coercions, operator identification, scopes)
    ▼
 A68.Core    (typed core representation with explicit coercions and resolved names)
-   │  A68.Interp.run
+   │  A68.Opt.run                  (constant folding, coercion and block simplification)
+   ▼
+A68.Core    (optimised)
+   ├── A68.Interp.run              → run directly            (a68lean run)
+   └── A68.CodeGen.program         → C → system C compiler   (a68lean compile)
    ▼
 observable behaviour (stdout bytes, files, exit status)
 ```
+
+Both back ends share `A68.Runtime`, so `print`, `printf`, the operators and the
+number formatting are one implementation reached two ways; that is what makes a
+compiled program and an interpreted one produce the same bytes.
 
 ## Lexer (`A68/Lexer.lean`)
 
@@ -145,3 +153,62 @@ reproduces that loop bit for bit (including a68g's `ten_up` power table), so
 that outputs such as `123456789012345671.653` for the double
 `123456789012345678.0` are identical. See
 [COMPATIBILITY.md](COMPATIBILITY.md) for details.
+
+## Optimiser (`A68/Opt.lean`)
+
+The passes are those of a68g's optimiser (`plugin-folder.c`, `plugin-inline.c`),
+applied to the core representation before either back end runs:
+
+* **Constant folding.** An operator, coercion or widening whose operands are all
+  literals is replaced by the literal it evaluates to. The folding is done *by
+  running the unit with the run-time evaluator* in a scratch state with no
+  output, so a folded value cannot differ from what the program would have
+  computed, and a unit that would fail at run time (overflow, division by zero)
+  is simply left alone.
+* **Coercion simplification.** `deref (refCell d s)` becomes `loadCell d s`,
+  and a widening between equal modes disappears.
+* **Constant control flow.** A conditional, short-circuit operator or case with
+  a constant selector becomes the branch it selects.
+* **Frameless blocks.** A block that allocates no cells, declares nothing and
+  has no labels needs no run-time frame; its units become a sequence. Removing a
+  frame changes what every enclosed name is relative to, so the pass shifts the
+  depth of each name that reaches past the removed frame — the same de Bruijn
+  shift a compiler performs when it drops a scope.
+
+`-O0` disables the passes, `-O1` (the default) runs them once, `-O2` twice.
+`A68.Verified.Opt` proves the same rewrites correct over the formal core.
+
+## C back end (`A68/CodeGen.lean`, `A68/Runtime.lean`, `A68/Serial.lean`)
+
+`a68lean compile` emits a self-contained C program and hands it to the system C
+compiler. The division of labour mirrors a68g's optimiser, which also compiles
+units to C against its own runtime, except that the result here is a whole
+program rather than a plugin loaded back into an interpreter:
+
+* **Structure is compiled.** Blocks, conditionals, cases, loops and jumps become
+  C control flow; every routine text becomes its own C function.
+* **Values go through the runtime.** `A68.Runtime` exposes the evaluator's
+  operations as a C-callable API that is deliberately integer-only, so the
+  generated C never touches a Lean object: an environment stack of frames of
+  cells (`a68rt_enter` / `a68rt_leave`) and an operand stack of values
+  (`a68rt_push_*`, `a68rt_dyop`, …), which is the discipline the verified stack
+  machine models.
+* **Tables are rebuilt at start-up.** Modes tag united values and drive the
+  layout of `print`; format texts carry the pictures. Both are serialised by
+  `A68.Serial` into a blob the C program carries as a string literal and hands
+  to `a68rt_boot`.
+* **Calls back into compiled code.** A compiled procedure is a `Value.cproc`
+  holding a function index and its captured environment; the dynamic parts of a
+  format text are `Core.hole` nodes. When the runtime needs either, it calls
+  `a68_dispatch_proc` / `a68_dispatch_hole`, which the generated program
+  defines. The `a68lean` binary itself links stubs for them (`csrc/stubs.c`).
+* **Jumps.** A jump to a label of the enclosing C function is a C `goto`. A jump
+  out of a routine sets a pending label and returns; each call site checks it and
+  either lands on one of its own labels or returns in turn, so the C stack
+  unwinds without `longjmp`. Landing restores the environment and operand stack
+  to the depths recorded at block entry, which is what the evaluator does when it
+  re-enters a block at a label.
+
+A compiled program links the Lean runtime and this compiler's library, so the
+binaries are large (about 18 MB) and need the Lean toolchain at link time, not
+at run time.

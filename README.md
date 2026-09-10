@@ -31,11 +31,17 @@ unsupported a68g extensions or genuine gaps listed in the testing document.
 
 ```bash
 # toolchain: Lean 4 via elan (https://github.com/leanprover/elan)
-lake build                                  # builds the compiler and checks all proofs
-.lake/build/bin/a68lean run hello.a68       # compile and run a program
-.lake/build/bin/a68lean check hello.a68     # parse + mode check only
-.lake/build/bin/a68lean dump hello.a68      # print the elaborated core representation
+lake build                                    # builds the compiler and checks all proofs
+.lake/build/bin/a68lean run hello.a68         # compile and run in one step
+.lake/build/bin/a68lean compile hello.a68     # compile to C and link a native binary
+./hello                                       # …then run it
+.lake/build/bin/a68lean compile hello.a68 -c  # keep the generated C only
+.lake/build/bin/a68lean check hello.a68       # parse + mode check only
+.lake/build/bin/a68lean dump hello.a68        # print the elaborated core representation
 ```
+
+`compile` accepts `-o <file>`, `-O0`/`-O1`/`-O2` (optimiser level, default
+`-O1`) and `-v` (report how many core nodes the optimiser removed).
 
 ```algol68
 BEGIN
@@ -91,6 +97,12 @@ fuzz/run.sh 1 200           # differential fuzzing: 200 random programs from see
   mathematical functions, `char in string`, `string in string`, character
   classification, a68g's taus113 random generator (`random`, `first random`),
   environment enquiries.
+* **Two back ends**: a direct evaluator, and a C back end that emits a
+  self-contained C program (compiled control flow, one C function per routine
+  text) linked against the same runtime, so both produce identical bytes.
+* **Optimiser**: constant folding by evaluation, coercion simplification,
+  constant control flow and frameless-block flattening, mirroring a68g's
+  optimiser passes; the same rewrites are proved correct over the formal core.
 
 ## Project layout
 
@@ -104,7 +116,13 @@ A68/Builtins.lean    modes of the standard prelude
 A68/Numfmt.lean      byte-exact number formatting (whole/fixed/float)
 A68/Elab.lean        elaborator: mode checking, coercions, operator identification
 A68/Interp.lean      evaluator, standard prelude, formatted transput, files
+A68/Opt.lean         optimisation passes over the core representation
+A68/CodeGen.lean     C back end
+A68/Runtime.lean     C-callable runtime shared by both back ends
+A68/Serial.lean      mode and format tables carried by compiled programs
+A68/Pretty.lean      readable rendering of the core representation (dump)
 A68/Verified/        machine-checked theorems
+csrc/stubs.c         default dispatch hooks for the interpreter binary
 Main.lean            command line driver
 tests/               regression suite and differential-test scripts
 fuzz/                grammar-based program generator and fuzz driver

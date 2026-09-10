@@ -52,6 +52,71 @@ def evalConst (rt : Interp.Rt) (c : Core) : IO (Option Value) := do
     | _ => return none
   | .error _ => return none
 
+-- Remove one frame from the environment chain: every name that reaches past the
+-- removed frame moves one level closer.  `cutoff` counts the frames pushed between
+-- the current point and the frame being removed, so it grows at every construct that
+-- pushes one: blocks, routine texts, loop iterations and conformity alternatives.
+mutual
+partial def shift (cutoff : Nat) : Core → Core
+  | .loadCell d s => .loadCell (if d > cutoff then d - 1 else d) s
+  | .refCell d s => .refCell (if d > cutoff then d - 1 else d) s
+  | .block size stmts lb nl => .block size (stmts.map (shiftStmt (cutoff + 1))) lb nl
+  | .routine np fs body => .routine np fs (shift (cutoff + 1) body)
+  | .loop slot f b t w body =>
+    -- the bounds are evaluated outside the iteration frame, the rest inside it
+    .loop slot (shift cutoff f) (shift cutoff b) (t.map (shift cutoff))
+          (w.map (shift (cutoff + 1))) (shift (cutoff + 1) body)
+  | .caseConf sel alts out =>
+    .caseConf (shift cutoff sel) (alts.map fun (m, s, c) => (m, s, shift (cutoff + 1) c))
+              (shift cutoff out)
+  | .deref e => .deref (shift cutoff e)
+  | .deproc e => .deproc (shift cutoff e)
+  | .rowOf e => .rowOf (shift cutoff e)
+  | .voiding e => .voiding (shift cutoff e)
+  | .gen e => .gen (shift cutoff e)
+  | .at p e => .at p (shift cutoff e)
+  | .widen a b e => .widen a b (shift cutoff e)
+  | .unite m e => .unite m (shift cutoff e)
+  | .monop op m e => .monop op m (shift cutoff e)
+  | .select i e r => .select i (shift cutoff e) r
+  | .assign a b f => .assign (shift cutoff a) (shift cutoff b) f
+  | .identRel a b i => .identRel (shift cutoff a) (shift cutoff b) i
+  | .andThen a b => .andThen (shift cutoff a) (shift cutoff b)
+  | .orElse a b => .orElse (shift cutoff a) (shift cutoff b)
+  | .seq a b => .seq (shift cutoff a) (shift cutoff b)
+  | .dyop op m1 m2 a b => .dyop op m1 m2 (shift cutoff a) (shift cutoff b)
+  | .call f args => .call (shift cutoff f) (args.map (shift cutoff))
+  | .slice a idx r => .slice (shift cutoff a) (idx.map (shiftIdx cutoff)) r
+  | .newRow bs i f => .newRow (bs.map fun (l, u) => (shift cutoff l, shift cutoff u)) (shift cutoff i) f
+  | .collateral es st d => .collateral (es.map (shift cutoff)) st d
+  | .cond c t e => .cond (shift cutoff c) (shift cutoff t) (shift cutoff e)
+  | .caseInt s alts o => .caseInt (shift cutoff s) (alts.map (shift cutoff)) (shift cutoff o)
+  | other => other
+
+partial def shiftStmt (cutoff : Nat) : CoreStmt → CoreStmt
+  | .decl slot init => .decl slot (shift cutoff init)
+  | .unit e => .unit (shift cutoff e)
+  | st => st
+
+partial def shiftIdx (cutoff : Nat) : CoreIdx → CoreIdx
+  | .index e => .index (shift cutoff e)
+  | .trim l u a => .trim (l.map (shift cutoff)) (u.map (shift cutoff)) (a.map (shift cutoff))
+end
+
+/-- A block that allocates no cells, declares nothing and has no labels needs no frame:
+    its units become a sequence, with the names inside shifted one level closer. -/
+def flattenBlock (size : Nat) (stmts : Array CoreStmt) (nl : Nat) : Option Core :=
+  if size != 0 || nl != 0 then none
+  else
+    let units := stmts.toList.filterMap fun
+      | .unit e => some e
+      | _ => none
+    if units.length != stmts.size then none      -- a declaration, label or EXIT is present
+    else match units.map (shift 0) with
+      | [] => some (.lit .void)
+      | [e] => some e
+      | e :: rest => some (rest.foldl (fun acc u => .seq acc u) e)
+
 mutual
 
 /-- Constant folding and the structural simplifications. -/
@@ -113,15 +178,12 @@ partial def opt (rt : Interp.Rt) (c : Core) : IO Core := do
     | .lit (.int i) =>
       if i ≥ 1 && i ≤ alts.length then return alts[(i - 1).toNat]! else return out
     | _ => return .caseInt sel alts out
-  -- a block that needs no frame, has no labels and only one unit is that unit
+  -- a block that needs no frame, declares nothing and has no labels needs no frame
   | .block size stmts lb nl =>
     let stmts ← stmts.mapM (optStmt rt)
-    if size == 0 && nl == 0 then
-      match stmts.toList with
-      | [.unit e] => return e
-      | [] => return .lit .void
-      | _ => return .block size stmts lb nl
-    else return .block size stmts lb nl
+    match flattenBlock size stmts nl with
+    | some c => return c
+    | none => return .block size stmts lb nl
   -- congruence cases
   | .deproc e => return .deproc (← opt rt e)
   | .rowOf e => return .rowOf (← opt rt e)
