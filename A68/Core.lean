@@ -76,7 +76,7 @@ inductive CoreFmt where
   deriving Inhabited, Repr
 
 inductive CoreStmt where
-  | decl (slot : Nat) (init : Core)
+  | decl (slot : Nat) (mode : Mode) (init : Core)
   | unit (e : Core)
   | label (id : Nat)
   | exit

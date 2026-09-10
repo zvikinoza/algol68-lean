@@ -655,7 +655,7 @@ partial def elabDecl (d : Decl) : Elab (List CoreStmt) := do
       let dflt ← match m with
         | .ind "" => pure (Core.lit .undef)
         | _ => defaultValue m
-      out := out ++ [.decl b.slot dflt]
+      out := out ++ [.decl b.slot elemM dflt]
       match init with
       | some e =>
         let (c, _) ← elabUnit e (.strong elemM)
@@ -668,7 +668,7 @@ partial def elabDecl (d : Decl) : Elab (List CoreStmt) := do
     for (n, e) in items do
       let some b ← lookup n | err "internal: identity binding"
       let (c, _) ← elabUnit e (.strong b.mode)
-      out := out ++ [.decl b.slot (.at p c)]
+      out := out ++ [.decl b.slot b.mode (.at p c)]
     return out
   | .op name m body p =>
     modify fun es => { es with curPos := p }
@@ -682,7 +682,7 @@ partial def elabDecl (d : Decl) : Elab (List CoreStmt) := do
       if chosen.isNone && ob.depth == d - 1 && (← eqv ob.mode mode) then chosen := some ob
     let some ob := chosen | err "internal: op binding"
     let (c, _) ← elabUnit body (.strong ob.mode)
-    return [.decl ob.slot (.at p c)]
+    return [.decl ob.slot ob.mode (.at p c)]
 
 partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
   modify fun es => { es with curPos := e.pos }

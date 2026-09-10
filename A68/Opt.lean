@@ -94,7 +94,7 @@ partial def shift (cutoff : Nat) : Core → Core
   | other => other
 
 partial def shiftStmt (cutoff : Nat) : CoreStmt → CoreStmt
-  | .decl slot init => .decl slot (shift cutoff init)
+  | .decl slot m init => .decl slot m (shift cutoff init)
   | .unit e => .unit (shift cutoff e)
   | st => st
 
@@ -210,7 +210,7 @@ partial def opt (rt : Interp.Rt) (c : Core) : IO Core := do
   | other => return other
 
 partial def optStmt (rt : Interp.Rt) : CoreStmt → IO CoreStmt
-  | .decl slot init => return .decl slot (← opt rt init)
+  | .decl slot m init => return .decl slot m (← opt rt init)
   | .unit e => return .unit (← opt rt e)
   | st => return st
 
@@ -243,7 +243,7 @@ partial def size : Core → Nat
       | .trim l u a => (l.map size).getD 0 + (u.map size).getD 0 + (a.map size).getD 0)).foldl (· + ·) 0
   | .newRow bs i _ => 1 + size i + (bs.map (fun (l, u) => size l + size u)).foldl (· + ·) 0
   | .block _ stmts _ _ => 1 + (stmts.toList.map (fun
-      | .decl _ c => size c
+      | .decl _ _ c => size c
       | .unit c => size c
       | _ => 0)).foldl (· + ·) 0
   | .collateral es _ _ => 1 + (es.map size).foldl (· + ·) 0

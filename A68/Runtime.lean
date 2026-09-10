@@ -68,7 +68,10 @@ private def flushOut : IO Unit := do
 private def die (msg : String) : IO α := do
   let rt ← getRt
   flushOut
-  IO.eprintln s!"a68lean: runtime error: {(← rt.pos.get).line}: {msg}."
+  let cl ← Interp.compiledLine ()
+  let evalLine := (← rt.pos.get).line
+  let line := if cl == 0 then evalLine else cl.toNat
+  IO.eprintln s!"a68lean: runtime error: {line}: {msg}."
   IO.Process.exit 1
 
 /-- Run a runtime action.  `stop` and errors leave the process; a jump is recorded
@@ -319,6 +322,113 @@ def takeTop : IO Value := do
 @[export a68rt_push_array]
 def pushArray (a : Array Value) : IO Unit := go do
   for v in a do push v
+
+-- ## Native scalar access
+--
+-- These are the entry points the compiled code uses for values of primitive mode: they
+-- read and write a cell in a native C type, so an expression like `s + i * 3` becomes C
+-- arithmetic with nothing boxed and nothing pushed on the operand stack.
+
+@[export a68rt_cell_int]
+def cellInt (depth slot : UInt32) : IO Int64 := do
+  match (← run (Interp.readCell (← cellOf depth slot)) .undef) with
+  | .int n => return Int64.ofInt n
+  | .undef => die "attempt to use an uninitialised INT value"
+  | _ => throw (IO.userError "INT expected")
+
+@[export a68rt_cell_real]
+def cellReal (depth slot : UInt32) : IO Float := do
+  match (← run (Interp.readCell (← cellOf depth slot)) .undef) with
+  | .real x => return x
+  | .int n => return Float.ofInt n
+  | .undef => die "attempt to use an uninitialised REAL value"
+  | _ => throw (IO.userError "REAL expected")
+
+@[export a68rt_cell_bool]
+def cellBool (depth slot : UInt32) : IO UInt8 := do
+  match (← run (Interp.readCell (← cellOf depth slot)) .undef) with
+  | .bool b => return (if b then 1 else 0)
+  | .undef => die "attempt to use an uninitialised BOOL value"
+  | _ => throw (IO.userError "BOOL expected")
+
+@[export a68rt_cell_char]
+def cellChar (depth slot : UInt32) : IO UInt32 := do
+  match (← run (Interp.readCell (← cellOf depth slot)) .undef) with
+  | .char c => return UInt32.ofNat c
+  | .undef => die "attempt to use an uninitialised CHAR value"
+  | _ => throw (IO.userError "CHAR expected")
+
+@[export a68rt_cell_bits]
+def cellBits (depth slot : UInt32) : IO UInt64 := do
+  match (← run (Interp.readCell (← cellOf depth slot)) .undef) with
+  | .bits b => return UInt64.ofNat b
+  | .undef => die "attempt to use an uninitialised BITS value"
+  | _ => throw (IO.userError "BITS expected")
+
+@[export a68rt_set_cell_int]
+def setCellInt (depth slot : UInt32) (v : Int64) : IO Unit := do
+  run (Interp.writeCell (← cellOf depth slot) (.int v.toInt)) ()
+
+@[export a68rt_set_cell_real]
+def setCellReal (depth slot : UInt32) (v : Float) : IO Unit := do
+  run (Interp.writeCell (← cellOf depth slot) (.real v)) ()
+
+@[export a68rt_set_cell_bool]
+def setCellBool (depth slot : UInt32) (v : UInt8) : IO Unit := do
+  run (Interp.writeCell (← cellOf depth slot) (.bool (v != 0))) ()
+
+@[export a68rt_set_cell_char]
+def setCellChar (depth slot : UInt32) (v : UInt32) : IO Unit := do
+  run (Interp.writeCell (← cellOf depth slot) (.char v.toNat)) ()
+
+@[export a68rt_set_cell_bits]
+def setCellBits (depth slot : UInt32) (v : UInt64) : IO Unit := do
+  run (Interp.writeCell (← cellOf depth slot) (.bits v.toNat)) ()
+
+@[export a68rt_pop_real]
+def popReal : IO Float :=
+  val (do
+    match (← pop) with
+    | .real x => return x
+    | .int n => return Float.ofInt n
+    | .undef => die "attempt to use an uninitialised REAL value"
+    | _ => throw (IO.userError "REAL expected")) 0.0
+
+@[export a68rt_pop_char]
+def popChar : IO UInt32 :=
+  val (do
+    match (← pop) with
+    | .char c => return UInt32.ofNat c
+    | .undef => die "attempt to use an uninitialised CHAR value"
+    | _ => throw (IO.userError "CHAR expected")) 0
+
+@[export a68rt_pop_bits]
+def popBits : IO UInt64 :=
+  val (do
+    match (← pop) with
+    | .bits b => return UInt64.ofNat b
+    | .undef => die "attempt to use an uninitialised BITS value"
+    | _ => throw (IO.userError "BITS expected")) 0
+
+/-- A promoted C variable read before it was assigned. -/
+@[export a68rt_undef_error]
+def undefError (kind : UInt32) : IO Unit := do
+  die (match kind with
+       | 0 => "attempt to use an uninitialised INT value"
+       | 1 => "attempt to use an uninitialised REAL value"
+       | 2 => "attempt to use an uninitialised BOOL value"
+       | 3 => "attempt to use an uninitialised CHAR value"
+       | _ => "attempt to use an uninitialised BITS value")
+
+/-- Report a failure detected by native arithmetic in compiled code. -/
+@[export a68rt_arith_error]
+def arithError (kind : UInt32) : IO Unit := do
+  die (match kind with
+       | 0 => "INT value overflow, result too large"
+       | 1 => "INT division by zero"
+       | 2 => "infinite REAL value"
+       | 3 => "REAL value is not a number"
+       | _ => "INT value out of bounds")
 
 -- ## Reading scalars back into C
 

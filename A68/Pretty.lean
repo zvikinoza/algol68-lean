@@ -88,7 +88,7 @@ partial def core (n : Nat) : Core → String
   | .hole fn idx => s!"(hole {fn}.{idx})"
 
 partial def stmt (n : Nat) : CoreStmt → String
-  | .decl slot init => s!"cell[0.{slot}] := {core n init}"
+  | .decl slot _ init => s!"cell[0.{slot}] := {core n init}"
   | .unit e => core n e
   | .label id => s!"L{id}:"
   | .exit => "EXIT"

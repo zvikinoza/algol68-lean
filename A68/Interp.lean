@@ -73,9 +73,19 @@ abbrev Env := List (Array Nat)
 
 instance : Inhabited (M α) := ⟨fun _ => throw default⟩
 
-def rtErr (msg : String) : M α := do
+/-- The line a compiled program last reached; zero while the evaluator is running. -/
+@[extern "a68_get_line"]
+opaque compiledLine (u : Unit) : BaseIO UInt32
+
+/-- Where to say an error happened: the line the compiled program recorded, when there is
+    one, and otherwise the position the evaluator is holding. -/
+def errPos : M Pos := do
   let p ← (← read).pos.get
-  throw (.error msg p)
+  let cl ← compiledLine ()
+  return if cl == 0 then p else { p with line := cl.toNat, col := 0 }
+
+def rtErr (msg : String) : M α := do
+  throw (.error msg (← errPos))
 
 def alloc (v : Value) : M Nat := do
   (← read).heap.modifyGet fun h => (h.size, h.push v)
@@ -862,7 +872,7 @@ partial def runStmts (env : Env) (frame : Array Nat) (stmts : Array CoreStmt) (s
   let mut v : Value := .void
   for i in [start:stmts.size] do
     match stmts[i]! with
-    | .decl slot init =>
+    | .decl slot _ init =>
       let x ← eval env init
       writeCell frame[slot]! x
     | .unit e => v ← eval env e

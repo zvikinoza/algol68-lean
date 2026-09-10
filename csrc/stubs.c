@@ -11,6 +11,17 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/* The source line a compiled program last reached.  Compiled code records it with a
+   plain store to this variable rather than a call into the runtime, so that reaching a
+   statement costs nothing at all when the statement does not fail.  It stays zero while
+   the evaluator runs, which is how the error reporter knows to use its own position. */
+uint32_t a68_line_no = 0;
+
+uint32_t a68_get_line(lean_object* w) {
+  (void) w;
+  return a68_line_no;
+}
+
 /* Holds `some state`, so that the accessor need not allocate. */
 static lean_object* a68_state = NULL;
 
