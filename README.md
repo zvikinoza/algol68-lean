@@ -27,6 +27,27 @@ output depends on a68g's multi-precision `LONG REAL` arithmetic (not
 implemented: `LONG REAL` is IEEE double here), and a small remainder of
 unsupported a68g extensions or genuine gaps listed in the testing document.
 
+## Speed of the compiled program
+
+`a68lean compile` produces a native binary, and for numeric and array code that
+binary is now close to hand-written C. Every benchmark in `benchmarks/` ships
+with a C twin computing the same answer, which is the ceiling the emitted code
+is measured against.
+
+On `intloop`, twenty million iterations of `s := (s + i * 3) MOD 1000003`:
+
+| | vs hand-written C |
+|---|---:|
+| a68lean compiled `-O2` | 1.8x |
+| a68g interpreted | 30x |
+| a68lean compiled, before this work | 350x |
+
+Values of primitive mode are computed in native C types, locals that cannot
+escape become C variables rather than run-time cells, and a row element is
+reached in one call instead of four. See
+[benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for the analysis and for what
+is still slow — procedure calls, structure fields and strings.
+
 ## Quick start
 
 ```bash

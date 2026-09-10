@@ -202,12 +202,30 @@ program rather than a plugin loaded back into an interpreter:
 
 * **Structure is compiled.** Blocks, conditionals, cases, loops and jumps become
   C control flow; every routine text becomes its own C function.
-* **Values go through the runtime.** `A68.Runtime` exposes the evaluator's
-  operations as a C-callable API that is deliberately integer-only, so the
-  generated C never touches a Lean object: an environment stack of frames of
-  cells (`a68rt_enter` / `a68rt_leave`) and an operand stack of values
+* **Values of primitive mode are compiled to native C.** `INT`, `REAL`, `BOOL`,
+  `CHAR` and `BITS` at their unwidened length are computed in `int64_t`,
+  `double`, `uint8_t`, `uint32_t` and `uint64_t`, so `(s + i * 3) MOD 1000003`
+  is one line of C arithmetic that allocates nothing. Each helper reproduces the
+  check its interpreted counterpart performs, so overflow, division by zero and
+  a non-finite real still fail in the same place with the same message. Longer
+  lengths keep the runtime's arbitrary-precision representation.
+* **Locals that cannot escape become C variables.** A slot qualifies when its
+  declared mode is primitive, nothing takes a reference to it, and no routine
+  text or format text inside the frame could reach it from another C function.
+  When every slot of a frame qualifies, no run-time frame is pushed for it, and
+  `rtDepthOf` translates the syntactic depths that `loadCell` and `refCell`
+  carry into the run-time depths that remain. A `FOR` counter becomes the C
+  induction variable itself.
+* **Everything else goes through the runtime.** `A68.Runtime` exposes the
+  evaluator's operations as a C-callable API that is deliberately integer-only,
+  so the generated C never touches a Lean object: an environment stack of frames
+  of cells (`a68rt_enter` / `a68rt_leave`) and an operand stack of values
   (`a68rt_push_*`, `a68rt_dyop`, …), which is the discipline the verified stack
-  machine models.
+  machine models. Rows are the one composite with a short cut: an element of a
+  row held directly in a cell is read and written by one call that carries a
+  native value, and anything else falls back to the general slicing machinery.
+* **Reaching a statement is a store, not a call.** The current line lives in a C
+  variable that the error reporters read when a compiled program is running.
 * **Tables are rebuilt at start-up.** Modes tag united values and drive the
   layout of `print`; format texts carry the pictures. Both are serialised by
   `A68.Serial` into a blob the C program carries as a string literal and hands
@@ -223,6 +241,11 @@ program rather than a plugin loaded back into an interpreter:
   unwinds without `longjmp`. Landing restores the environment and operand stack
   to the depths recorded at block entry, which is what the evaluator does when it
   re-enters a block at a label.
+
+Promotion depends on the optimiser having flattened the block structure: at
+`-O0` each unit sits in its own block, so an assignment is the value of its
+block rather than a statement, and the escape analysis rightly refuses. `-O1`
+and `-O2` flatten first, and that is where the native code appears.
 
 A compiled program links the Lean runtime and this compiler's library, so the
 binaries are large (about 18 MB) and need the Lean toolchain at link time, not

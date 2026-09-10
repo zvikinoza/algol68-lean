@@ -13,6 +13,13 @@
 # results/bench.csv as: program,variant,seconds,ops,ns_per_op,status
 #
 # Usage: bench.sh [name ...]      (default: every program in progs/)
+#
+# Environment:
+#   REPS=n        repetitions per measurement, best taken (default 3)
+#   VARIANTS=...  space-separated subset of: native a68g a68gO interp comp0 comp1 comp2
+#                 (default: all).  `interp` and `comp0` are the slow ones; when you are
+#                 measuring the emitted binary, VARIANTS="native a68g comp1 comp2" is
+#                 several times quicker and measures the same thing.
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
 BIN=${A68LEAN:-$DIR/../.lake/build/bin/a68lean}
@@ -20,6 +27,14 @@ OUT=$DIR/results
 mkdir -p "$OUT" "$DIR/build"
 CSV=$OUT/bench.csv
 REPS=${REPS:-3}
+VARIANTS=${VARIANTS:-"native a68g a68gO interp comp0 comp1 comp2"}
+want() { case " $VARIANTS " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# Record what else the machine was doing.  CPU time is far steadier than wall clock, but
+# it is not immune to contention, so a reader should be able to see the conditions.
+LOAD=$(uptime | sed 's/.*averages*: *//')
+echo "# load averages at start: $LOAD" > "$CSV.meta"
+echo "# variants: $VARIANTS, reps: $REPS" >> "$CSV.meta"
 echo "program,variant,seconds,ops,ns_per_op,status" > "$CSV"
 
 # Best-of-N CPU time (user+sys) of a command, in seconds.  CPU time rather than wall
@@ -60,8 +75,10 @@ for name in $progs; do
   if [ -f "$DIR/native/$name.c" ]; then
     cc -O2 -w "$DIR/native/$name.c" -o "$DIR/build/$name.native" 2>/dev/null
     "$DIR/build/$name.native" > "$ref" 2>/dev/null
-    t=$(timeit "$DIR/build/$name.native")
-    record "$name" native "$t" "$ops" ok
+    if want native; then
+      t=$(timeit "$DIR/build/$name.native")
+      record "$name" native "$t" "$ops" ok
+    fi
   else
     a68g "$src" > "$ref" 2>/dev/null
   fi
@@ -73,27 +90,34 @@ for name in $progs; do
   }
 
   o=$DIR/build/$name.out
+  if want a68g; then
   if gtimeout 300 a68g "$src" > "$o" 2>/dev/null; then
     t=$(timeit a68g "$src"); record "$name" a68g "$t" "$ops" "$(check "$o")"
   else
     record "$name" a68g 999999 "$ops" failed
   fi
+  fi
 
   # a68g --compile writes prog.c/prog.o next to the source; keep progs/ clean
+  if want a68gO; then
   if gtimeout 300 a68g -O "$src" > "$o" 2>/dev/null; then
     t=$(timeit a68g -O "$src"); record "$name" a68gO "$t" "$ops" "$(check "$o")"
   else
     record "$name" a68gO 999999 "$ops" unsupported
   fi
+  fi
   rm -f "$DIR/progs/$name.c" "$DIR/progs/$name.o" "$DIR/progs/$name.so"
 
+  if want interp; then
   if gtimeout 300 "$BIN" run "$src" > "$o" 2>/dev/null; then
     t=$(timeit "$BIN" run "$src"); record "$name" interp "$t" "$ops" "$(check "$o")"
   else
     record "$name" interp 999999 "$ops" failed
   fi
+  fi
 
   for lvl in 0 1 2; do
+    want "comp$lvl" || continue
     exe=$DIR/build/$name.O$lvl
     if "$BIN" compile "$src" -O$lvl -o "$exe" >/dev/null 2>&1; then
       if gtimeout 300 "$exe" > "$o" 2>/dev/null; then

@@ -10,7 +10,16 @@ cd benchmarks
 REPS=3 ./bench.sh                 # all benchmarks, all implementations
 REPS=3 ./bench.sh intloop calls   # a subset
 python3 roofline.py               # analysis of results/bench.csv
+
+# when you only care about the emitted binary, which is usually the case:
+VARIANTS="native a68g comp1 comp2" REPS=3 ./bench.sh
 ```
+
+`VARIANTS` selects which implementations to time. Leaving out `interp` and
+`comp0`, which are one to two orders of magnitude slower than the rest, cuts a
+full sweep from hours to minutes and measures the same thing. The machine's load
+averages at the start of a run are written to `results/bench.csv.meta`, so a set
+of numbers carries the conditions it was taken under.
 
 For each program the harness runs, and checks the output of, seven variants:
 
@@ -43,6 +52,11 @@ Times are **CPU time (user + sys), best of `REPS` runs**, not wall clock, so
 that numbers stay meaningful when something else is using the machine. Even so,
 the authoritative numbers for a report should be taken on an otherwise idle
 machine.
+
+When a run was made under load, quote the **slowdown against the C twin** rather
+than the absolute nanoseconds. Contention stretches the twin and the compiled
+binary by roughly the same factor, so the ratio survives what the absolute
+figure does not.
 
 ## What the numbers mean
 
