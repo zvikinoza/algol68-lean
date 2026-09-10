@@ -13,5 +13,6 @@ import A68.Builtins
 import A68.Numfmt
 import A68.Elab
 import A68.Interp
+import A68.Pretty
 import A68.Verified.StackMachine
 import A68.Verified.Numfmt

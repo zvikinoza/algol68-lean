@@ -50,6 +50,7 @@ structure FileSt where
   writing : Bool := false
   reading : Bool := false
   loaded  : Bool := false                    -- stand in: read lazily
+  eof     : Bool := false                    -- stand in: no more input available
   dirty   : Bool := false                    -- has unflushed output for a disk file
   onDisk  : Bool := false
   deriving Inhabited
@@ -1213,17 +1214,21 @@ partial def setFile (fid : Nat) (f : FileSt) : M Unit := do
     take the current value of their string). -/
 partial def loadFile (fid : Nat) : M FileSt := do
   let f ← getFile fid
-  if f.loaded then return f
   if fid == 1 then
+    -- standard input is read a line at a time so that interactive programs work:
+    -- pending output is flushed first, and more input is fetched only when needed
+    if f.pos < f.buf.size || f.eof then return f
+    flushOut
     let stdin ← IO.getStdin
-    let mut acc := ByteArray.empty
-    repeat
-      let chunk ← stdin.read 65536
-      if chunk.size == 0 then break
-      acc := acc ++ chunk
-    let f' := { f with buf := acc, pos := 0, loaded := true, reading := true }
+    let line ← stdin.getLine
+    if line.isEmpty then
+      let f' := { f with eof := true, loaded := true, reading := true }
+      setFile fid f'
+      return f'
+    let f' := { f with buf := f.buf ++ line.toUTF8, loaded := true, reading := true }
     setFile fid f'
     return f'
+  if f.loaded then return f
   match f.assoc with
   | some r =>
     let sv ← readRef r

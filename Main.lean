@@ -2,6 +2,7 @@ import A68.Parser
 import A68.Numfmt
 import A68.Elab
 import A68.Interp
+import A68.Pretty
 
 open A68
 
@@ -63,7 +64,7 @@ def main (args : List String) : IO UInt32 := do
     | none => return 1
   | ["dump", file] =>
     match (← compile file) with
-    | some (core, _, _) => IO.println (repr core); return 0
+    | some (core, _, _) => IO.println (Pretty.program core); return 0
     | none => return 1
   | ["lex", file] =>
     let src ← readSource file
