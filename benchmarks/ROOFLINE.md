@@ -78,6 +78,22 @@ three changes that got there, in the order the profile called for:
    value. A row held directly in a cell is now reached in one call that carries a
    native value; any other shape falls back to the general slicing machinery.
 
+`arraysum`, which fills and sums a thousand-element row twenty thousand times,
+shows how far the row work got and how far it has to go. Measured in the same
+run:
+
+| variant | ns/op | vs native C |
+|---|---:|---:|
+| hand-written C | 4.75 | 1x |
+| a68g, interpreted | 169.8 | 36x |
+| a68lean evaluator | 1967.3 | 414x |
+| a68lean compiled `-O2` | 137.3 | **29x** |
+
+The compiled binary now beats a68g interpreted on array code, where before it
+lost to it heavily. But 29x is still one runtime call per element, and that is
+the next thing to remove: the row descriptor is resolved from scratch on every
+access rather than once per loop.
+
 `-O0` gains almost nothing, and that is the design: promotion needs the block
 structure flattened first, so that an assignment is a statement rather than the
 value of its own block. The optimiser earns the native code.
