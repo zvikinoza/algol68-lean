@@ -240,6 +240,30 @@ def jumpCheck : M Unit := do
       emit s!"  case {l}: goto L{l};"
     emit "  default: return; } }"
 
+/-- `x +:= e` and its relatives, as a C expression for the new value.  These are the
+    assigning operators: the left operand is a name, and the operator writes through it,
+    so in statement position the whole thing is an update rather than a reference handed
+    to the runtime.  Each form reproduces the check the evaluator performs. -/
+def nativeAssignOp (op : String) (ty : CTy) (a b : String) : Option String :=
+  match ty, op with
+  | .i64, "+:=" => some s!"a68_add_i({a}, {b})"
+  | .i64, "-:=" => some s!"a68_sub_i({a}, {b})"
+  | .i64, "*:=" => some s!"a68_mul_i({a}, {b})"
+  | .i64, "%:=" => some s!"a68_over_i({a}, {b})"
+  | .i64, "%*:=" => some s!"a68_mod_i({a}, {b})"
+  | .f64, "+:=" => some s!"a68_chk_r(({a}) + ({b}))"
+  | .f64, "-:=" => some s!"a68_chk_r(({a}) - ({b}))"
+  | .f64, "*:=" => some s!"a68_chk_r(({a}) * ({b}))"
+  | .f64, "/:=" => some s!"a68_diveq_r({a}, {b})"
+  | .u64, "&:=" => some s!"(({a}) & ({b}))"
+  | .u64, "|:=" => some s!"((({a}) | ({b})) & 0xffffffffull)"
+  | _, _ => none
+
+/-- Is this assigning operator one that a slot of this type can be updated with in place?
+    The escape analysis has to ask exactly what the emitter can do, or a slot would be
+    promoted to a C variable that the emitter then cannot write. -/
+def assignsNatively (ty : CTy) (op : String) : Bool := (nativeAssignOp op ty "a" "b").isSome
+
 /-- Peel the position markers off a node. -/
 partial def strip : Core → Core
   | .at _ e => strip e
@@ -262,89 +286,97 @@ def voidPositions (stmts : Array CoreStmt) (wantValue : Bool) : Array Bool := Id
     match stmts[i]! with | .unit _ => last := some i | _ => pure ()
   let mut out : Array Bool := #[]
   for i in [0:stmts.size] do
-    out := out.push (match stmts[i]! with | .unit _ => last != some i | _ => false)
+    out := out.push (match stmts[i]! with
+      | .unit e => last != some i || (match strip e with | .voiding _ => true | _ => false)
+      | _ => false)
   return out
 
 mutual
 /-- Does anything inside `c` force slot `sl` of frame `d` to live in a run-time cell?
     A plain read is fine, and so is assigning a whole value to it in statement position;
     anything else — taking a reference to it, or using an assignment for its value — is. -/
-partial def slotEscapes (d sl : Nat) (c : Core) : Bool :=
+partial def slotEscapes (ok : String → Bool) (d sl : Nat) (c : Core) : Bool :=
   match c with
-  | .at _ e => slotEscapes d sl e
+  | .at _ e => slotEscapes ok d sl e
   | .lit _ => false
   | .loadCell _ _ => false
   | .refCell dd ss => dd == d && ss == sl
-  | .voiding e => slotEscapesV d sl e
-  | .deref e | .deproc e | .rowOf e | .gen e => slotEscapes d sl e
-  | .widen _ _ e | .unite _ e | .monop _ _ e => slotEscapes d sl e
-  | .assign dst src _ => slotEscapes d sl dst || slotEscapes d sl src
+  | .voiding e => slotEscapesV ok d sl e
+  | .deref e | .deproc e | .rowOf e | .gen e => slotEscapes ok d sl e
+  | .widen _ _ e | .unite _ e | .monop _ _ e => slotEscapes ok d sl e
+  | .assign dst src _ => slotEscapes ok d sl dst || slotEscapes ok d sl src
   | .identRel l r _ | .dyop _ _ _ l r | .andThen l r | .orElse l r =>
-    slotEscapes d sl l || slotEscapes d sl r
-  | .call f args => slotEscapes d sl f || args.any (slotEscapes d sl)
-  | .routine _ _ body => slotEscapes (d + 1) sl body
-  | .slice arr idx _ => slotEscapes d sl arr || idx.any (slotEscapesIdx d sl)
-  | .select _ e _ => slotEscapes d sl e
+    slotEscapes ok d sl l || slotEscapes ok d sl r
+  | .call f args => slotEscapes ok d sl f || args.any (slotEscapes ok d sl)
+  | .routine _ _ body => slotEscapes ok (d + 1) sl body
+  | .slice arr idx _ => slotEscapes ok d sl arr || idx.any (slotEscapesIdx ok d sl)
+  | .select _ e _ => slotEscapes ok d sl e
   | .newRow bs init _ =>
-    slotEscapes d sl init || bs.any fun (l, u) => slotEscapes d sl l || slotEscapes d sl u
-  | .block _ stmts _ _ => slotEscapesStmts (d + 1) sl stmts true
-  | .collateral es _ _ => es.any (slotEscapes d sl)
-  | .cond a b e => slotEscapes d sl a || slotEscapes d sl b || slotEscapes d sl e
-  | .caseInt sel alts out => slotEscapes d sl sel || alts.any (slotEscapes d sl) || slotEscapes d sl out
+    slotEscapes ok d sl init || bs.any fun (l, u) => slotEscapes ok d sl l || slotEscapes ok d sl u
+  | .block _ stmts _ _ => slotEscapesStmts ok (d + 1) sl stmts true
+  | .collateral es _ _ => es.any (slotEscapes ok d sl)
+  | .cond a b e => slotEscapes ok d sl a || slotEscapes ok d sl b || slotEscapes ok d sl e
+  | .caseInt sel alts out => slotEscapes ok d sl sel || alts.any (slotEscapes ok d sl) || slotEscapes ok d sl out
   | .caseConf sel alts out =>
-    slotEscapes d sl sel || slotEscapes d sl out
-      || alts.any fun (_, _, b) => slotEscapes (d + 1) sl b
+    slotEscapes ok d sl sel || slotEscapes ok d sl out
+      || alts.any fun (_, _, b) => slotEscapes ok (d + 1) sl b
   | .loop _ f b t w body =>
-    slotEscapes d sl f || slotEscapes d sl b
-      || (match t with | some e => slotEscapes d sl e | none => false)
-      || (match w with | some e => slotEscapes (d + 1) sl e | none => false)
-      || slotEscapesV (d + 1) sl body
-  | .fmt items => items.any (slotEscapesFmt d sl)
-  | .seq a b => slotEscapes d sl a || slotEscapes d sl b
+    slotEscapes ok d sl f || slotEscapes ok d sl b
+      || (match t with | some e => slotEscapes ok d sl e | none => false)
+      || (match w with | some e => slotEscapes ok (d + 1) sl e | none => false)
+      || slotEscapesV ok (d + 1) sl body
+  | .fmt items => items.any (slotEscapesFmt ok d sl)
+  | .seq a b => slotEscapes ok d sl a || slotEscapes ok d sl b
   | _ => false
 
 /-- The same question for a node in statement position: an assignment straight into the
     slot is then just a write, not a reference that outlives the statement. -/
-partial def slotEscapesV (d sl : Nat) (c : Core) : Bool :=
+partial def slotEscapesV (ok : String → Bool) (d sl : Nat) (c : Core) : Bool :=
   match strip c with
-  | .voiding e => slotEscapesV d sl e
-  | .seq a b => slotEscapesV d sl a || slotEscapesV d sl b
+  | .voiding e => slotEscapesV ok d sl e
+  | .seq a b => slotEscapesV ok d sl a || slotEscapesV ok d sl b
+  | .dyop op _ _ l r =>
+    (if ok op then
+       match strip l with
+       | .refCell dd ss => if dd == d && ss == sl then false else slotEscapes ok d sl l
+       | l' => slotEscapes ok d sl l'
+     else slotEscapes ok d sl l) || slotEscapes ok d sl r
   | .assign dst src _ =>
     (match strip dst with
-     | .refCell dd ss => if dd == d && ss == sl then false else slotEscapes d sl dst
-     | dst' => slotEscapes d sl dst') || slotEscapes d sl src
-  | .cond a b e => slotEscapes d sl a || slotEscapesV d sl b || slotEscapesV d sl e
-  | .block _ stmts _ _ => slotEscapesStmts (d + 1) sl stmts false
+     | .refCell dd ss => if dd == d && ss == sl then false else slotEscapes ok d sl dst
+     | dst' => slotEscapes ok d sl dst') || slotEscapes ok d sl src
+  | .cond a b e => slotEscapes ok d sl a || slotEscapesV ok d sl b || slotEscapesV ok d sl e
+  | .block _ stmts _ _ => slotEscapesStmts ok (d + 1) sl stmts false
   | .loop _ f b t w body =>
-    slotEscapes d sl f || slotEscapes d sl b
-      || (match t with | some e => slotEscapes d sl e | none => false)
-      || (match w with | some e => slotEscapes (d + 1) sl e | none => false)
-      || slotEscapesV (d + 1) sl body
-  | e => slotEscapes d sl e
+    slotEscapes ok d sl f || slotEscapes ok d sl b
+      || (match t with | some e => slotEscapes ok d sl e | none => false)
+      || (match w with | some e => slotEscapes ok (d + 1) sl e | none => false)
+      || slotEscapesV ok (d + 1) sl body
+  | e => slotEscapes ok d sl e
 
-partial def slotEscapesStmts (d sl : Nat) (stmts : Array CoreStmt) (wantValue : Bool) : Bool :=
+partial def slotEscapesStmts (ok : String → Bool) (d sl : Nat) (stmts : Array CoreStmt) (wantValue : Bool) : Bool :=
   Id.run do
     let vp := voidPositions stmts wantValue
     for i in [0:stmts.size] do
       let bad := match stmts[i]! with
-        | .decl _ _ init => slotEscapes d sl init
-        | .unit e => if vp[i]! == true then slotEscapesV d sl e else slotEscapes d sl e
+        | .decl _ _ init => slotEscapes ok d sl init
+        | .unit e => if vp[i]! == true then slotEscapesV ok d sl e else slotEscapes ok d sl e
         | .label _ | .exit => false
       if bad == true then return true
     return false
 
-partial def slotEscapesIdx (d sl : Nat) : CoreIdx → Bool
-  | .index e => slotEscapes d sl e
+partial def slotEscapesIdx (ok : String → Bool) (d sl : Nat) : CoreIdx → Bool
+  | .index e => slotEscapes ok d sl e
   | .trim l u a =>
-    (match l with | some e => slotEscapes d sl e | none => false)
-      || (match u with | some e => slotEscapes d sl e | none => false)
-      || (match a with | some e => slotEscapes d sl e | none => false)
+    (match l with | some e => slotEscapes ok d sl e | none => false)
+      || (match u with | some e => slotEscapes ok d sl e | none => false)
+      || (match a with | some e => slotEscapes ok d sl e | none => false)
 
-partial def slotEscapesFmt (d sl : Nat) : CoreFmt → Bool
-  | .rep _ dyn it => (match dyn with | some e => slotEscapes d sl e | none => false) || slotEscapesFmt d sl it
-  | .general args => args.any (slotEscapes d sl)
-  | .group items => items.any (slotEscapesFmt d sl)
-  | .include f => slotEscapes d sl f
+partial def slotEscapesFmt (ok : String → Bool) (d sl : Nat) : CoreFmt → Bool
+  | .rep _ dyn it => (match dyn with | some e => slotEscapes ok d sl e | none => false) || slotEscapesFmt ok d sl it
+  | .general args => args.any (slotEscapes ok d sl)
+  | .group items => items.any (slotEscapesFmt ok d sl)
+  | .include f => slotEscapes ok d sl f
   | _ => false
 end
 
@@ -555,12 +587,12 @@ def planFrame (tag : Nat) (size : Nat) (slotModes : Array (Option Mode))
   for i in [0:size] do
     match (slotModes[i]?.join).bind CTy.ofMode with
     | some t =>
-      if slotEscapesStmts 0 i stmts wantValue then
+      if slotEscapesStmts (assignsNatively t) 0 i stmts wantValue then
         vars := vars.push none; all := false
       else
         vars := vars.push (some (s!"p{tag}_{i}", t, !slotInitialised stmts i))
     | none => vars := vars.push none; all := false
-  return { vars := vars, pushed := !all || size == 0 }
+  return { vars := vars, pushed := !all }
 
 def env : M (List Frame) := do return (← get).frames
 def rtd (d : Nat) : M Nat := do return rtDepthOf (← env) d
@@ -579,6 +611,40 @@ partial def gen (c : Core) : M Unit := do
     | none => genNode c
   | none => genNode c
 
+/-- Compute the primitive value of `c` into the C variable `v`, instead of pushing it
+    onto the operand stack.  This is what a `WHILE` condition wants: the test itself is a
+    C value, and the statements that produce it are statements. -/
+partial def genInto (ty : CTy) (v : String) (c : Core) : M Unit := do
+  match strip c with
+  | .seq a b => genVoid a; genInto ty v b
+  | .cond cc t e =>
+    match scalarExpr (← env) .bool cc with
+    | some ce => emit ("if (" ++ ce ++ ") {")
+    | none => do gen cc; emit "if (a68_bool()) {"
+    indent (genInto ty v t)
+    emit "} else {"
+    indent (genInto ty v e)
+    emit "}"
+  | .block size stmts lb nl => genBlockAt size stmts lb nl true (some (ty, v))
+  | .andThen l r =>
+    if ty != .u8 then genFallbackInto ty v c else do
+      genInto ty v l
+      emit ("if (" ++ v ++ ") {")
+      indent (genInto ty v r)
+      emit "}"
+  | .orElse l r =>
+    if ty != .u8 then genFallbackInto ty v c else do
+      genInto ty v l
+      emit ("if (!" ++ v ++ ") {")
+      indent (genInto ty v r)
+      emit "}"
+  | c' => genFallbackInto ty v c'
+
+partial def genFallbackInto (ty : CTy) (v : String) (c : Core) : M Unit := do
+  match scalarExpr (← env) ty.toMode c with
+  | some e => emit s!"{v} = {e};"
+  | none => gen c; emit s!"{v} = {ty.popFn}();"
+
 /-- Emit `c` in statement position.  Its value is discarded, so none of the push, nip and
     pop traffic that keeps a value on the operand stack has to be emitted at all. -/
 partial def genVoid (c : Core) : M Unit := do
@@ -595,6 +661,9 @@ partial def genVoid (c : Core) : M Unit := do
       gen src
       emit s!"a68_v(a68rt_assign({if flex then 1 else 0}, W));"
       emit "a68_v(a68rt_pop(W));"
+  | .dyop op m1 m2 l r =>
+    if (← assignOpVoid op m1 m2 l r) then pure ()
+    else do gen c; emit "a68_v(a68rt_pop(W));"
   | .cond c t e =>
     match scalarExpr (← env) .bool c with
     | some ce => emit ("if (" ++ ce ++ ") {")
@@ -608,6 +677,30 @@ partial def genVoid (c : Core) : M Unit := do
   | .goto l => genNode (.goto l)
   | .stop => emit "a68_v(a68rt_stop(W));"
   | _ => gen c; emit "a68_v(a68rt_pop(W));"
+
+/-- `x +:= e` in statement position: the variable or cell is updated in place, with
+    nothing boxed and no reference built.  Returns whether it applied. -/
+partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : M Bool := do
+  match m1 with
+  | .ref tm =>
+    match CTy.ofMode tm, strip l with
+    | some ty, .refCell dd ss =>
+      let ev ← env
+      match scalarExpr ev m2 r with
+      | none => return false
+      | some rs =>
+        let cur := match varOf ev dd ss with
+          | some vv => readVar vv
+          | none => s!"{ty.cellFn}({rtDepthOf ev dd}, {ss})"
+        match nativeAssignOp op ty cur rs with
+        | none => return false
+        | some e =>
+          match varOf ev dd ss with
+          | some (v, _, u) => emit (if u then s!"{v} = {e}; {v}_i = 1;" else s!"{v} = {e};")
+          | none => emit s!"{ty.setFn}({rtDepthOf ev dd}, {ss}, {e});"
+          return true
+    | _, _ => return false
+  | _ => return false
 
 /-- `dest := <value>` written straight into its C variable or its cell, leaving nothing
     on the operand stack.  Returns whether it applied. -/
@@ -671,7 +764,7 @@ partial def genNode (c : Core) : M Unit := do
     emit s!"a68_v(a68rt_widen({← putMode a}, {← putMode b}, W));"
   | .rowOf e => gen e; emit "a68_v(a68rt_row_of(W));"
   | .unite m e => gen e; emit s!"a68_v(a68rt_unite({← putMode m}, W));"
-  | .voiding e => gen e; emit "a68_v(a68rt_voiding(W));"
+  | .voiding e => genVoid e; emit "a68_v(a68rt_push_void(W));"
   | .assign d s flex =>
     -- `x := <scalar>` writes the cell directly, with nothing boxed and nothing pushed;
     -- the reference the assignment yields is only re-made when someone wants it
@@ -766,7 +859,7 @@ partial def genNode (c : Core) : M Unit := do
     let items ← items.mapM genFmtItem
     emit s!"a68_v(a68rt_push_format({← putFmtList items}, W));"
   | .stop => emit "a68_v(a68rt_stop(W));"
-  | .seq a b => gen a; emit "a68_v(a68rt_pop(W));"; gen b
+  | .seq a b => genVoid a; gen b
   | .at p e => emit s!"a68_line({p.line});"; gen e
   | .hole _ _ => emit "a68_v(a68rt_push_void(W));"
 
@@ -795,7 +888,7 @@ partial def genLit (v : Value) : M Unit := do
   | _ => emit "a68_v(a68rt_push_void(W));"
 
 partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels : Nat)
-    (wantValue : Bool) : M Unit := do
+    (wantValue : Bool) (dest : Option (CTy × String) := none) : M Unit := do
   let _ := labelBase
   let _ := nLabels
   let n ← fresh
@@ -848,15 +941,22 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
       | .unit e =>
         if vp[i]! == true then genVoid e
         else if onStack then do gen e; emit "a68_v(a68rt_nip(W));"
-        else if wantValue then do gen e; produced := true
+        else if wantValue then
+          match dest with
+          | some (ty, v) => do genInto ty v e; produced := true
+          | none => do gen e; produced := true
         else genVoid e
       | .label id =>
         emit s!"L{id}: a68_v(a68rt_env_truncate(e{n}+{if fr.pushed then 1 else 0}, W)); a68_v(a68rt_stack_truncate(s{n}, W));"
         if onStack then emit "a68_v(a68rt_push_void(W));"
       | .exit => emit s!"goto B{n};"
-    if wantValue && !onStack && !produced then emit "a68_v(a68rt_push_void(W));"
+    if wantValue && !onStack && !produced && dest.isNone then emit "a68_v(a68rt_push_void(W));"
     modify fun st => { st with frames := st.frames.tail }
     emit s!"B{n}: {if fr.pushed then "a68_v(a68rt_leave(W));" else ";"}"
+    -- a block with labels keeps its value on the stack even when a variable was asked for
+    match dest with
+    | some (ty, v) => if onStack then emit s!"{v} = {ty.popFn}();"
+    | none => pure ()
   emit "}"
 
 partial def genBlock (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels : Nat) : M Unit :=
@@ -903,15 +1003,16 @@ partial def genLoopAt (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
   | none => emit s!"int64_t to{n} = 0; int has{n} = 0;"
   -- the counter can be the C induction variable itself when nothing inside needs a cell
   let others := hasOtherFn body || (match w with | some e => hasOtherFn e | none => false)
+  let ok := assignsNatively CTy.i64
   let esc (sl : Nat) : Bool :=
-    slotEscapes 0 sl body || (match w with | some e => slotEscapes 0 sl e | none => false)
+    slotEscapesV ok 0 sl body || (match w with | some e => slotEscapes ok 0 sl e | none => false)
   let fr : Frame :=
     match slot with
     | some sl =>
       if !others && !esc sl && sl == 0 then
         { vars := #[some (s!"i{n}", CTy.i64, false)], pushed := false }
       else { vars := #[none], pushed := true }
-    | none => { vars := #[], pushed := true }
+    | none => { vars := #[], pushed := others }
   emit ("for (int64_t i" ++ toString n ++ " = from" ++ toString n ++ "; ; i" ++ toString n ++ " += by" ++ toString n ++ ") {")
   indent do
     emit s!"if (has{n} && ((by{n} > 0 && i{n} > to{n}) || (by{n} < 0 && i{n} < to{n}))) break;"
@@ -928,8 +1029,9 @@ partial def genLoopAt (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
       | some ce =>
         emit ("if (!(" ++ ce ++ ")) { " ++ (if fr.pushed then "a68_v(a68rt_leave(W)); " else "") ++ "break; }")
       | none =>
-        gen wc
-        emit ("if (!a68_bool()) { " ++ (if fr.pushed then "a68_v(a68rt_leave(W)); " else "") ++ "break; }")
+        emit s!"uint8_t cnd{n} = 0;"
+        genInto .u8 s!"cnd{n}" wc
+        emit ("if (!cnd" ++ toString n ++ ") { " ++ (if fr.pushed then "a68_v(a68rt_leave(W)); " else "") ++ "break; }")
     | none => pure ()
     genVoid body
     modify fun st => { st with frames := st.frames.tail }
@@ -1235,6 +1337,11 @@ static inline double a68_chk_r(double x) {
 }
 static inline double a68_div_r(double a, double b) {
   if (b == 0.0) return a68_die_r(3);
+  return a68_chk_r(a / b);
+}
+/* `/:=` reports a different message from `/` when the divisor is zero. */
+static inline double a68_diveq_r(double a, double b) {
+  if (b == 0.0) return a68_die_r(5);
   return a68_chk_r(a / b);
 }
 static inline int64_t a68_entier(double x) {

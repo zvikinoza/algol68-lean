@@ -541,7 +541,8 @@ def arithError (kind : UInt32) : IO Unit := do
        | 1 => "INT division by zero"
        | 2 => "infinite REAL value"
        | 3 => "REAL value is not a number"
-       | _ => "INT value out of bounds")
+       | 4 => "INT value out of bounds"
+       | _ => "REAL division by zero")
 
 -- ## Reading scalars back into C
 
