@@ -79,11 +79,13 @@ for name in $progs; do
     record "$name" a68g 999999 "$ops" failed
   fi
 
+  # a68g --compile writes prog.c/prog.o next to the source; keep progs/ clean
   if gtimeout 300 a68g -O "$src" > "$o" 2>/dev/null; then
     t=$(timeit a68g -O "$src"); record "$name" a68gO "$t" "$ops" "$(check "$o")"
   else
     record "$name" a68gO 999999 "$ops" unsupported
   fi
+  rm -f "$DIR/progs/$name.c" "$DIR/progs/$name.o" "$DIR/progs/$name.so"
 
   if gtimeout 300 "$BIN" run "$src" > "$o" 2>/dev/null; then
     t=$(timeit "$BIN" run "$src"); record "$name" interp "$t" "$ops" "$(check "$o")"
