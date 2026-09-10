@@ -140,5 +140,16 @@ reported separately by the test scripts.
   `sound`, curses, plotutils, GSL, MPFR, R mathlib, sockets, `system`,
   `execve`, environment and date/time enquiries (`local time`, `getenv`,
   `file is directory`).
+* **Output already written when formatted transput fails.** When a `printf`
+  picture cannot accept the value it is given, a68g discards the characters it
+  had produced for that item and this implementation keeps them. Both fail on
+  the same line with a non-zero status, but the bytes before the failure differ:
+  a68g emits nothing for the item, and `a68lean` emits the part it had already
+  converted. The evaluator and the compiled program agree with each other; it is
+  a68g they differ from. Found by differential fuzzing at seed 9535.
+* **A display coerced to a union** is accepted here and rejected by a68g, which
+  is right: a display has no a priori mode, so it cannot be the operand of a
+  union coercion. This can only affect programs a68g refuses outright, so it
+  cannot change the output of a program a68g accepts.
 * **Runtime error messages** are not byte-identical; only standard output
   and the non-zero exit status are.
