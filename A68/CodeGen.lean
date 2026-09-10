@@ -222,7 +222,7 @@ partial def gen (c : Core) : M Unit := do
     gen l
     emit "if (a68_bool()) {"
     indent (gen r)
-    emit "} else { a68_v(a68rt_push_bool(W)); }"
+    emit "} else { a68_v(a68rt_push_bool(0, W)); }"
   | .orElse l r =>
     gen l
     emit "if (a68_bool()) { a68_v(a68rt_push_bool(1, W)); } else {"
@@ -297,7 +297,7 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
       if slot.isSome then
         emit "a68_v(a68rt_enter(1, W));"
         emit "a68_v(a68rt_bind_cell(0, 0, W));"
-      else emit "a68_v(a68rt_enter(W));"
+      else emit "a68_v(a68rt_enter(0, W));"
       gen body
       emit "a68_v(a68rt_nip(W));"
       emit "a68_v(a68rt_leave(W));"
@@ -325,7 +325,7 @@ partial def genLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Opti
     | some sl =>
       emit "a68_v(a68rt_enter(1, W));"
       emit s!"a68_v(a68rt_set_int(0, {sl}, i{n}, W));"
-    | none => emit "a68_v(a68rt_enter(W));"
+    | none => emit "a68_v(a68rt_enter(0, W));"
     match w with
     | some wc =>
       gen wc
