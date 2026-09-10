@@ -25,8 +25,10 @@ fi
 record() {  # record <dir> <source>
   local d="$1" src="$2"
   mkdir -p "$d"; cp "$src" "$d/prog.a68"
+  # a68g exits nonzero on the many programs it rejects, and that is data, not a failure:
+  # swallow the status so `set -e` does not stop the sweep on the first rejected program.
   ( cd "$d" && gtimeout 60 a68g prog.a68 </dev/null >out1.txt 2>err1.txt; echo $? > rc1.txt
-             gtimeout 60 a68g prog.a68 </dev/null >out2.txt 2>/dev/null )
+             gtimeout 60 a68g prog.a68 </dev/null >out2.txt 2>/dev/null ) || true
 }
 
 : > golden.txt
