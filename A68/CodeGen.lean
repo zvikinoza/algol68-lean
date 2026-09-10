@@ -60,6 +60,16 @@ def CTy.popFn : CTy → String
   | .i64 => "a68_pop_i" | .f64 => "a68_pop_r" | .u8 => "a68_pop_b"
   | .u32 => "a68_pop_c" | .u64 => "a68_pop_u"
 
+/-- How one element of a row of this mode is read, and written, without building a
+    reference to it or going through the general slicing machinery. -/
+def CTy.rowFn : CTy → String
+  | .i64 => "a68_row_i" | .f64 => "a68_row_r" | .u8 => "a68_row_b"
+  | .u32 => "a68_row_c" | .u64 => "a68_row_u"
+
+def CTy.rowSetFn : CTy → String
+  | .i64 => "a68_set_row_i" | .f64 => "a68_set_row_r" | .u8 => "a68_set_row_b"
+  | .u32 => "a68_set_row_c" | .u64 => "a68_set_row_u"
+
 /-- The mode a native type stands for.  Promotion only ever happens for these modes, so
     this is exact, not an approximation. -/
 def CTy.toMode : CTy → Mode
@@ -389,9 +399,25 @@ def monopResult (op : String) (m : Mode) : Option Mode :=
   | "REPR", _ => some .char
   | _, _ => none
 
-/-- A native C expression for `c`, which the caller knows has mode `m`, or `none` when
-    the value has to go through the operand stack.  Nothing here allocates: this is the
-    path that turns `s + i * 3` into C arithmetic instead of three boxed values. -/
+mutual
+/-- `a[i]` and `a[i, j]` where `a` is a row held directly in a cell: one call that returns
+    a native value, instead of a reference built on the operand stack and then dereferenced. -/
+partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List CoreIdx) : Option String := do
+  let (d, sl) ← match strip base with
+    | .refCell d sl => some (d, sl)
+    | .loadCell d sl => some (d, sl)
+    | _ => none
+  if (varOf env d sl).isSome then none else
+  match idx with
+  | [.index a] => do
+    let ia ← scalarExpr env (.int 0) a
+    some s!"{ty.rowFn}({rtDepthOf env d}, {sl}, 1, {ia}, 0)"
+  | [.index a, .index b] => do
+    let ia ← scalarExpr env (.int 0) a
+    let ib ← scalarExpr env (.int 0) b
+    some s!"{ty.rowFn}({rtDepthOf env d}, {sl}, 2, {ia}, {ib})"
+  | _ => none
+
 partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String := do
   let ty ← CTy.ofMode m
   match c with
@@ -409,6 +435,8 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     match varOf env d s with
     | some (v, vt, u) => if vt == ty then some (readVar (v, vt, u)) else none
     | none => some s!"{ty.cellFn}({rtDepthOf env d}, {s})"
+  | .deref (.slice base idx true) => rowRead env ty base idx
+  | .slice base idx false => rowRead env ty base idx
   | .widen src dst e =>
     -- only the widenings that stay inside a native type
     match src, dst with
@@ -462,6 +490,8 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | ">=", _ => some s!"(uint8_t)(({a}) >= ({b}))"
     | _, _ => none
   | _ => none
+
+end
 
 /-- The mode a node yields, when it can be told from the node itself. -/
 def resultMode : Core → Option Mode
@@ -594,6 +624,31 @@ partial def storeScalar (dst src : Core) : M Bool := do
         | some ty => emit s!"{ty.setFn}({← rtd dd}, {ss}, {e});"; return true
         | none => return false
       | none => return false
+  | .slice base idx true =>
+    -- `a[i] := <scalar>` writes the element in place
+    match strip base with
+    | .refCell dd ss =>
+      if (← lvar dd ss).isSome then return false else
+      match scalarExprAny (← env) src with
+      | some (m, e) =>
+        match CTy.ofMode m with
+        | some ty =>
+          let ev ← env
+          let ixs : Option (Nat × String × String) := match idx with
+            | [.index a] => do let ia ← scalarExpr ev (.int 0) a; some (1, ia, "0")
+            | [.index a, .index b] => do
+              let ia ← scalarExpr ev (.int 0) a
+              let ib ← scalarExpr ev (.int 0) b
+              some (2, ia, ib)
+            | _ => none
+          match ixs with
+          | some (rank, ia, ib) =>
+            emit s!"{ty.rowSetFn}({← rtd dd}, {ss}, {rank}, {ia}, {ib}, {e});"
+            return true
+          | none => return false
+        | none => return false
+      | none => return false
+    | _ => return false
   | _ => return false
 
 partial def genNode (c : Core) : M Unit := do
@@ -811,12 +866,15 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
     emit ("if (!done" ++ toString n ++ " && a68_conform(" ++ toString mi ++ ", " ++ (if slot.isSome then "1" else "0") ++ ")) {")
     indent do
       emit s!"done{n} = 1;"
-      -- as in the evaluator: a frame per alternative, empty when nothing is bound
+      -- as in the evaluator: a frame per alternative, empty when nothing is bound.  It is
+      -- always a real frame, so the generator has to count it when translating depths.
       if slot.isSome then
         emit "a68_v(a68rt_enter(1, W));"
         emit "a68_v(a68rt_bind_cell(0, 0, W));"
       else emit "a68_v(a68rt_enter(0, W));"
+      modify fun st => { st with frames := { vars := #[none], pushed := true } :: st.frames }
       gen body
+      modify fun st => { st with frames := st.frames.tail }
       emit "a68_v(a68rt_nip(W));"
       emit "a68_v(a68rt_leave(W));"
     emit "}"
@@ -889,6 +947,7 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   let savedFrames := s.frames
   modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [] }
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
+  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, pushed := true }] }
   gen body
   emit "a68_v(a68rt_leave(W));"
   let st ← get
@@ -1096,6 +1155,27 @@ lean_object* a68rt_pop_real(lean_object* w);
 lean_object* a68rt_pop_char(lean_object* w);
 lean_object* a68rt_pop_bits(lean_object* w);
 lean_object* a68rt_undef_error(uint32_t k, lean_object* w);
+lean_object* a68rt_row_int(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
+lean_object* a68rt_row_real(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
+lean_object* a68rt_row_bool(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
+lean_object* a68rt_row_char(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
+lean_object* a68rt_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
+lean_object* a68rt_set_row_int(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int64_t v, lean_object* w);
+lean_object* a68rt_set_row_real(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, double v, lean_object* w);
+lean_object* a68rt_set_row_bool(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint8_t v, lean_object* w);
+lean_object* a68rt_set_row_char(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint32_t v, lean_object* w);
+lean_object* a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint64_t v, lean_object* w);
+
+#define a68_row_i(d,s,r,i,j)  a68_i64(a68rt_row_int(d, s, r, i, j, W))
+#define a68_row_r(d,s,r,i,j)  a68_f64(a68rt_row_real(d, s, r, i, j, W))
+#define a68_row_b(d,s,r,i,j)  a68_u8(a68rt_row_bool(d, s, r, i, j, W))
+#define a68_row_c(d,s,r,i,j)  a68_u32(a68rt_row_char(d, s, r, i, j, W))
+#define a68_row_u(d,s,r,i,j)  a68_u64(a68rt_row_bits(d, s, r, i, j, W))
+#define a68_set_row_i(d,s,r,i,j,v)  a68_v(a68rt_set_row_int(d, s, r, i, j, v, W))
+#define a68_set_row_r(d,s,r,i,j,v)  a68_v(a68rt_set_row_real(d, s, r, i, j, v, W))
+#define a68_set_row_b(d,s,r,i,j,v)  a68_v(a68rt_set_row_bool(d, s, r, i, j, v, W))
+#define a68_set_row_c(d,s,r,i,j,v)  a68_v(a68rt_set_row_char(d, s, r, i, j, v, W))
+#define a68_set_row_u(d,s,r,i,j,v)  a68_v(a68rt_set_row_bits(d, s, r, i, j, v, W))
 
 #define a68_pop_i()  a68_i64(a68rt_pop_int(W))
 #define a68_pop_r()  a68_f64(a68rt_pop_real(W))

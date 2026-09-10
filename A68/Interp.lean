@@ -2305,4 +2305,14 @@ def run (core : Core) (modes : Mode.Table) (args : Array String) (ll : Nat := Nu
     IO.eprintln s!"a68lean: runtime error: {p.line}: {msg}."
     return 1
 
+
+/-- One element of the row in cell `c`, as a reference, using the general machinery.
+    The compiled runtime falls back to this when the cell does not hold a plain row of
+    the expected rank. -/
+def sliceGeneral (c : Nat) (rank : UInt32) (i j : Int64) : M Value := do
+  let ivs : List IdxVal :=
+    if rank == 1 then [.index (.int i.toInt)]
+    else [.index (.int i.toInt), .index (.int j.toInt)]
+  sliceValue (.ref c []) ivs true
+
 end A68.Interp

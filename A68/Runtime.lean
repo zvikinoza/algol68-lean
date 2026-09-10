@@ -410,6 +410,119 @@ def popBits : IO UInt64 :=
     | .undef => die "attempt to use an uninitialised BITS value"
     | _ => throw (IO.userError "BITS expected")) 0
 
+-- ## Row elements
+--
+-- `a[i]` in a loop is the other shape that has to be cheap.  A declared row lives
+-- directly in its cell, so the element can be reached without building a reference and
+-- without going through the general slicing machinery; anything else falls back to it.
+
+@[inline] private def elemOffset (l u : Array Int) (rank : UInt32) (i j : Int64)
+    : Interp.M Nat := do
+  let lo := l[0]!
+  let hi := u[0]!
+  let a : Int := i.toInt
+  if a < lo || a > hi then Interp.rtErr s!"index {a} out of bounds [{lo}:{hi}]"
+  if rank == 1 then return (a - lo).toNat
+  let lo1 := l[1]!
+  let hi1 := u[1]!
+  let b : Int := j.toInt
+  if b < lo1 || b > hi1 then Interp.rtErr s!"index {b} out of bounds [{lo1}:{hi1}]"
+  return ((a - lo) * (hi1 - lo1 + 1) + (b - lo1)).toNat
+
+private def elemOf (c : Nat) (rank : UInt32) (i j : Int64) : Interp.M Value := do
+  match (← Interp.readCell c) with
+  | .row l u es =>
+    if l.size == rank.toNat then
+      let o ← elemOffset l u rank i j
+      match es[o]? with
+      | some v => return v
+      | none => Interp.rtErr "internal: element offset out of range"
+    else Interp.sliceGeneral c rank i j >>= Interp.readRef
+  | _ => Interp.sliceGeneral c rank i j >>= Interp.readRef
+
+private def setElemOf (c : Nat) (rank : UInt32) (i j : Int64) (nv : Value) : Interp.M Unit := do
+  match (← Interp.takeCell c) with
+  | .row l u es =>
+    if l.size == rank.toNat then
+      -- the cell was emptied, so the element array is uniquely owned and updates in place
+      let o ← try elemOffset l u rank i j
+              catch e => do Interp.writeCell c (.row l u es); throw e
+      Interp.writeCell c (.row l u (es.set! o nv))
+    else
+      Interp.writeCell c (.row l u es)
+      (← Interp.sliceGeneral c rank i j) |> (Interp.writeRef · nv)
+  | old =>
+    Interp.writeCell c old
+    (← Interp.sliceGeneral c rank i j) |> (Interp.writeRef · nv)
+
+@[inline] private def rowCell (depth slot : UInt32) : IO Nat := cellOf depth slot
+
+@[export a68rt_row_int]
+def rowInt (depth slot rank : UInt32) (i j : Int64) : IO Int64 := do
+  let c ← rowCell depth slot
+  match (← run (elemOf c rank i j) .undef) with
+  | .int n => return Int64.ofInt n
+  | .undef => die "attempt to use an uninitialised INT value"
+  | _ => throw (IO.userError "INT expected")
+
+@[export a68rt_row_real]
+def rowReal (depth slot rank : UInt32) (i j : Int64) : IO Float := do
+  let c ← rowCell depth slot
+  match (← run (elemOf c rank i j) .undef) with
+  | .real x => return x
+  | .int n => return Float.ofInt n
+  | .undef => die "attempt to use an uninitialised REAL value"
+  | _ => throw (IO.userError "REAL expected")
+
+@[export a68rt_row_bool]
+def rowBool (depth slot rank : UInt32) (i j : Int64) : IO UInt8 := do
+  let c ← rowCell depth slot
+  match (← run (elemOf c rank i j) .undef) with
+  | .bool b => return (if b then 1 else 0)
+  | .undef => die "attempt to use an uninitialised BOOL value"
+  | _ => throw (IO.userError "BOOL expected")
+
+@[export a68rt_row_char]
+def rowChar (depth slot rank : UInt32) (i j : Int64) : IO UInt32 := do
+  let c ← rowCell depth slot
+  match (← run (elemOf c rank i j) .undef) with
+  | .char ch => return UInt32.ofNat ch
+  | .undef => die "attempt to use an uninitialised CHAR value"
+  | _ => throw (IO.userError "CHAR expected")
+
+@[export a68rt_row_bits]
+def rowBits (depth slot rank : UInt32) (i j : Int64) : IO UInt64 := do
+  let c ← rowCell depth slot
+  match (← run (elemOf c rank i j) .undef) with
+  | .bits b => return UInt64.ofNat b
+  | .undef => die "attempt to use an uninitialised BITS value"
+  | _ => throw (IO.userError "BITS expected")
+
+@[export a68rt_set_row_int]
+def setRowInt (depth slot rank : UInt32) (i j : Int64) (v : Int64) : IO Unit := do
+  let c ← rowCell depth slot
+  run (setElemOf c rank i j (.int v.toInt)) ()
+
+@[export a68rt_set_row_real]
+def setRowReal (depth slot rank : UInt32) (i j : Int64) (v : Float) : IO Unit := do
+  let c ← rowCell depth slot
+  run (setElemOf c rank i j (.real v)) ()
+
+@[export a68rt_set_row_bool]
+def setRowBool (depth slot rank : UInt32) (i j : Int64) (v : UInt8) : IO Unit := do
+  let c ← rowCell depth slot
+  run (setElemOf c rank i j (.bool (v != 0))) ()
+
+@[export a68rt_set_row_char]
+def setRowChar (depth slot rank : UInt32) (i j : Int64) (v : UInt32) : IO Unit := do
+  let c ← rowCell depth slot
+  run (setElemOf c rank i j (.char v.toNat)) ()
+
+@[export a68rt_set_row_bits]
+def setRowBits (depth slot rank : UInt32) (i j : Int64) (v : UInt64) : IO Unit := do
+  let c ← rowCell depth slot
+  run (setElemOf c rank i j (.bits v.toNat)) ()
+
 /-- A promoted C variable read before it was assigned. -/
 @[export a68rt_undef_error]
 def undefError (kind : UInt32) : IO Unit := do
