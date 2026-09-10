@@ -57,13 +57,13 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
     let level := if rest.contains "-O0" then 0 else if rest.contains "-O2" then 2 else 1
     match (← compile file) with
     | none => return 1
-    | some (core0, _, ll) =>
+    | some (core0, modes, ll) =>
       let src ← readSource file
       let toks := A68.lex src
       let core ← Opt.run core0 level
       if rest.contains "-v" then
         IO.println s!"core nodes: {Opt.size core0} -> {Opt.size core}"
-      let cCode := CodeGen.program core ll (A68.isRegression toks)
+      let cCode := CodeGen.program core modes ll (A68.isRegression toks)
       let cFile := out ++ ".c"
       IO.FS.writeFile cFile cCode
       if cOnly then IO.println s!"wrote {cFile}"; return 0

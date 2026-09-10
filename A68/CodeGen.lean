@@ -70,6 +70,16 @@ def CTy.rowSetFn : CTy → String
   | .i64 => "a68_set_row_i" | .f64 => "a68_set_row_r" | .u8 => "a68_set_row_b"
   | .u32 => "a68_set_row_c" | .u64 => "a68_set_row_u"
 
+/-- How one field of a structure reached from a cell is read, and written, without
+    building the reference to it a selector at a time. -/
+def CTy.selFn : CTy → String
+  | .i64 => "a68_sel_i" | .f64 => "a68_sel_r" | .u8 => "a68_sel_b"
+  | .u32 => "a68_sel_c" | .u64 => "a68_sel_u"
+
+def CTy.selSetFn : CTy → String
+  | .i64 => "a68_set_sel_i" | .f64 => "a68_set_sel_r" | .u8 => "a68_set_sel_b"
+  | .u32 => "a68_set_sel_c" | .u64 => "a68_set_sel_u"
+
 /-- The mode a native type stands for.  Promotion only ever happens for these modes, so
     this is exact, not an approximation. -/
 def CTy.toMode : CTy → Mode
@@ -84,6 +94,23 @@ def CTy.undefFn : CTy → String
 def CTy.setFn : CTy → String
   | .i64 => "a68_set_i" | .f64 => "a68_set_r" | .u8 => "a68_set_b"
   | .u32 => "a68_set_c" | .u64 => "a68_set_u"
+
+/-- `x +:= e` and its relatives as C.  These are exactly the assigning operators whose
+    effect on a name of primitive mode is `x := x op e` with the same checks.  `/:=` on
+    REAL is deliberately not among them: it reports a different error than `/` does. -/
+def assignOpExpr (op : String) (ty : CTy) (x y : String) : Option String :=
+  match op, ty with
+  | "+:=", .i64 => some s!"a68_add_i({x}, {y})"
+  | "-:=", .i64 => some s!"a68_sub_i({x}, {y})"
+  | "*:=", .i64 => some s!"a68_mul_i({x}, {y})"
+  | "%:=", .i64 => some s!"a68_over_i({x}, {y})"
+  | "%*:=", .i64 => some s!"a68_mod_i({x}, {y})"
+  | "+:=", .f64 => some s!"a68_chk_r(({x}) + ({y}))"
+  | "-:=", .f64 => some s!"a68_chk_r(({x}) - ({y}))"
+  | "*:=", .f64 => some s!"a68_chk_r(({x}) * ({y}))"
+  | "&:=", .u64 => some s!"(({x}) & ({y}))"
+  | "|:=", .u64 => some s!"(({x}) | ({y}))"
+  | _, _ => none
 
 /-- A frame as the generator sees it.  `vars` names the C variable a slot was promoted
     to, when it has one; `pushed` says whether a run-time frame was emitted for it at all.
@@ -430,11 +457,41 @@ def dyopResult (op : String) (m1 : Mode) : Option Mode :=
 def monopResult (op : String) (m : Mode) : Option Mode :=
   match op, m with
   | "-", _ | "+", _ | "ABS", .int _ | "ABS", .real _ | "NOT", _ => some m
+  | "ABS", .char | "ABS", .bool => some (.int 0)
   | "SIGN", _ => some (.int 0)
   | "ODD", _ => some .bool
   | "ENTIER", .real n | "ROUND", .real n => some (.int n)
   | "REPR", _ => some .char
   | _, _ => none
+
+/-- A chain of selectors rooted at a cell: `f OF … OF a[i, j]`, `f OF … OF s`, or
+    `f OF … OF p` where the cell holds a `REF`.  The runtime takes it as two words:
+    `spec` (rank of the subscript, whether the cell holds the structure or a `REF` to it,
+    and how many fields follow) and `fields` (the field indices, one byte each). -/
+structure SelChain where
+  depth  : Nat
+  slot   : Nat
+  viaCellRef : Bool := false
+  rank   : Nat := 0
+  i      : String := "0"
+  j      : String := "0"
+  fields : List Nat := []
+  deriving Inhabited
+
+def SelChain.spec (c : SelChain) : Nat :=
+  c.rank + (if c.viaCellRef then 4 else 0) + 256 * c.fields.length
+
+def SelChain.fieldsWord (c : SelChain) : Nat := Id.run do
+  let mut w := 0
+  let mut k := 0
+  for f in c.fields do
+    w := w + f * 256 ^ k
+    k := k + 1
+  return w
+
+/-- The argument list every `a68rt_sel_*` entry point takes. -/
+def SelChain.args (c : SelChain) : String :=
+  s!"{c.depth}, {c.slot}, {c.spec}u, {c.i}, {c.j}, {c.fieldsWord}u"
 
 mutual
 /-- `a[i]` and `a[i, j]` where `a` is a row held directly in a cell: one call that returns
@@ -455,6 +512,44 @@ partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List Core
     some s!"{ty.rowFn}({rtDepthOf env d}, {sl}, 2, {ia}, {ib})"
   | _ => none
 
+/-- Recognise a chain of selectors rooted at a cell.  A slot promoted to a C variable has
+    no cell for the chain to start from, and neither an index nor a bound that is not a
+    native expression can be passed to the runtime, so those give `none` and the caller
+    falls back to building the reference a step at a time. -/
+partial def selChain (env : List Frame) : Core → Option SelChain
+  | .at _ e => selChain env e
+  | .refCell d s =>
+    if (varOf env d s).isSome then none
+    else some { depth := rtDepthOf env d, slot := s }
+  -- the cell holds a `REF`; the structure is what it designates
+  | .loadCell d s | .deref (.refCell d s) =>
+    if (varOf env d s).isSome then none
+    else some { depth := rtDepthOf env d, slot := s, viaCellRef := true }
+  | .slice base idx true => do
+    let c ← selChain env base
+    guard (!c.viaCellRef && c.rank == 0 && c.fields.isEmpty)
+    match idx with
+    | [.index a] => do
+      let ia ← scalarExpr env (.int 0) a
+      some { c with rank := 1, i := ia }
+    | [.index a, .index b] => do
+      let ia ← scalarExpr env (.int 0) a
+      let ib ← scalarExpr env (.int 0) b
+      some { c with rank := 2, i := ia, j := ib }
+    | _ => none
+  | .select f e true => do
+    let c ← selChain env e
+    guard (c.fields.length < 4 && f < 256)
+    some { c with fields := c.fields ++ [f] }
+  | _ => none
+
+/-- The chain, but only when it actually selects a field: without one there is nothing
+    here that the row and cell entry points do not already do. -/
+partial def fieldChain (env : List Frame) (c : Core) : Option SelChain := do
+  let ch ← selChain env c
+  guard (!ch.fields.isEmpty)
+  some ch
+
 partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String := do
   let ty ← CTy.ofMode m
   match c with
@@ -474,6 +569,9 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | none => some s!"{ty.cellFn}({rtDepthOf env d}, {s})"
   | .deref (.slice base idx true) => rowRead env ty base idx
   | .slice base idx false => rowRead env ty base idx
+  | .deref (.select f e true) => do
+    let ch ← fieldChain env (.select f e true)
+    some s!"{ty.selFn}({ch.args})"
   | .widen src dst e =>
     -- only the widenings that stay inside a native type
     match src, dst with
@@ -489,6 +587,9 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | "+", _ => some x
     | "ABS", .i64 => some s!"a68_abs_i({x})"
     | "ABS", .f64 => some s!"a68_fabs({x})"
+    | "ABS", .u32 => some s!"((int64_t)({x}))"
+    | "ABS", .u8 => some s!"((int64_t)(({x}) != 0))"
+    | "REPR", .i64 => some s!"a68_repr({x})"
     | "SIGN", .i64 => some s!"a68_sign_i({x})"
     | "SIGN", .f64 => some s!"a68_sign_r({x})"
     | "ODD", .i64 => some s!"(uint8_t)((({x}) % 2) != 0)"
@@ -663,6 +764,7 @@ partial def genVoid (c : Core) : M Unit := do
       emit "a68_v(a68rt_pop(W));"
   | .dyop op m1 m2 l r =>
     if (← assignOpVoid op m1 m2 l r) then pure ()
+    else if op == "+:=" && (← appendTo m1 l r) then pure ()
     else do gen c; emit "a68_v(a68rt_pop(W));"
   | .cond c t e =>
     match scalarExpr (← env) .bool c with
@@ -718,6 +820,25 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : M Bool := d
     | _, _ => return false
   | _ => return false
 
+/-- `s +:= t` where `s` is a whole cell holding a row: one call that appends to the row in
+    place, instead of a reference, a rowing and an operator that rebuilds the whole row.
+    Returns whether it applied. -/
+partial def appendTo (m1 : Mode) (lhs rhs : Core) : M Bool := do
+  match m1 with
+  | .ref (.row 1 _ _) =>
+    match strip lhs with
+    | .refCell d s =>
+      if (← lvar d s).isSome then return false
+      let dd ← rtd d
+      match strip rhs with
+      | .rowOf e =>
+        match scalarExpr (← env) .char e with
+        | some ce => emit s!"a68_appendc({dd}, {s}, {ce});"; return true
+        | none => do gen rhs; emit s!"a68_v(a68rt_append({dd}, {s}, W));"; return true
+      | _ => do gen rhs; emit s!"a68_v(a68rt_append({dd}, {s}, W));"; return true
+    | _ => return false
+  | _ => return false
+
 /-- `dest := <value>` written straight into its C variable or its cell, leaving nothing
     on the operand stack.  Returns whether it applied. -/
 partial def storeScalar (dst src : Core) : M Bool := do
@@ -763,7 +884,17 @@ partial def storeScalar (dst src : Core) : M Bool := do
         | none => return false
       | none => return false
     | _ => return false
-  | _ => return false
+  | dst' =>
+    -- `f OF … OF a[i] := <scalar>` writes the field in place
+    match fieldChain (← env) dst' with
+    | none => return false
+    | some ch =>
+      match scalarExprAny (← env) src with
+      | some (m, e) =>
+        match CTy.ofMode m with
+        | some ty => emit s!"{ty.selSetFn}({ch.args}, {e});"; return true
+        | none => return false
+      | none => return false
 
 partial def genNode (c : Core) : M Unit := do
   match c with
@@ -773,22 +904,35 @@ partial def genNode (c : Core) : M Unit := do
     | some vv => emit s!"a68_v({vv.2.1.pushFn}({readVar vv}, W));"
     | none => emit s!"a68_v(a68rt_push_cell({← rtd d}, {s}, W));"
   | .refCell d s => emit s!"a68_v(a68rt_push_ref({← rtd d}, {s}, W));"
-  | .deref e => gen e; emit "a68_v(a68rt_deref(W));"
+  | .deref e =>
+    -- `f OF … OF x` of any mode: one call that pushes the field's value
+    match fieldChain (← env) e with
+    | some ch => emit s!"a68_v(a68rt_sel_push({ch.args}, W));"
+    | none => do gen e; emit "a68_v(a68rt_deref(W));"
   | .deproc e => gen e; emit "a68_v(a68rt_deproc(W));"; jumpCheck
   | .widen a b e =>
     gen e
     emit s!"a68_v(a68rt_widen({← putMode a}, {← putMode b}, W));"
   | .rowOf e => gen e; emit "a68_v(a68rt_row_of(W));"
   | .unite m e => gen e; emit s!"a68_v(a68rt_unite({← putMode m}, W));"
-  | .voiding e => genVoid e; emit "a68_v(a68rt_push_void(W));"
+  | .voiding e =>
+    -- a VOIDing is a statement whose value happens to be wanted, and the escape analysis
+    -- reads it that way (`slotEscapes` of a VOIDing is `slotEscapesV` of what it voids).
+    -- Generating it any other way would build a reference to a slot that, because it does
+    -- not escape, has been promoted to a C variable and has no cell.
+    genVoid e
+    emit "a68_v(a68rt_push_void(W));"
   | .assign d s flex =>
     -- `x := <scalar>` writes the cell directly, with nothing boxed and nothing pushed;
-    -- the reference the assignment yields is only re-made when someone wants it
-    if (← storeScalar d s) then
-      match strip d with
-      | .refCell dd ss => emit s!"a68_v(a68rt_push_ref({← rtd dd}, {ss}, W));"
-      | _ => emit "a68_v(a68rt_push_void(W));"
-    else
+    -- the reference the assignment yields is only re-made when someone wants it.  Only a
+    -- whole cell can be re-made that cheaply, so an assignment whose value is wanted and
+    -- whose destination is a slice or a field goes the ordinary way.
+    let direct ← match strip d with
+      | .refCell dd ss => if (← storeScalar d s) then pure (some (dd, ss)) else pure none
+      | _ => pure none
+    match direct with
+    | some (dd, ss) => emit s!"a68_v(a68rt_push_ref({← rtd dd}, {ss}, W));"
+    | none => do
       gen d; gen s; emit s!"a68_v(a68rt_assign({if flex then 1 else 0}, W));"
   | .identRel l r isnt =>
     gen l; gen r
@@ -1300,6 +1444,37 @@ lean_object* a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, i
 #define a68_set_row_c(d,s,r,i,j,v)  a68_v(a68rt_set_row_char(d, s, r, i, j, v, W))
 #define a68_set_row_u(d,s,r,i,j,v)  a68_v(a68rt_set_row_bits(d, s, r, i, j, v, W))
 
+/* One field of a structure a cell holds, or that is an element of a row a cell holds, or
+   that a cell points at.  `spec` and `fields` describe the chain of selectors; see the
+   runtime.  Anything that does not fit the shape falls back to the general machinery. */
+lean_object* a68rt_sel_push(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_set_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int64_t v, lean_object* w);
+lean_object* a68rt_set_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, double v, lean_object* w);
+lean_object* a68rt_set_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint8_t v, lean_object* w);
+lean_object* a68rt_set_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint32_t v, lean_object* w);
+lean_object* a68rt_set_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint64_t v, lean_object* w);
+
+#define a68_sel_i(d,s,sp,i,j,f)  a68_i64(a68rt_sel_int(d, s, sp, i, j, f, W))
+#define a68_sel_r(d,s,sp,i,j,f)  a68_f64(a68rt_sel_real(d, s, sp, i, j, f, W))
+#define a68_sel_b(d,s,sp,i,j,f)  a68_u8(a68rt_sel_bool(d, s, sp, i, j, f, W))
+#define a68_sel_c(d,s,sp,i,j,f)  a68_u32(a68rt_sel_char(d, s, sp, i, j, f, W))
+#define a68_sel_u(d,s,sp,i,j,f)  a68_u64(a68rt_sel_bits(d, s, sp, i, j, f, W))
+#define a68_set_sel_i(d,s,sp,i,j,f,v)  a68_v(a68rt_set_sel_int(d, s, sp, i, j, f, v, W))
+#define a68_set_sel_r(d,s,sp,i,j,f,v)  a68_v(a68rt_set_sel_real(d, s, sp, i, j, f, v, W))
+#define a68_set_sel_b(d,s,sp,i,j,f,v)  a68_v(a68rt_set_sel_bool(d, s, sp, i, j, f, v, W))
+#define a68_set_sel_c(d,s,sp,i,j,f,v)  a68_v(a68rt_set_sel_char(d, s, sp, i, j, f, v, W))
+#define a68_set_sel_u(d,s,sp,i,j,f,v)  a68_v(a68rt_set_sel_bits(d, s, sp, i, j, f, v, W))
+
+/* `s +:= c` and `s +:= t` where `s` is a row a cell holds: appended in place. */
+lean_object* a68rt_append_char(uint32_t d, uint32_t s, uint32_t ch, lean_object* w);
+lean_object* a68rt_append(uint32_t d, uint32_t s, lean_object* w);
+#define a68_appendc(d,s,ch)  a68_v(a68rt_append_char(d, s, ch, W))
+
 #define a68_pop_i()  a68_i64(a68rt_pop_int(W))
 #define a68_pop_r()  a68_f64(a68rt_pop_real(W))
 #define a68_pop_b()  a68_u8(a68rt_pop_bool(W))
@@ -1371,13 +1546,24 @@ static inline int64_t a68_round(double x) {
   return x < 0 ? -n : n;
 }
 static inline double a68_fabs(double x) { return x < 0 ? -x : x; }
+static inline uint32_t a68_repr(int64_t x) {
+  if (x < 0 || x > 255) { a68_v(a68rt_arith_error(6, W)); return 0; }
+  return (uint32_t) x;
+}
 "
 
 /-- Emit the whole program. -/
-def program (core : Core) (ll : Nat) (regression : Bool) : String := Id.run do
+def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : String := Id.run do
   let (_, st) := (do
       let idx ← genFunction 0 0 core
       pure idx : M Nat).run {}
+  -- the mode declarations, sorted so that the emitted C does not depend on hash order
+  let decls := modes.toArray.qsort (fun a b => a.1 < b.1)
+  let st := decls.foldl (fun st (n, m) =>
+      let (si, w) := st.w.str n
+      let (mi, w) := Serial.putMode w m
+      let (_, w) := w.add s!"n {si} {mi}"
+      { st with w := w }) st
   let mut out := prelude
   out := out ++ "\nstatic const char* A68_BLOB =\n"
   -- the blob is emitted in chunks so that no C string literal grows too long

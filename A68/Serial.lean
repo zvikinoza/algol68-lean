@@ -152,6 +152,9 @@ structure Reader where
   lists : Array (List CoreFmt) := #[]
   cores : Array Core := #[]
   strs  : Array String := #[]
+  /-- The program's mode declarations, `MODE YEAR = INT`, so that the run time can resolve
+      a mode indicant exactly as the evaluator does. Not index-aligned with the tables. -/
+  decls : Array (String × Mode) := #[]
   deriving Inhabited
 
 private def field (fs : Array String) (i : Nat) : Nat := (fs[i]?.getD "0").toNat!
@@ -227,6 +230,8 @@ def parse (blob : String) : Reader := Id.run do
         | "incl" => .include r.cores[field fs 2]!
         | "col" => .col
         | _ => .sep
+    else if kind == "n" then
+      r := { r with decls := r.decls.push (r.strs[field fs 1]!, r.modes[field fs 2]!) }
     else if kind == "k" then
       let n := field fs 1
       l := (List.range n).map fun k => r.fmts[field fs (2 + k)]!
