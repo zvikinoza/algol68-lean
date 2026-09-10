@@ -33,6 +33,7 @@ def valueStr : Value → String
   | .union m _ => s!"union {m}"
   | .proc .. => "proc"
   | .builtin n => s!"builtin {n}"
+  | .cproc fn np _ => s!"cproc#{fn}/{np}"
   | .fmt .. => "format"
   | .file id => s!"file {id}"
 
@@ -84,6 +85,7 @@ partial def core (n : Nat) : Core → String
   | .stop => "(stop)"
   | .seq a b => s!"(seq {core n a} {core n b})"
   | .at _ e => core n e
+  | .hole fn idx => s!"(hole {fn}.{idx})"
 
 partial def stmt (n : Nat) : CoreStmt → String
   | .decl slot init => s!"cell[0.{slot}] := {core n init}"

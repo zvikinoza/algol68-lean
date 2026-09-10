@@ -3,6 +3,8 @@ import A68.Numfmt
 import A68.Elab
 import A68.Interp
 import A68.Pretty
+import A68.CodeGen
+import A68.Runtime
 
 open A68
 
@@ -62,6 +64,56 @@ def main (args : List String) : IO UInt32 := do
       for e in A68.echoesOf toks do IO.println e
       Interp.run core modes ("a68g" :: file :: rest).toArray ll (A68.isRegression toks)
     | none => return 1
+  | "compile" :: file :: rest =>
+    -- a68lean compile prog.a68 [-o out] [-c]   (-c keeps the generated C only)
+    let out := match rest.dropWhile (· != "-o") with
+      | _ :: o :: _ => o
+      | _ => (file.splitOn ".").head!
+    let cOnly := rest.contains "-c"
+    match (← compile file) with
+    | none => return 1
+    | some (core, _, ll) =>
+      let src ← readSource file
+      let toks := A68.lex src
+      let cCode := CodeGen.program core ll (A68.isRegression toks)
+      let cFile := out ++ ".c"
+      IO.FS.writeFile cFile cCode
+      if cOnly then IO.println s!"wrote {cFile}"; return 0
+      -- link against the Lean runtime and this compiler's runtime library
+      let leanPrefix ← match (← IO.getEnv "LEAN_SYSROOT") with
+        | some p => pure p
+        | none => do
+          let home := (← IO.getEnv "HOME").getD ""
+          let cands := ["lean", home ++ "/.elan/bin/lean"]
+          let mut found := ""
+          for c in cands do
+            if found.isEmpty then
+              try
+                let o ← IO.Process.output { cmd := c, args := #["--print-prefix"] }
+                if o.exitCode == 0 then found := o.stdout.trim
+              catch _ => pure ()
+          if found.isEmpty then
+            IO.eprintln "a68lean: cannot find the Lean toolchain; set LEAN_SYSROOT"
+          pure found
+      let libDir ← match (← IO.getEnv "A68LEAN_LIB") with
+        | some p => pure p
+        | none => do
+          -- the library sits next to the executable: <prefix>/bin/a68lean, <prefix>/lib/…
+          let exe ← IO.appPath
+          match exe.parent.bind (·.parent) with
+          | some root => pure (root / "lib").toString
+          | none => pure ((← IO.currentDir) / ".lake" / "build" / "lib").toString
+      let cc := (← IO.getEnv "CC").getD "cc"
+      let args := #[cFile, libDir ++ "/libalgol68_A68.a", "-I" ++ leanPrefix ++ "/include",
+                    "-L" ++ leanPrefix ++ "/lib/lean", "-L" ++ leanPrefix ++ "/lib",
+                    "-lleancpp", "-lInit", "-lStd", "-lLean", "-lleanrt", "-lc++", "-lLake",
+                    "-lgmp", "-luv", "-lssl", "-lcrypto", "-w", "-O2", "-o", out]
+      let r ← IO.Process.output { cmd := cc, args := args }
+      if r.exitCode != 0 then
+        IO.eprintln s!"a68lean: C compiler failed:\n{r.stderr}"
+        return 1
+      IO.println s!"wrote {out}"
+      return 0
   | ["dump", file] =>
     match (← compile file) with
     | some (core, _, _) => IO.println (Pretty.program core); return 0

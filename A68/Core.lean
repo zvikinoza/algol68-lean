@@ -40,6 +40,7 @@ inductive Value where
   | union (m : Mode) (v : Value)
   | proc (env : List (Array Nat)) (nparams frameSize : Nat) (body : Core)
   | builtin (name : String)
+  | cproc (fn : Nat) (nparams : Nat) (env : List (Array Nat))   -- compiled procedure
   | fmt (env : List (Array Nat)) (items : List CoreFmt)
   | file (id : Nat)
   deriving Inhabited, Repr
@@ -108,6 +109,7 @@ inductive Core where
   | fmt (items : List CoreFmt)
   | stop
   | seq (a b : Core)                            -- evaluate a, then b (no new frame)
+  | hole (fn : Nat) (idx : Nat)                 -- compiled code: evaluate via the C dispatcher
   | at (p : Pos) (e : Core)
   deriving Inhabited, Repr
 end

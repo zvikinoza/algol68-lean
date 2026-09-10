@@ -521,6 +521,14 @@ structure FmtState where
   frames : List FmtFrame
   deriving Inhabited
 
+/-- Compiled code installs these: they evaluate a hole of a format text, and apply a
+    compiled procedure. In interpreted mode they are never reached. -/
+@[extern "a68_dispatch_hole"]
+opaque dispatchHole (fn : USize) (idx : USize) (env : @& Env) : IO Value
+
+@[extern "a68_dispatch_proc"]
+opaque dispatchProc (fn : USize) (env : @& Env) (args : @& Array Value) : IO Value
+
 -- ## Evaluation
 
 mutual
@@ -673,6 +681,7 @@ partial def eval (env : Env) (c : Core) : M Value := do
     if (← expectBool (← eval env l)) then return .bool true else eval env r
   | .fmt items => return .fmt env items
   | .stop => throw .stop
+  | .hole fn idx => (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env : IO Value)
   | .seq a b => do let _ ← eval env a; eval env b
   | .at p e =>
     (← read).pos.set p
@@ -852,6 +861,7 @@ partial def callValue (f : Value) (args : List Value) : M Value := do
       let v := if i < n then argsArr[i]! else .undef
       frame := frame.push (← alloc v)
     eval (frame :: cenv) body
+  | .cproc fn _ cenv => (dispatchProc (USize.ofNat fn) cenv args.toArray : IO Value)
   | .builtin name => callBuiltin name args
   | .nil => rtErr "attempt to call NIL"
   | .undef => rtErr "attempt to call an uninitialised procedure"
