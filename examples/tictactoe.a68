@@ -1,0 +1,82 @@
+# Tic-tac-toe: you play X (enter a square number 1-9), the program plays O.  #
+# Moves are read from standard input, so the game can be played interactively #
+# or scripted:  printf '5\n1\n9\n' | a68lean run tictactoe.a68                 #
+BEGIN
+  [1:9] CHAR board;
+  FOR i TO 9 DO board[i] := REPR (ABS "0" + i) OD;
+
+  PROC show = VOID:
+    FOR r FROM 0 TO 2 DO
+      print((" ", board[3*r + 1], " | ", board[3*r + 2], " | ", board[3*r + 3], newline));
+      IF r < 2 THEN print(("---+---+---", newline)) FI
+    OD;
+
+  [,] INT lines = ((1,2,3), (4,5,6), (7,8,9), (1,4,7), (2,5,8), (3,6,9), (1,5,9), (3,5,7));
+
+  PROC winner = (CHAR p) BOOL:
+    BEGIN
+      BOOL won := FALSE;
+      FOR l TO 8 WHILE NOT won DO
+        won := board[lines[l, 1]] = p AND board[lines[l, 2]] = p AND board[lines[l, 3]] = p
+      OD;
+      won
+    END;
+
+  PROC free = (INT sq) BOOL: board[sq] /= "X" AND board[sq] /= "O";
+
+  PROC full = BOOL: BEGIN BOOL f := TRUE; FOR i TO 9 DO f := f AND NOT free(i) OD; f END;
+
+  # a square that completes a line for player p, or 0 #
+  PROC completing = (CHAR p) INT:
+    BEGIN
+      INT found := 0;
+      FOR l TO 8 WHILE found = 0 DO
+        INT count := 0, empty := 0;
+        FOR k TO 3 DO
+          INT sq = lines[l, k];
+          IF board[sq] = p THEN count +:= 1 ELIF free(sq) THEN empty := sq FI
+        OD;
+        IF count = 2 AND empty /= 0 THEN found := empty FI
+      OD;
+      found
+    END;
+
+  PROC computer move = INT:
+    IF INT w = completing("O"); w /= 0 THEN w
+    ELIF INT b = completing("X"); b /= 0 THEN b
+    ELIF free(5) THEN 5
+    ELSE
+      INT choice := 0;
+      [] INT preferred = (1, 3, 7, 9, 2, 4, 6, 8);
+      FOR i TO 8 WHILE choice = 0 DO IF free(preferred[i]) THEN choice := preferred[i] FI OD;
+      choice
+    FI;
+
+  BOOL playing := TRUE;
+  on logical file end(stand in, (REF FILE f) BOOL: (playing := FALSE; TRUE));
+
+  show;
+  WHILE playing DO
+    print(("Your move (1-9): ", newline));
+    INT sq;
+    read((sq, newline));
+    IF NOT playing THEN
+      print(("No more input - game abandoned.", newline))
+    ELIF sq < 1 OR sq > 9 OR NOT free(sq) THEN
+      print(("Square ", whole(sq, 0), " is not available.", newline))
+    ELSE
+      board[sq] := "X";
+      IF winner("X") THEN show; print(("You win!", newline)); playing := FALSE
+      ELIF full THEN show; print(("Draw.", newline)); playing := FALSE
+      ELSE
+        INT m = computer move;
+        board[m] := "O";
+        print(("Computer plays ", whole(m, 0), newline));
+        show;
+        IF winner("O") THEN print(("Computer wins.", newline)); playing := FALSE
+        ELIF full THEN print(("Draw.", newline)); playing := FALSE
+        FI
+      FI
+    FI
+  OD
+END
