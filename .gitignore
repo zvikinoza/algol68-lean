@@ -4,3 +4,5 @@ fuzz/failures/
 tests/corpus/
 *.tmp
 fuzz/*.log
+benchmarks/build/
+benchmarks/results/

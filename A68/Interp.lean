@@ -294,6 +294,41 @@ def writeRef (r : Value) (nv : Value) : M Unit := do
   | .nil => rtErr "attempt to assign to NIL"
   | _ => rtErr "internal: assignment to a non-REF"
 
+/-- `s +:= t` where `s` is a whole cell holding a row whose bounds start at 1.  Taking the
+    value out of the cell leaves the element array uniquely owned, so the elements are
+    appended in place and building a string a piece at a time costs time linear in its
+    length rather than quadratic.  Any other shape gives `none` and takes the general
+    path, which is what reports its errors. -/
+def appendInPlace (a b : Value) : M (Option Value) := do
+  match a, b with
+  | .ref c [], .row _ _ ys =>
+    match (← takeCell c) with
+    | .row l u xs =>
+      if l.size == 1 && u.size == 1 && l[0]! == 1 && u[0]! == (xs.size : Int) then do
+        let n := xs.size + ys.size
+        writeCell c (.row l (u.set! 0 (n : Int)) (ys.foldl Array.push xs))
+        return some a
+      else do
+        writeCell c (.row l u xs)
+        return none
+    | old => do writeCell c old; return none
+  | _, _ => return none
+
+/-- The same for a single element, which is what `s +:= c` appends.  Returns whether it
+    applied; it does not, and the general path takes over, unless the cell holds a
+    one-dimensional row whose lower bound is 1. -/
+def appendOne (c : Nat) (v : Value) : M Bool := do
+  match (← takeCell c) with
+  | .row l u xs =>
+    if l.size == 1 && u.size == 1 && l[0]! == 1 && u[0]! == (xs.size : Int) then do
+      let n := xs.size + 1
+      writeCell c (.row l (u.set! 0 (n : Int)) (xs.push v))
+      return true
+    else do
+      writeCell c (.row l u xs)
+      return false
+  | old => do writeCell c old; return false
+
 /-- Extend a ref path by an element selection, composing through a sub-row view. -/
 def refElem (r : Value) (i : Nat) : M Value := do
   match r with
@@ -731,9 +766,37 @@ partial def sliceValue (base : Value) (idx : List IdxVal) (viaRef : Bool) : M Va
       let o := (i - lo).toNat
       if viaRef then return ← refElem base o
       else
-        match es[o]? with
-        | some v => return v
-        | none => rtErr "internal: element offset out of range"
+        -- `es[o]?` would allocate an `Option` for every element read
+        if h : o < es.size then return es[o]
+        else rtErr "internal: element offset out of range"
+  -- fast path: a one-dimensional trim of a one-dimensional row is contiguous, so the
+  -- elements can be copied in one go and the offsets, where they are still needed, run
+  -- consecutively.  Trimming the whole dimension only renames the bounds.
+  | [.trim lo hi at_] =>
+    if d == 1 && es.size == rowSize l u then
+      let l0 := l[0]!
+      let u0 := u[0]!
+      let lo' ← match lo with | some v => expectInt v | none => pure l0
+      let hi' ← match hi with | some v => expectInt v | none => pure u0
+      let at' ← match at_ with | some v => expectInt v | none => pure 1
+      if lo' < l0 || hi' > u0 then
+        if !(hi' < lo') then rtErr s!"trim [{lo'}:{hi'}] out of bounds [{l0}:{u0}]"
+      let newL := #[at']
+      let newU := #[at' + (hi' - lo')]
+      let n := if hi' ≥ lo' then (hi' - lo' + 1).toNat else 0
+      let start := if n == 0 then 0 else (lo' - l0).toNat
+      if !viaRef then
+        if n != 0 && lo' == l0 && hi' == u0 then return .row newL newU es
+        return .row newL newU (es.extract start (start + n))
+      -- through a reference: compose with any view the reference already denotes
+      match base with
+      | .ref c path =>
+        match path.getLast?, n != 0 && lo' == l0 && hi' == u0 with
+        | some (.sub _ _ offs0), true => return .ref c (path.dropLast ++ [.sub newL newU offs0])
+        | some (.sub _ _ offs0), false =>
+          return .ref c (path.dropLast ++ [.sub newL newU (Array.ofFn (n := n) fun k => offs0[start + k.val]!)])
+        | _, _ => return .ref c (path ++ [.sub newL newU (Array.ofFn (n := n) fun k => start + k.val)])
+      | _ => rtErr "internal: sub-row of a non-REF"
   | _ => pure ()
   -- collect the indexers
   let mut ixs : Array (Option Int × Option Int × Option Int × Bool) := #[]   -- (lwb, upb, at, isIndex)
@@ -901,6 +964,15 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
   let tb := (← read).modes
   let m1r := Mode.resolve tb m1
   let m2r := Mode.resolve tb m2
+  -- appending to a row variable is the one assigning operator worth a special case: done
+  -- the general way it rebuilds the whole row every time
+  if op == "+:=" then
+    match m1r with
+    | .ref (.row 1 _ _) =>
+      match (← appendInPlace a b) with
+      | some r => return r
+      | none => pure ()
+    | _ => pure ()
   match m1r, m2r with
   | .ref m, _ =>
     -- assigning operators: a is a REF
@@ -1081,9 +1153,7 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     match op with
     | "+" => return .row #[1] #[xs.size + ys.size] (xs ++ ys)
     | _ =>
-      let sx ← strOf a
-      let sy ← strOf b
-      let cmp := compareStr sx sy
+      let cmp ← compareChars xs ys
       match op with
       | "=" => return .bool (cmp == 0)
       | "/=" => return .bool (cmp != 0)
@@ -1156,6 +1226,30 @@ partial def compareStr (a b : String) : Int :=
     | _, [] => 1
     | x :: xs, y :: ys => if x.toNat < y.toNat then -1 else if x.toNat > y.toNat then 1 else go xs ys
   go a.toList b.toList
+
+/-- Every element of a row of CHAR, checked exactly as `strOf` checks it. -/
+private partial def checkChars (es : Array Value) : M Unit := do
+  for e in es do
+    match e with
+    | .char _ => pure ()
+    | .undef => rtErr "attempt to use an uninitialised CHAR value"
+    | _ => rtErr "internal: [] CHAR expected"
+
+/-- Compare two rows of CHAR the way `compareStr` compares the strings they denote, but
+    without building those strings.  Both rows are checked first, and in the same order,
+    so that an uninitialised character is still reported where it was. -/
+partial def compareChars (xs ys : Array Value) : M Int := do
+  checkChars xs
+  checkChars ys
+  let n := min xs.size ys.size
+  for i in [0:n] do
+    let x := match xs[i]! with | .char c => c | _ => 0
+    let y := match ys[i]! with | .char c => c | _ => 0
+    if x < y then return -1
+    if x > y then return 1
+  if xs.size < ys.size then return -1
+  if xs.size > ys.size then return 1
+  return 0
 
 partial def valuesEqual (a b : Value) : M Bool := do
   match a, b with

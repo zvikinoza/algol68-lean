@@ -434,9 +434,10 @@ private def elemOf (c : Nat) (rank : UInt32) (i j : Int64) : Interp.M Value := d
   | .row l u es =>
     if l.size == rank.toNat then
       let o ← elemOffset l u rank i j
-      match es[o]? with
-      | some v => return v
-      | none => Interp.rtErr "internal: element offset out of range"
+      -- the index was checked against the bounds; `es[o]?` would allocate an `Option`
+      -- on every element read, which in a loop is more work than the read itself
+      if h : o < es.size then return es[o]
+      else Interp.rtErr "internal: element offset out of range"
     else Interp.sliceGeneral c rank i j >>= Interp.readRef
   | _ => Interp.sliceGeneral c rank i j >>= Interp.readRef
 
@@ -523,6 +524,196 @@ def setRowBits (depth slot rank : UInt32) (i j : Int64) (v : UInt64) : IO Unit :
   let c ← rowCell depth slot
   run (setElemOf c rank i j (.bits v.toNat)) ()
 
+-- ## Structure fields
+--
+-- `f OF s`, `f OF a[i]` and `f OF p` (`p` a `REF`) all reach one field of a structure
+-- that a cell holds, or that is an element of a row a cell holds, or that a cell points
+-- at.  Compiled step by step these build a reference on the operand stack one selector
+-- at a time and then dereference it; here the whole chain is one call, which yields the
+-- field's value directly — in a native C type where the field's mode is primitive.
+--
+-- `spec` describes the chain: bits 0-1 the rank of the subscript (0 = none), bit 2
+-- whether the cell holds the structure itself or a `REF` to it, bits 8-11 how many
+-- fields follow.  `fields` packs the field indices, one byte each, innermost first.
+-- Anything the shape does not fit — a row of the wrong rank, a view, a multiple
+-- selection — falls back to the general machinery, which is what reports its errors.
+
+@[inline] private def specRank (spec : UInt32) : UInt32 := spec &&& 3
+@[inline] private def specViaRef (spec : UInt32) : Bool := spec &&& 4 != 0
+@[inline] private def specNF (spec : UInt32) : Nat := ((spec >>> 8) &&& 15).toNat
+@[inline] private def specField (fields : UInt32) (k : Nat) : Nat :=
+  ((fields >>> (UInt32.ofNat (8 * k))) &&& 255).toNat
+
+@[inline] private def selIdx (rank : UInt32) (i j : Int64) : List IdxVal :=
+  if rank == 1 then [.index (.int i.toInt)]
+  else [.index (.int i.toInt), .index (.int j.toInt)]
+
+/-- The value the chain designates.  The steps match, one for one, what pushing the cell
+    or its reference, slicing and selecting would have done, so the errors are the same. -/
+private def selRead (c : Nat) (spec : UInt32) (i j : Int64) (fields : UInt32)
+    : Interp.M Value := do
+  let mut v ← Interp.readCell c
+  if specViaRef spec then
+    v ← (match v with
+      | .undef => Interp.rtErr "attempt to use an uninitialised value"
+      | .nil => Interp.rtErr "attempt to select from NIL"
+      | r => Interp.readRef r)
+  let rank := specRank spec
+  if rank != 0 then
+    v ← (match v with
+      | .row l u es =>
+        if l.size == rank.toNat then do
+          let o ← elemOffset l u rank i j
+          if h : o < es.size then pure es[o]
+          else Interp.rtErr "internal: element offset out of range"
+        else Interp.sliceValue (.row l u es) (selIdx rank i j) false
+      | other => Interp.sliceValue other (selIdx rank i j) false)
+  for k in [0:specNF spec] do
+    let f := specField fields k
+    v ← (match v with
+      | .struct fs =>
+        if h : f < fs.size then pure fs[f]
+        else Interp.rtErr "internal: field index out of range"
+      | other => Interp.readPath other [.field f])
+  return v
+
+/-- The reference the chain designates, for an assignment. -/
+private def selRef (c : Nat) (spec : UInt32) (i j : Int64) (fields : UInt32)
+    : Interp.M Value := do
+  let mut r : Value ←
+    if specViaRef spec then
+      match (← Interp.readCell c) with
+      | .undef => Interp.rtErr "attempt to use an uninitialised value"
+      | .nil => Interp.rtErr "attempt to select from NIL"
+      | v => pure v
+    else pure (.ref c [])
+  let rank := specRank spec
+  if rank != 0 then
+    -- the common shape: a plain row of the expected rank held directly in the cell.  The
+    -- row value is dropped again before the assignment, so the element array stays
+    -- uniquely owned and the update below is in place.
+    let off : Option Nat ← (match r with
+      | .ref bc [] => do
+        match (← Interp.readCell bc) with
+        | .row l u _ => if l.size == rank.toNat then some <$> elemOffset l u rank i j else pure none
+        | _ => pure none
+      | _ => pure none)
+    match off, r with
+    | some o, .ref bc _ => r := .ref bc [.elem o]
+    | _, _ => r ← Interp.sliceValue r (selIdx rank i j) true
+  for k in [0:specNF spec] do
+    let f := specField fields k
+    r ← (match r with
+      | .ref bc p => pure (.ref bc (p ++ [.field f]))
+      | .nil => Interp.rtErr "attempt to select from NIL"
+      | _ => Interp.rtErr "internal: select via non-REF")
+  return r
+
+@[inline] private def selWrite (c : Nat) (spec : UInt32) (i j : Int64) (fields : UInt32)
+    (nv : Value) : Interp.M Unit := do
+  Interp.writeRef (← selRef c spec i j fields) nv
+
+@[export a68rt_sel_push]
+def selPush (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Unit := go do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .undef => die "attempt to use an uninitialised value"
+  | v => push v
+
+@[export a68rt_sel_int]
+def selInt (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Int64 := do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .int n => return Int64.ofInt n
+  | .undef => die "attempt to use an uninitialised INT value"
+  | _ => throw (IO.userError "INT expected")
+
+@[export a68rt_sel_real]
+def selReal (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Float := do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .real x => return x
+  | .int n => return Float.ofInt n
+  | .undef => die "attempt to use an uninitialised REAL value"
+  | _ => throw (IO.userError "REAL expected")
+
+@[export a68rt_sel_bool]
+def selBool (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO UInt8 := do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .bool b => return (if b then 1 else 0)
+  | .undef => die "attempt to use an uninitialised BOOL value"
+  | _ => throw (IO.userError "BOOL expected")
+
+@[export a68rt_sel_char]
+def selChar (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO UInt32 := do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .char ch => return UInt32.ofNat ch
+  | .undef => die "attempt to use an uninitialised CHAR value"
+  | _ => throw (IO.userError "CHAR expected")
+
+@[export a68rt_sel_bits]
+def selBits (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO UInt64 := do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .bits b => return UInt64.ofNat b
+  | .undef => die "attempt to use an uninitialised BITS value"
+  | _ => throw (IO.userError "BITS expected")
+
+@[export a68rt_set_sel_int]
+def setSelInt (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) (v : Int64) : IO Unit := do
+  let c ← cellOf depth slot
+  run (selWrite c spec i j fields (.int v.toInt)) ()
+
+@[export a68rt_set_sel_real]
+def setSelReal (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) (v : Float) : IO Unit := do
+  let c ← cellOf depth slot
+  run (selWrite c spec i j fields (.real v)) ()
+
+@[export a68rt_set_sel_bool]
+def setSelBool (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) (v : UInt8) : IO Unit := do
+  let c ← cellOf depth slot
+  run (selWrite c spec i j fields (.bool (v != 0))) ()
+
+@[export a68rt_set_sel_char]
+def setSelChar (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) (v : UInt32) : IO Unit := do
+  let c ← cellOf depth slot
+  run (selWrite c spec i j fields (.char v.toNat)) ()
+
+@[export a68rt_set_sel_bits]
+def setSelBits (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) (v : UInt64) : IO Unit := do
+  let c ← cellOf depth slot
+  run (selWrite c spec i j fields (.bits v.toNat)) ()
+
+-- ## Appending to a row variable
+--
+-- `s +:= c` is how a string is built up.  Reached the general way it pushes a reference,
+-- boxes the character, rows it, and rebuilds the whole string; here it is one call that
+-- appends to the element array in place.  A cell that does not hold a one-dimensional row
+-- starting at 1 falls back to the operator itself, which is what reports the error.
+
+@[inline] private def appendFallback (c : Nat) (v : Value) : Interp.M Unit := do
+  let _ ← Interp.dyadic "+:=" (.ref Mode.string) Mode.string (.ref c []) v
+  pure ()
+
+@[export a68rt_append_char]
+def appendChar (depth slot ch : UInt32) : IO Unit := go do
+  let c ← cellOf depth slot
+  run (do
+    if !(← Interp.appendOne c (.char ch.toNat)) then
+      appendFallback c (.row #[1] #[1] #[.char ch.toNat])) ()
+
+/-- `s +:= t`, with the row to append on the operand stack. -/
+@[export a68rt_append]
+def appendTop (depth slot : UInt32) : IO Unit := go do
+  let v ← pop
+  let c ← cellOf depth slot
+  run (do
+    match (← Interp.appendInPlace (.ref c []) v) with
+    | some _ => pure ()
+    | none => appendFallback c v) ()
+
 /-- A promoted C variable read before it was assigned. -/
 @[export a68rt_undef_error]
 def undefError (kind : UInt32) : IO Unit := do
@@ -541,7 +732,8 @@ def arithError (kind : UInt32) : IO Unit := do
        | 1 => "INT division by zero"
        | 2 => "infinite REAL value"
        | 3 => "REAL value is not a number"
-       | _ => "INT value out of bounds")
+       | 4 => "INT value out of bounds"
+       | _ => "REPR argument out of range")
 
 -- ## Reading scalars back into C
 
