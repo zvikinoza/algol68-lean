@@ -24,6 +24,8 @@ fi
 
 record() {  # record <dir> <source>
   local d="$1" src="$2"
+  # already recorded: skip, so that an interrupted sweep resumes where it stopped
+  [ -s "$d/rc1.txt" ] && [ -f "$d/out2.txt" ] && return 0
   mkdir -p "$d"; cp "$src" "$d/prog.a68"
   # a68g exits nonzero on the many programs it rejects, and that is data, not a failure:
   # swallow the status so `set -e` does not stop the sweep on the first rejected program.

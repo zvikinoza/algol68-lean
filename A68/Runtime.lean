@@ -416,18 +416,32 @@ def popBits : IO UInt64 :=
 -- directly in its cell, so the element can be reached without building a reference and
 -- without going through the general slicing machinery; anything else falls back to it.
 
+/-- The element offset, or `none` when a subscript is out of bounds.  Pure, so that the
+    write path can check the subscript without a `try`: a `try` keeps the row alive across
+    the update, and then the element array has to be copied instead of written in place. -/
+@[inline] private def elemOffset? (l u : Array Int) (rank : UInt32) (i j : Int64) : Option Nat :=
+  let lo := l[0]!
+  let a : Int := i.toInt
+  if a < lo || a > u[0]! then none
+  else if rank == 1 then some (a - lo).toNat
+  else
+    let lo1 := l[1]!
+    let b : Int := j.toInt
+    if b < lo1 || b > u[1]! then none
+    else some ((a - lo) * (u[1]! - lo1 + 1) + (b - lo1)).toNat
+
+/-- Report the subscript that was out of bounds, in the evaluator's words. -/
+private def offsetErr (l u : Array Int) (rank : UInt32) (i j : Int64) : Interp.M α :=
+  let a : Int := i.toInt
+  if a < l[0]! || a > u[0]! then Interp.rtErr s!"index {a} out of bounds [{l[0]!}:{u[0]!}]"
+  else if rank == 1 then Interp.rtErr "internal: element offset out of range"
+  else Interp.rtErr s!"index {j.toInt} out of bounds [{l[1]!}:{u[1]!}]"
+
 @[inline] private def elemOffset (l u : Array Int) (rank : UInt32) (i j : Int64)
     : Interp.M Nat := do
-  let lo := l[0]!
-  let hi := u[0]!
-  let a : Int := i.toInt
-  if a < lo || a > hi then Interp.rtErr s!"index {a} out of bounds [{lo}:{hi}]"
-  if rank == 1 then return (a - lo).toNat
-  let lo1 := l[1]!
-  let hi1 := u[1]!
-  let b : Int := j.toInt
-  if b < lo1 || b > hi1 then Interp.rtErr s!"index {b} out of bounds [{lo1}:{hi1}]"
-  return ((a - lo) * (hi1 - lo1 + 1) + (b - lo1)).toNat
+  match elemOffset? l u rank i j with
+  | some o => return o
+  | none => offsetErr l u rank i j
 
 private def elemOf (c : Nat) (rank : UInt32) (i j : Int64) : Interp.M Value := do
   match (← Interp.readCell c) with
@@ -445,9 +459,11 @@ private def setElemOf (c : Nat) (rank : UInt32) (i j : Int64) (nv : Value) : Int
   | .row l u es =>
     if l.size == rank.toNat then
       -- the cell was emptied, so the element array is uniquely owned and updates in place
-      let o ← try elemOffset l u rank i j
-              catch e => do Interp.writeCell c (.row l u es); throw e
-      Interp.writeCell c (.row l u (es.set! o nv))
+      match elemOffset? l u rank i j with
+      | some o => Interp.writeCell c (.row l u (es.set! o nv))
+      | none =>
+        Interp.writeCell c (.row l u es)
+        offsetErr l u rank i j
     else
       Interp.writeCell c (.row l u es)
       (← Interp.sliceGeneral c rank i j) |> (Interp.writeRef · nv)

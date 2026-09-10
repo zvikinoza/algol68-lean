@@ -686,16 +686,32 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : M Bool := d
     match CTy.ofMode tm, strip l with
     | some ty, .refCell dd ss =>
       let ev ← env
-      match scalarExpr ev m2 r with
+      let promoted := varOf ev dd ss
+      -- a promoted variable has no cell to take a reference to, so once the analysis has
+      -- allowed the operator this path has to carry it through
+      if promoted.isSome && !assignsNatively ty op then return false
+      match CTy.ofMode m2 with
       | none => return false
-      | some rs =>
-        let cur := match varOf ev dd ss with
+      | some rty =>
+        -- the right operand is evaluated first, as the evaluator does, and the variable
+        -- is read after it, in case evaluating it wrote to the variable
+        let rs : Option String ← match scalarExpr ev m2 r with
+          | some e => pure (some e)
+          | none =>
+            -- only worth the temporary when the destination has no cell to fall back to
+            if promoted.isNone then pure none else do
+              let t ← fresh
+              gen r
+              emit s!"{rty.name} t{t} = {rty.popFn}();"
+              pure (some s!"t{t}")
+        let some rs := rs | return false
+        let cur := match promoted with
           | some vv => readVar vv
           | none => s!"{ty.cellFn}({rtDepthOf ev dd}, {ss})"
         match nativeAssignOp op ty cur rs with
         | none => return false
         | some e =>
-          match varOf ev dd ss with
+          match promoted with
           | some (v, _, u) => emit (if u then s!"{v} = {e}; {v}_i = 1;" else s!"{v} = {e};")
           | none => emit s!"{ty.setFn}({rtDepthOf ev dd}, {ss}, {e});"
           return true
