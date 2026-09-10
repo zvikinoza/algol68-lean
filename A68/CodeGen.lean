@@ -674,6 +674,57 @@ def slotInitialised (stmts : Array CoreStmt) (slot : Nat) : Bool := Id.run do
     | _ => pure ()
   return false
 
+/-- The `Core` inside a format item: the dynamic replicators, the arguments of general
+    patterns and the included formats. -/
+partial def fmtChildren : CoreFmt → List Core
+  | .rep _ dyn item => dyn.toList ++ fmtChildren item
+  | .general args => args
+  | .include f => [f]
+  | .group items => items.flatMap fmtChildren
+  | _ => []
+
+/-- The immediate `Core` children of a node, each with the number of frames entered
+    between the node and that child.  It covers every constructor, so an analysis
+    written on it cannot silently miss a use. -/
+partial def childrenD : Core → List (Nat × Core)
+  | .deref e | .deproc e | .rowOf e | .voiding e | .gen e | .at _ e
+  | .widen _ _ e | .unite _ e | .monop _ _ e | .select _ e _ => [(0, e)]
+  | .assign a b _ | .identRel a b _ | .andThen a b | .orElse a b | .seq a b
+  | .dyop _ _ _ a b => [(0, a), (0, b)]
+  | .call f args => (0, f) :: args.map ((0, ·))
+  | .routine _ _ b => [(1, b)]
+  | .slice a idx _ => (0, a) :: idx.flatMap (fun
+      | .index e => [(0, e)]
+      | .trim l u a => (l.toList ++ u.toList ++ a.toList).map ((0, ·)))
+  | .newRow bs i _ => bs.flatMap (fun (l, u) => [(0, l), (0, u)]) ++ [(0, i)]
+  | .block _ stmts _ _ => stmts.toList.flatMap (fun
+      | .decl _ _ c => [(1, c)]
+      | .unit c => [(1, c)]
+      | _ => [])
+  | .collateral es _ _ => es.map ((0, ·))
+  | .cond c t e => [(0, c), (0, t), (0, e)]
+  | .caseInt s alts o => (0, s) :: alts.map ((0, ·)) ++ [(0, o)]
+  | .caseConf s alts o => (0, s) :: alts.map (fun (_, _, c) => (1, c)) ++ [(0, o)]
+  | .loop _ f b t w body =>
+    [(0, f), (0, b)] ++ t.toList.map ((0, ·)) ++ w.toList.map ((1, ·)) ++ [(1, body)]
+  | .fmt items => items.flatMap (fun it => (fmtChildren it).map ((0, ·)))
+  | _ => []
+
+/-- Is the slot read or named anywhere below? -/
+partial def seesSlot (slot d : Nat) (c : Core) : Bool :=
+  match c with
+  | .refCell d' s | .loadCell d' s => d' == d && s == slot
+  | _ => (childrenD c).any fun (k, ch) => seesSlot slot (d + k) ch
+
+/-- Is the slot read or named by code that is compiled into another C function: the body
+    of a routine text, or a hole of a format text?  Format holes are evaluated in the
+    environment the format captured, so their depths are those of the format itself. -/
+partial def seenByOtherFn (slot d : Nat) (c : Core) : Bool :=
+  match c with
+  | .routine _ _ b => seesSlot slot (d + 1) b
+  | .fmt items => items.any fun it => (fmtChildren it).any (seesSlot slot d)
+  | _ => (childrenD c).any fun (k, ch) => seenByOtherFn slot (d + k) ch
+
 /-- Which of a frame's slots can become C variables.  A slot qualifies when its declared
     mode is primitive and nothing inside the frame needs it to live in a cell.  If no
     routine text or format text occurs in the body — those compile to separate C functions
@@ -681,19 +732,26 @@ def slotInitialised (stmts : Array CoreStmt) (slot : Nat) : Bool := Id.run do
     no run-time frame is emitted for it at all. -/
 def planFrame (tag : Nat) (size : Nat) (slotModes : Array (Option Mode))
     (stmts : Array CoreStmt) (wantValue : Bool) : Frame := Id.run do
-  if stmts.toList.any hasOtherFnStmt then
-    return { vars := Array.replicate size none, pushed := true }
+  -- A routine text or a format text is compiled into a C function of its own and reaches
+  -- this frame through the run-time environment.  A slot it can see therefore needs its
+  -- cell; a slot it cannot see is as free to become a C variable as in any other block.
+  -- Its depths count this frame, though, so the frame is pushed whenever one is present.
+  let others := stmts.toList.any hasOtherFnStmt
+  let seenElsewhere (i : Nat) : Bool :=
+    others && stmts.toList.any fun
+      | .decl _ _ c | .unit c => seenByOtherFn i 0 c
+      | _ => false
   let mut vars : Array (Option (String × CTy × Bool)) := #[]
   let mut all := true
   for i in [0:size] do
     match (slotModes[i]?.join).bind CTy.ofMode with
     | some t =>
-      if slotEscapesStmts (assignsNatively t) 0 i stmts wantValue then
+      if seenElsewhere i || slotEscapesStmts (assignsNatively t) 0 i stmts wantValue then
         vars := vars.push none; all := false
       else
         vars := vars.push (some (s!"p{tag}_{i}", t, !slotInitialised stmts i))
     | none => vars := vars.push none; all := false
-  return { vars := vars, pushed := !all }
+  return { vars := vars, pushed := others || !all }
 
 def env : M (List Frame) := do return (← get).frames
 def rtd (d : Nat) : M Nat := do return rtDepthOf (← env) d
