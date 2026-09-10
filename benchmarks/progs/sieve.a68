@@ -1,0 +1,19 @@
+# Sieve of Eratosthenes over 2 million, repeated twice. #
+# ops: 1e7  (approximate inner-loop marking steps)      #
+BEGIN
+  INT n = 2000000;
+  INT count := 0;
+  FOR rep TO 2 DO
+    [1:n] BOOL prime;
+    FOR i TO n DO prime[i] := TRUE OD;
+    count := 0;
+    FOR i FROM 2 TO n DO
+      IF prime[i] THEN
+        count +:= 1;
+        INT j := i + i;
+        WHILE j <= n DO prime[j] := FALSE; j +:= i OD
+      FI
+    OD
+  OD;
+  print((count, newline))
+END

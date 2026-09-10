@@ -1,0 +1,8 @@
+# Procedure calls: 5 million calls of a two-parameter procedure. #
+# ops: 5e6  (one call per iteration)                             #
+BEGIN
+  PROC f = (INT x, INT y) INT: (x + y) MOD 1000003;
+  INT s := 0;
+  FOR i TO 5000000 DO s := f(s, i) OD;
+  print((s, newline))
+END

@@ -1,0 +1,9 @@
+# Tight integer arithmetic: 20 million adds, multiplies and modulos in a loop. #
+# ops: 6e7  (three arithmetic operations per iteration)                        #
+BEGIN
+  INT s := 0;
+  FOR i TO 20000000 DO
+    s := (s + i * 3) MOD 1000003
+  OD;
+  print((s, newline))
+END

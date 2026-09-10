@@ -1,0 +1,11 @@
+# Row indexing: fill and sum a 1000-element row 20000 times. #
+# ops: 4e7  (one store and one load per element)             #
+BEGIN
+  [1:1000] INT a;
+  INT total := 0;
+  FOR r TO 20000 DO
+    FOR i TO 1000 DO a[i] := i + r OD;
+    FOR i TO 1000 DO total := (total + a[i]) MOD 1000003 OD
+  OD;
+  print((total, newline))
+END
