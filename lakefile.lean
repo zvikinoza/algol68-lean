@@ -21,6 +21,8 @@ extern_lib liba68stubs pkg := do
 @[default_target]
 lean_lib A68 where
   roots := #[`A68]
+  -- compiled programs link the static archive, so build it by default
+  defaultFacets := #[LeanLib.staticFacet]
 
 @[default_target]
 lean_exe a68lean where

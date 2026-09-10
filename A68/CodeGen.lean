@@ -173,11 +173,11 @@ partial def gen (c : Core) : M Unit := do
       match ix with
       | .index e => gen e
       | .trim l u a =>
-        match l with | some e => gen e | none => emit "a68_v(a68rt_push_int(-2147483647LL, W));"
-        match u with | some e => gen e | none => emit "a68_v(a68rt_push_int(-2147483647LL, W));"
-        match a with
-        | some e => gen e; kinds := kinds + 2 * 4 ^ i
-        | none => kinds := kinds + 1 * 4 ^ i
+        let mut bits := 1
+        match l with | some e => gen e; bits := bits + 2 | none => pure ()
+        match u with | some e => gen e; bits := bits + 4 | none => pure ()
+        match a with | some e => gen e; bits := bits + 8 | none => pure ()
+        kinds := kinds + bits * 16 ^ i
       i := i + 1
     emit s!"a68_v(a68rt_slice({idx.length}, {kinds}ULL, {if viaRef then 1 else 0}, W));"
   | .select i e viaRef =>
@@ -293,12 +293,14 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
     emit ("if (!done" ++ toString n ++ " && a68_conform(" ++ toString mi ++ ", " ++ (if slot.isSome then "1" else "0") ++ ")) {")
     indent do
       emit s!"done{n} = 1;"
+      -- as in the evaluator: a frame per alternative, empty when nothing is bound
       if slot.isSome then
         emit "a68_v(a68rt_enter(1, W));"
         emit "a68_v(a68rt_bind_cell(0, 0, W));"
+      else emit "a68_v(a68rt_enter(0, W));"
       gen body
       emit "a68_v(a68rt_nip(W));"
-      if slot.isSome then emit "a68_v(a68rt_leave(W));"
+      emit "a68_v(a68rt_leave(W));"
     emit "}"
   emit ("if (!done" ++ toString n ++ ") {")
   indent do
@@ -318,21 +320,20 @@ partial def genLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Opti
   emit ("for (int64_t i" ++ toString n ++ " = from" ++ toString n ++ "; ; i" ++ toString n ++ " += by" ++ toString n ++ ") {")
   indent do
     emit s!"if (has{n} && ((by{n} > 0 && i{n} > to{n}) || (by{n} < 0 && i{n} < to{n}))) break;"
+    -- the evaluator pushes a frame for every iteration, empty when there is no counter
     match slot with
     | some sl =>
       emit "a68_v(a68rt_enter(1, W));"
       emit s!"a68_v(a68rt_set_int(0, {sl}, i{n}, W));"
-    | none => pure ()
+    | none => emit "a68_v(a68rt_enter(0, W));"
     match w with
     | some wc =>
       gen wc
-      emit "if (!a68_bool()) {"
-      indent (if slot.isSome then emit "a68_v(a68rt_leave(W));" else pure ())
-      emit "  break; }"
+      emit "if (!a68_bool()) { a68_v(a68rt_leave(W)); break; }"
     | none => pure ()
     gen body
     emit "a68_v(a68rt_pop(W));"
-    if slot.isSome then emit "a68_v(a68rt_leave(W));"
+    emit "a68_v(a68rt_leave(W));"
   emit "}"
   emit "a68_v(a68rt_push_void(W));"
 
@@ -413,6 +414,7 @@ lean_object* a68rt_leave(lean_object* w);
 lean_object* a68rt_env_depth(lean_object* w);
 lean_object* a68rt_env_truncate(uint32_t d, lean_object* w);
 lean_object* a68rt_env_set(lean_object* env, lean_object* w);
+lean_object* a68rt_env_restore(lean_object* w);
 lean_object* a68rt_stack_depth(lean_object* w);
 lean_object* a68rt_stack_truncate(uint32_t d, lean_object* w);
 lean_object* a68rt_push_int(int64_t v, lean_object* w);
@@ -519,18 +521,18 @@ def program (core : Core) (ll : Nat) (regression : Bool) : String := Id.run do
     out := out ++ "static void " ++ h.name ++ "(void) {\n" ++ "\n".intercalate h.body.toList ++ "\n}\n\n"
   -- dispatchers called from the runtime
   out := out ++ "lean_object* a68_dispatch_proc(size_t fn, lean_object* env, lean_object* args, lean_object* w) {\n"
-  out := out ++ "  lean_inc(env);\n  uint32_t saved = a68_u32(a68rt_env_set(env, W));\n"
+  out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n"
   out := out ++ "  lean_inc(args);\n  a68_v(a68rt_push_array(args, W));\n  switch (fn) {\n"
   for i in [0:st.fns.size] do
     out := out ++ s!"    case {i}: a68_fn{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(W);\n  a68_v(a68rt_env_truncate(saved, W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68rt_take_top(W);\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   out := out ++ "lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_object* w) {\n"
-  out := out ++ "  lean_inc(env);\n  uint32_t saved = a68_u32(a68rt_env_set(env, W));\n  switch (idx) {\n"
+  out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n  switch (idx) {\n"
   for i in [0:st.holes.size] do
     out := out ++ s!"    case {i}: a68_hole{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(W);\n  a68_v(a68rt_env_truncate(saved, W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68rt_take_top(W);\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   -- main
   out := out ++ "int main(int argc, char** argv) {\n"
   out := out ++ "  argv = lean_setup_args(argc, argv);\n  lean_initialize_runtime_module();\n"

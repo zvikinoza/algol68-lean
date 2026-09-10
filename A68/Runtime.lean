@@ -34,6 +34,7 @@ structure St where
   stack   : Array Value := #[]
   envs    : Array (Array Nat) := #[]      -- environment stack, innermost last
   tables  : Serial.Reader := {}
+  saved   : Array (Array (Array Nat)) := #[]   -- environment stacks saved across calls
   jump    : Option Nat := none            -- pending jump label
 
 builtin_initialize stRef : IO.Ref (Option St) ← IO.mkRef none
@@ -177,13 +178,20 @@ def envDepth : IO UInt32 := do return UInt32.ofNat (← getSt).envs.size
 @[export a68rt_env_truncate]
 def envTruncate (d : UInt32) : IO Unit := modSt fun s => { s with envs := s.envs.shrink d.toNat }
 
-/-- Enter the environment captured by a compiled procedure (used by the dispatcher). -/
+/-- Enter the environment captured by a compiled procedure: the current environment
+    stack is saved and replaced by the closure's. -/
 @[export a68rt_env_set]
-def envSet (env : Env) : IO UInt32 := do
+def envSet (env : Env) : IO Unit := do
   let s ← getSt
-  let old := s.envs.size
-  stRef.set (some { s with envs := env.reverse.toArray })
-  return UInt32.ofNat old
+  stRef.set (some { s with saved := s.saved.push s.envs, envs := env.reverse.toArray })
+
+/-- Restore the environment stack saved by `a68rt_env_set`. -/
+@[export a68rt_env_restore]
+def envRestore : IO Unit := do
+  let s ← getSt
+  match s.saved.back? with
+  | some e => stRef.set (some { s with envs := e, saved := s.saved.pop })
+  | none => throw (IO.userError "a68 runtime: environment stack underflow")
 
 private def cellOf (depth slot : UInt32) : IO Nat := do
   let s ← getSt
@@ -397,33 +405,39 @@ def select (idx : UInt32) (viaRef : UInt8) : IO Unit := do
     | .row _ _ _ => push (← run (Interp.readPath v [.field idx.toNat]) .undef)
     | _ => throw (IO.userError "a68 runtime: select from non-struct")
 
-/-- Slice: the indexers were pushed in order; `kinds` is a bit string with two bits per
-    indexer (0 = index, 1 = trim without AT, 2 = trim with AT). -/
+/-- Slice.  The indexer values were pushed in order; `kinds` holds four bits per
+    indexer: bit 0 = it is a trim, bit 1 = a lower bound was given, bit 2 = an upper
+    bound was given, bit 3 = an `AT` was given. -/
 @[export a68rt_slice]
 def slice (nidx : UInt32) (kinds : UInt64) (viaRef : UInt8) : IO Unit := do
-  let mut vals ← popN (← countArgs nidx kinds)
+  let nvals := Id.run do
+    let mut c := 0
+    for i in [0:nidx.toNat] do
+      let k := (kinds >>> (UInt64.ofNat (4 * i))) &&& 15
+      if k &&& 1 == 0 then c := c + 1
+      else
+        if k &&& 2 != 0 then c := c + 1
+        if k &&& 4 != 0 then c := c + 1
+        if k &&& 8 != 0 then c := c + 1
+    return c
+  let vals ← popN nvals
   let base ← pop
   let mut idx : List CoreIdx := []
   let mut k := 0
-  let mut lits : Array Value := #[]
   for i in [0:nidx.toNat] do
-    let kind := (kinds >>> (UInt64.ofNat (2 * i))) &&& 3
-    if kind == 0 then
-      lits := lits.push vals[k]!; k := k + 1
-      idx := idx ++ [.index (.lit vals[k-1]!)]
+    let kind := (kinds >>> (UInt64.ofNat (4 * i))) &&& 15
+    if kind &&& 1 == 0 then
+      idx := idx ++ [.index (.lit vals[k]!)]
+      k := k + 1
     else
-      let lo := vals[k]!; let hi := vals[k+1]!; k := k + 2
-      let at_ := if kind == 2 then some (Core.lit vals[k]!) else none
-      if kind == 2 then k := k + 1
-      idx := idx ++ [.trim (some (.lit lo)) (some (.lit hi)) at_]
+      let lo := if kind &&& 2 != 0 then some (Core.lit vals[k]!) else none
+      if kind &&& 2 != 0 then k := k + 1
+      let hi := if kind &&& 4 != 0 then some (Core.lit vals[k]!) else none
+      if kind &&& 4 != 0 then k := k + 1
+      let at_ := if kind &&& 8 != 0 then some (Core.lit vals[k]!) else none
+      if kind &&& 8 != 0 then k := k + 1
+      idx := idx ++ [.trim lo hi at_]
   push (← run (Interp.evalSlice [] (.lit base) idx (viaRef != 0)) .undef)
-where
-  countArgs (n : UInt32) (kinds : UInt64) : IO Nat := do
-    let mut c := 0
-    for i in [0:n.toNat] do
-      let kind := (kinds >>> (UInt64.ofNat (2 * i))) &&& 3
-      c := c + (if kind == 0 then 1 else if kind == 1 then 2 else 3)
-    return c
 
 @[export a68rt_new_row]
 def newRow (ndims : UInt32) (flex : UInt8) : IO Unit := do

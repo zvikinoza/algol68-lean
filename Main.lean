@@ -4,6 +4,7 @@ import A68.Elab
 import A68.Interp
 import A68.Pretty
 import A68.CodeGen
+import A68.Opt
 import A68.Runtime
 
 open A68
@@ -70,11 +71,15 @@ def main (args : List String) : IO UInt32 := do
       | _ :: o :: _ => o
       | _ => (file.splitOn ".").head!
     let cOnly := rest.contains "-c"
+    let level := if rest.contains "-O0" then 0 else if rest.contains "-O2" then 2 else 1
     match (← compile file) with
     | none => return 1
-    | some (core, _, ll) =>
+    | some (core0, _, ll) =>
       let src ← readSource file
       let toks := A68.lex src
+      let core ← Opt.run core0 level
+      if rest.contains "-v" then
+        IO.println s!"core nodes: {Opt.size core0} -> {Opt.size core}"
       let cCode := CodeGen.program core ll (A68.isRegression toks)
       let cFile := out ++ ".c"
       IO.FS.writeFile cFile cCode
