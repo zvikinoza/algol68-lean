@@ -2082,11 +2082,17 @@ partial def readScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (r : Valu
         match t.toInt? with
         | some n => writeRef r (.int n)
         | none => rtErr s!"cannot read INT from \"{t}\""
-      | .real _ =>
-        let neg := t.startsWith "-"
-        let body := if neg || t.startsWith "+" then String.ofList (t.toList.drop 1) else t
-        let x := Numfmt.parseFloat body
-        writeRef r (.real (if neg then -x else x))
+      | .real n =>
+        if n ≥ 1 then
+          -- a LONG value read with a pattern is converted by `string_to_mp` too
+          match (← liftMP (MP.stringToMp t (← mpDigitsOf n))) with
+          | some z => writeRef r (.mp z)
+          | none => rtErr s!"cannot read {Mode.toString (.real n)} from \"{t}\""
+        else
+          let neg := t.startsWith "-"
+          let body := if neg || t.startsWith "+" then String.ofList (t.toList.drop 1) else t
+          let x := Numfmt.parseFloat body
+          writeRef r (.real (if neg then -x else x))
       | _ => rtErr "numeric pattern on non-numeric value"
   | .bool_ f g =>
     let tok ← readToken fid
