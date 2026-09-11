@@ -141,12 +141,13 @@ def dblOfInt (n : Int) : Int :=
   let a := n.natAbs
   if a < 2 ^ 53 then n
   else
+    -- powers of two as shifts: `2^s` is `1 <<< s`, `a % 2^s` is `a &&& (2^s - 1)`
     let s := log2Nat a + 1 - 53
     let m := a >>> s
-    let rem := a % (2 ^ s)
-    let half := 2 ^ (s - 1)
+    let rem := a &&& ((1 <<< s) - 1)
+    let half := 1 <<< (s - 1)
     let m' := if rem > half || (rem == half && m % 2 == 1) then m + 1 else m
-    let r : Int := (m' * 2 ^ s : Nat)
+    let r : Int := (m' <<< s : Nat)
     if n < 0 then -r else r
 
 /-- `fmadd (a, b, c)` on integer-valued doubles: `a · b + c` rounded once. -/
@@ -159,10 +160,10 @@ def truncDiv (x y : Int) : Int :=
   else
     let a := x.natAbs
     let b := y.natAbs
-    -- find e with 2⁵² ≤ a / b · 2^(52 - e) < 2⁵³
+    -- find e with 2⁵² ≤ a / b · 2^(52 - e) < 2⁵³ (powers of two as shifts)
     let e0 : Int := (log2Nat a : Int) - (log2Nat b : Int)
     let scaled (e : Int) : Nat × Nat :=
-      if 52 - e ≥ 0 then (a * 2 ^ (52 - e).toNat, b) else (a, b * 2 ^ (e - 52).toNat)
+      if 52 - e ≥ 0 then (a <<< (52 - e).toNat, b) else (a, b <<< (e - 52).toNat)
     let pick : Int := Id.run do
       let mut e := e0 - 1
       for _ in [0:4] do
@@ -175,8 +176,32 @@ def truncDiv (x y : Int) : Int :=
     let r := p % q
     let m' := if 2 * r > q || (2 * r == q && m % 2 == 1) then m + 1 else m
     -- value is m' · 2^(e - 52); truncate toward zero
-    let t : Nat := if e - 52 ≥ 0 then m' * 2 ^ (e - 52).toNat else m' / 2 ^ (52 - e).toNat
+    let t : Nat := if e - 52 ≥ 0 then m' <<< (e - 52).toNat else m' >>> (52 - e).toNat
     if x < 0 then -(t : Int) else t
+
+/-- a68g's quotient-digit estimate `(int) (nom / den)`, where `nom` is
+    `fma (fma (fma tm1 R t0) R t1) R t2` and `den` the double denominator (`denF` is a
+    double close to it).  The exact computation above is exact but allocates big
+    integers on every digit; this one first computes the same quotient with plain
+    doubles.  Every double operation perturbs a value by at most one part in 2⁵³, so
+    a68g's fused estimate and the plain one (14 roundings between them) both lie within
+    2·10⁻¹⁵ of `nom / den` relatively, which for a quotient below 2²⁶ is less than
+    1.4·10⁻⁷.  When the plain quotient is further than 10⁻⁶ from every integer, both
+    therefore truncate to the same integer; otherwise the exact computation decides. -/
+def qDigit (tm1 t0 t1 t2 den : Int) (denF : Float) : Int :=
+  let lim : Int := 4503599627370496   -- 2⁵²
+  if tm1.natAbs < lim.natAbs && t0.natAbs < lim.natAbs && t1.natAbs < lim.natAbs
+      && t2.natAbs < lim.natAbs && denF > 0.0 then
+    let rF : Float := 10000000.0
+    let nomF := ((Float.ofInt tm1 * rF + Float.ofInt t0) * rF + Float.ofInt t1) * rF + Float.ofInt t2
+    let qF := nomF / denF
+    let aq := Float.abs qF
+    let fr := aq - Float.floor aq
+    if aq < 67108864.0 && fr > 0.000001 && fr < 0.999999 then
+      let t : Int := (Float.floor aq).toUInt64.toNat
+      if qF < 0.0 then -t else t
+    else truncDiv (fma (fma (fma tm1 R t0) R t1) R t2) den
+  else truncDiv (fma (fma (fma tm1 R t0) R t1) R t2) den
 
 -- ## Normalisation and rounding
 
@@ -185,12 +210,14 @@ def truncDiv (x y : Int) : Int :=
     which is exact for scratch values below 2⁵³. -/
 def carryAt (a : Array Int) (j : Nat) : Array Int :=
   let z := a.getD j 0
+  -- the neighbour is read before the first write, so the array is updated in place
+  let lo := a.getD (j - 1) 0
   if z ≥ R then
     let c := z / R
-    (a.setIfInBounds j (z - c * R)).setIfInBounds (j - 1) (a.getD (j - 1) 0 + c)
+    (a.setIfInBounds j (z - c * R)).setIfInBounds (j - 1) (lo + c)
   else if z < 0 then
     let c := 1 + (-z - 1) / R
-    (a.setIfInBounds j (z + c * R)).setIfInBounds (j - 1) (a.getD (j - 1) 0 - c)
+    (a.setIfInBounds j (z + c * R)).setIfInBounds (j - 1) (lo - c)
   else a
 
 /-- `norm_mp`'s loop: carries at `j, j - 1, …, k` (and never below position 1). -/
@@ -466,6 +493,78 @@ def mulMpDigit (z x : MP) (y : Int) (digs : Nat) : MPE MP := do
 
 -- ## Division
 
+/-- Whether a68g's estimate numerator `fma (fma (fma tm1 R t0) R t1) R t2` is zero.
+    When every input is below 2⁵² in magnitude it is zero exactly when the exact value
+    `((tm1·R + t0)·R + t1)·R + t2` is (a non-zero integer never rounds to zero, and a
+    stage that had to round is too large for the later small terms to cancel), which is
+    decided by divisibility by `R` on small integers.  Otherwise the chain is evaluated. -/
+def nomZero (tm1 t0 t1 t2 : Int) : Bool :=
+  let lim : Int := 4503599627370496   -- 2⁵²
+  if tm1.natAbs < lim.natAbs && t0.natAbs < lim.natAbs && t1.natAbs < lim.natAbs
+      && t2.natAbs < lim.natAbs then
+    if t2 % R != 0 then false
+    else
+      let s1 := t1 + t2 / R
+      if s1 % R != 0 then false
+      else
+        let s0 := t0 + s1 / R
+        if s0 % R != 0 then false
+        else tm1 + s0 / R == 0
+  else fma (fma (fma tm1 R t0) R t1) R t2 == 0
+
+/-- The quotient loop of `div_mp_digit` for `|x|` and `ya = |y| ∉ {2, 10}`, outside the
+    error monad (it cannot fail). -/
+def divDigitLoop (z xa : MP) (ya : Int) (digs oflow : Nat) : MP := Id.run do
+  let wdigs := 4 + digs
+  let mut w := Array.replicate (wdigs + 1) (0 : Int)
+  for k in [1:digs+1] do w := w.set! (k + 1) (xa.dig k)
+  let den := dblOfInt (dblOfInt (ya * R) * R)
+  -- div_mp_digit computes its denominator with two plain multiplications, as here
+  let denF := (Float.ofInt ya * 10000000.0) * 10000000.0
+  for k in [1:digs+3] do
+    let first := k + 2
+    let t2 := if wdigs ≥ first + 2 then w[k + 3]! else 0
+    let q := qDigit w[k]! w[k + 1]! w[k + 2]! t2 den denF
+    let wk := w[k]!
+    w := w.set! (k + 1) (w[k + 1]! + (wk * R - q * ya))
+    w := w.set! k q
+    if k % oflow == 0 || k == digs + 2 then w := normDigits w first wdigs
+  w := normDigits w 2 digs
+  return roundInternal z w xa.ex digs
+
+/-- The quotient loop of `div_mp` for `|x|` and the digits `yd` of `|y|`. -/
+def divLoop (z xa : MP) (yd : Array Int) (nzdigs digs oflow : Nat) (wex : Int) : MP := Id.run do
+  let wdigs := 4 + digs
+  let mut w := Array.replicate (wdigs + 1) (0 : Int)
+  for k in [1:digs+1] do w := w.set! (k + 1) (xa.dig k)
+  let y1 := yd.getD 1 0
+  let y2 := yd.getD 2 0
+  let y3 := yd.getD 3 0
+  let den := fma (fma y1 R y2) R y3
+  let denF := (Float.ofInt y1 * 10000000.0 + Float.ofInt y2) * 10000000.0 + Float.ofInt y3
+  for k in [1:digs+3] do
+    let first := k + 2
+    let len := digs + 1 + k
+    let t2 := if wdigs ≥ first + 2 then w[k + 3]! else 0
+    let tm1 := w[k]!
+    let t0 := w[k + 1]!
+    let t1 := w[k + 2]!
+    let nomIsZero := nomZero tm1 t0 t1 t2
+    let mut q : Int := 0
+    if !nomIsZero then
+      q := qDigit tm1 t0 t1 t2 den denF
+      let mut lim := min len wdigs
+      if nzdigs + first ≤ lim + 1 then lim := first + nzdigs - 1
+      for j in [first:lim+1] do
+        let idx := k + 1 + (j - first)
+        w := w.set! idx (w[idx]! - q * yd.getD (1 + (j - first)) 0)
+    let wk := w[k]!
+    w := w.set! (k + 1) (fma wk R w[k + 1]!)
+    w := w.set! k q
+    if k % oflow == 0 || k == digs + 2 then w := normDigits w first wdigs
+  w := normDigits w 2 digs
+  return roundInternal z w wex digs
+
 /-- `div_mp_digit (z, x, y, digs)`. -/
 def divMpDigit (z x : MP) (y : Int) (digs : Nat) : MPE MP := do
   catchNaN x
@@ -479,21 +578,7 @@ def divMpDigit (z x : MP) (y : Int) (digs : Nat) : MPE MP := do
   let ya := y.natAbs
   let r ← if ya == 2 then halfMp z xa digs
     else if ya == 10 then tenthMp z xa digs
-    else do
-      let wdigs := 4 + digs
-      let mut w := Array.replicate (wdigs + 1) (0 : Int)
-      for k in [1:digs+1] do w := w.set! (k + 1) (xa.dig k)
-      let den := dblOfInt (dblOfInt (ya * R) * R)
-      for k in [1:digs+3] do
-        let first := k + 2
-        let t2 := if wdigs ≥ first + 2 then w[k + 3]! else 0
-        let nom := fma (fma (fma w[k]! R w[k + 1]!) R w[k + 2]!) R t2
-        let q := truncDiv nom den
-        w := w.set! (k + 1) (w[k + 1]! + (w[k]! * R - q * ya))
-        w := w.set! k q
-        if k % oflow == 0 || k == digs + 2 then w := normDigits w first wdigs
-      w := normDigits w 2 digs
-      pure (roundInternal z w x.ex digs)
+    else pure (divDigitLoop z xa ya digs oflow)
   let z1 := r.dig 1
   checkExp (r.setDig 1 (if x1 * y ≥ 0 then z1 else -z1))
 
@@ -518,28 +603,7 @@ def divMp (z x y : MP) (digs : Nat) : MPE MP := do
     let r ← divMpDigit z xa (ya.dig 1) digs
     let z1 := r.dig 1
     return ← checkExp (r.setDig 1 (if x1 * y1 ≥ 0 then z1 else -z1))
-  let wdigs := 4 + digs
-  let mut w := Array.replicate (wdigs + 1) (0 : Int)
-  for k in [1:digs+1] do w := w.set! (k + 1) (xa.dig k)
-  let den := fma (fma (ya.dig 1) R (ya.dig 2)) R (ya.dig 3)
-  for k in [1:digs+3] do
-    let first := k + 2
-    let len := digs + 1 + k
-    let t2 := if wdigs ≥ first + 2 then w[k + 3]! else 0
-    let nom := fma (fma (fma w[k]! R w[k + 1]!) R w[k + 2]!) R t2
-    let mut q : Int := 0
-    if nom != 0 then
-      q := truncDiv nom den
-      let mut lim := min len wdigs
-      if nzdigs + first ≤ lim + 1 then lim := first + nzdigs - 1
-      for j in [first:lim+1] do
-        let idx := k + 1 + (j - first)
-        w := w.set! idx (w[idx]! - q * ya.dig (1 + (j - first)))
-    w := w.set! (k + 1) (fma w[k]! R w[k + 1]!)
-    w := w.set! k q
-    if k % oflow == 0 || k == digs + 2 then w := normDigits w first wdigs
-  w := normDigits w 2 digs
-  let r := roundInternal z w (x.ex - y.ex) digs
+  let r := divLoop z xa (grow ya.d (digs + 1)) nzdigs digs oflow (x.ex - y.ex)
   let z1 := r.dig 1
   checkExp (r.setDig 1 (if x1 * y1 ≥ 0 then z1 else -z1))
 
