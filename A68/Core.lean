@@ -133,6 +133,12 @@ def isUndef : Value → Bool
   | undef => true
   | _ => false
 
+/-- The value of a union that has not been given one: a union variable declared without an
+    initial value, a row element or a field of union mode, or `SKIP`.  a68g lets such a value
+    be copied and passed as a parameter, and a conformity clause takes none of its
+    alternatives.  Its mode is the empty union, to which no constituent is equivalent. -/
+def emptyUnion : Value := .union (.union []) .undef
+
 /-- Build a row value with bounds `1:n` from a list of elements. -/
 def rowOfList (xs : List Value) : Value :=
   .row #[1] #[xs.length] xs.toArray

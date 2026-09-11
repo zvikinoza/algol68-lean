@@ -1,0 +1,8 @@
+BEGIN
+  MODE V = UNION (INT, REAL);
+  [1:4] V a;
+  FOR i TO 4 DO a[i] := IF ODD i THEN V (i) ELSE SKIP FI OD;
+  FOR i TO 4 DO
+    CASE a[i] IN (INT k): print((k, newline)) OUT print(("out", newline)) ESAC
+  OD
+END

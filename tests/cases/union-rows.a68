@@ -1,0 +1,56 @@
+BEGIN
+  MODE ITEM = UNION (INT, REAL, BOOL, CHAR, BITS);
+  INT n = 12;
+  [1:n] ITEM a;
+  FOR i TO n DO
+    a[i] := CASE i MOD 5 + 1
+            IN ITEM (i * 3), ITEM (i / 4), ITEM (ODD i), ITEM (REPR (65 + i)), ITEM (BIN i)
+            ESAC
+  OD;
+  INT total := 0;
+  FOR i TO n DO
+    CASE a[i]
+    IN (INT k): total +:= k,
+       (REAL x): total +:= ROUND (x * 4),
+       (BOOL b): total +:= (b | 3 | 5),
+       (CHAR c): total +:= ABS c
+    OUT total +:= 1000
+    ESAC
+  OD;
+  print((total, newline));
+  # in value position, and alternatives without an identifier #
+  FOR i TO n DO
+    INT v = CASE a[i] IN (INT k): k, (REAL): -1, (CHAR c): ABS c OUT 0 ESAC;
+    print((v, " "))
+  OD;
+  print(newline);
+  # a routine text that sees the bound value #
+  FOR i TO 3 DO
+    CASE a[i]
+    IN (INT k): (PROC p = INT: k * 2; print((p, newline))),
+       (REAL x): (PROC q = REAL: x + 1; print((q, newline)))
+    OUT print(("other", newline))
+    ESAC
+  OD;
+  # a conditional clause as the source, in two dimensions #
+  [0:3, 1:2] ITEM g;
+  FOR i FROM 0 TO 3 DO
+    FOR j TO 2 DO
+      g[i, j] := IF i = j THEN ITEM (i + j) ELIF i > j THEN ITEM (i / j) ELSE ITEM (i < j) FI
+    OD
+  OD;
+  FOR i FROM 0 TO 3 DO
+    FOR j TO 2 DO
+      CASE g[i, j]
+      IN (INT k): print(("int", k)),
+         (REAL x): print(("real", x)),
+         (BOOL b): print(("bool", b))
+      ESAC
+    OD;
+    print(newline)
+  OD;
+  print((LWB g, UPB g, 2 LWB g, 2 UPB g, newline));
+  # a later alternative for the same constituent is never taken #
+  CASE a[2] IN (BOOL b): print(("first", b)), (BOOL c): print(("second", c)) OUT print("out") ESAC;
+  print(newline)
+END

@@ -636,6 +636,7 @@ partial def defaultValue (m : ModeSyn) : Elab Core := do
       | some m' => defaultOfMode m'
       | none => return .lit .undef
   | .long _ inner => defaultValue inner
+  | .union _ => return .lit Value.emptyUnion
   | _ => return .lit .undef
 
 /-- Default value from a semantic mode (no bounds information). -/
@@ -648,6 +649,7 @@ partial def defaultOfMode (m : Mode) (fuel : Nat := 8) : Elab Core := do
   | .struct fs =>
     let inits ← fs.mapM fun (_, fm) => defaultOfMode fm (fuel - 1)
     return .collateral inits true 0
+  | .union _ => return .lit Value.emptyUnion
   | _ => return .lit .undef
 
 partial def elabSerial (s : Serial) (ctx : Ctx) : Elab (Core × Mode) :=
