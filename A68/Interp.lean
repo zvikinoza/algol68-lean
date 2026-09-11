@@ -1458,6 +1458,11 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
       | _ => rtErr s!"internal: STRING operator {op}"
   | .int _, .row 1 _ .char =>
     let k ← expectInt a
+    -- `k UPB s` on a STRING is a bounds enquiry, not the replication `k * s`
+    if op == "LWB" || op == "UPB" then
+      let (l, u, _) ← expectRow b
+      if k < 1 || k > l.size then rtErr "LWB/UPB dimension out of range"
+      return .int (if op == "LWB" then l[(k-1).toNat]! else u[(k-1).toNat]!)
     let (_, _, ys) ← expectRow b
     let n := if k > 0 then k.toNat else 0
     return .row #[1] #[ys.size * n] ((List.replicate n ys).foldl (· ++ ·) #[])

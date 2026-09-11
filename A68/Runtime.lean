@@ -752,6 +752,36 @@ def appendTop (depth slot : UInt32) : IO Unit := go do
     | some _ => pure ()
     | none => appendFallback c v) ()
 
+/-- A STRING that compiled code keeps in a C buffer, made a value again: a row of its bytes
+    whose lower bound is `l`, a two's complement 64-bit integer. -/
+@[export a68rt_push_bytes]
+def pushBytes (b : ByteArray) (l : UInt64) : IO Unit := go do
+  let lw : Int := if l.toNat ≥ 2 ^ 63 then (l.toNat : Int) - 2 ^ 64 else l.toNat
+  let es : Array Value := b.data.map fun x => .char x.toNat
+  push (.row #[lw] #[lw + es.size - 1] es)
+
+/-- The STRING on top of the operand stack as the contents of a C buffer: eight bytes of its
+    lower bound, least significant first, then its characters. -/
+@[export a68rt_pop_bytes]
+def popBytes : IO ByteArray :=
+  val (do
+    let v ← pop
+    let (l, es) ← match v with
+      | .row l _ es => if l.size == 1 then pure (l[0]!, es) else throw (IO.userError "STRING expected")
+      | .char c => pure ((1 : Int), #[Value.char c])
+      | .undef => die "attempt to use an uninitialised value"
+      | _ => throw (IO.userError "STRING expected")
+    let lw : Nat := if l < 0 then (l + 2 ^ 64).toNat else l.toNat
+    let mut out := ByteArray.empty
+    for k in [0:8] do
+      out := out.push (UInt8.ofNat (lw / 256 ^ k % 256))
+    for e in es do
+      match e with
+      | .char c => out := out.push (UInt8.ofNat c)
+      | .undef => die "attempt to use an uninitialised CHAR value"
+      | _ => throw (IO.userError "CHAR expected")
+    return out) ByteArray.empty
+
 /-- A promoted C variable read before it was assigned. -/
 @[export a68rt_undef_error]
 def undefError (kind : UInt32) : IO Unit := do

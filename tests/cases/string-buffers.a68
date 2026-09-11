@@ -1,0 +1,43 @@
+# STRING variables: appends, assignments, subscripts, bounds and comparisons. #
+BEGIN
+  STRING s := "", t := "abc";
+  FOR i TO 30 DO s +:= REPR (ABS "a" + i MOD 26) OD;
+  print((s, " ", UPB s, " ", LWB s, newline));
+  t +:= s; t +:= "!?"; t +:= t;
+  print((t, UPB t, newline));
+  INT sum := 0;
+  FOR i FROM LWB t TO UPB t DO sum +:= ABS t[i] OD;
+  print((sum, newline));
+  STRING u := "abd";
+  print((s < t, s = s, "abc" < u, u > "ab", u >= "abd", u /= "abd", "" < u, t <= s, newline));
+  u := "xyz"[@0];
+  print((LWB u, UPB u, u[0], u[2], 1 UPB u, newline));
+  u +:= "q";
+  print((LWB u, UPB u, u, newline));
+  PROC rev = (STRING x) STRING:
+    BEGIN
+      STRING r := "";
+      FOR i FROM UPB x BY -1 TO LWB x DO r +:= x[i] OD;
+      r
+    END;
+  s := rev(s);
+  print((s, newline));
+  s := s + "|" + t[1:3];
+  print((s, UPB s, newline));
+  STRING w := "";
+  WHILE UPB w < 7 DO w +:= "ab" OD;
+  print((w, UPB w, w = "abababab", newline));
+  STRING e;
+  print((UPB e, LWB e, e = "", newline));
+  e +:= "x"; e +:= e; e +:= e;
+  CHAR c = e[3];
+  print((e, c, newline));
+  STRING q := "quote""and\?";
+  print((q, UPB q, newline));
+  FOR k TO 3 DO
+    STRING line := "row ";
+    line +:= whole(k, 0);
+    print((line, newline))
+  OD;
+  print(s[UPB s + 1])
+END
