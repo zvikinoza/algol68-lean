@@ -370,16 +370,28 @@ def isChoice (c : Core) : Bool :=
 
 /-- Which statements of a block are generated in statement position, where the value is
     thrown away.  Without labels only the last unit supplies the block's value, so every
-    earlier unit is a statement; with labels any unit can be the value the block exits
-    with, so only an explicit VOIDing is safe to treat that way. -/
+    earlier unit is a statement.  With labels and completers, the value a block exits with
+    is that of the unit elaborated last before an `EXIT` or the end; a jump to a label starts
+    again from no value.  So a unit followed by another unit before any `EXIT` is a
+    statement too: whatever path reaches the next `EXIT` or the end passes through that
+    later unit, which replaces the value. -/
 def voidPositions (stmts : Array CoreStmt) (wantValue : Bool) : Array Bool := Id.run do
   let hasLbl := stmts.any fun st => match st with | .label _ | .exit => true | _ => false
   if !wantValue then
     return stmts.map fun st => match st with | .unit _ => true | _ => false
   if hasLbl then
-    return stmts.map fun st => match st with
-      | .unit e => (match strip e with | .voiding _ => true | _ => false)
-      | _ => false
+    let mut out : Array Bool := Array.replicate stmts.size false
+    -- walking backwards: is there a unit ahead before the next EXIT?
+    let mut unitAhead := false
+    for k in [0:stmts.size] do
+      let i := stmts.size - 1 - k
+      match stmts[i]! with
+      | .unit e =>
+        out := out.set! i (unitAhead || (match strip e with | .voiding _ => true | _ => false))
+        unitAhead := true
+      | .exit => unitAhead := false
+      | _ => pure ()
+    return out
   let mut last : Option Nat := none
   for i in [0:stmts.size] do
     match stmts[i]! with | .unit _ => last := some i | _ => pure ()

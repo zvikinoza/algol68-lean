@@ -1,0 +1,57 @@
+# Blocks with labels and completers that yield values. #
+BEGIN
+  PROC steps = (INT n) INT:
+    BEGIN
+      INT x := n, c := 0;
+      WHILE x /= 1 DO
+        IF ODD x THEN x := 3 * x + 1 ELSE x := x OVER 2 FI;
+        c +:= 1;
+        IF c >= 50 THEN GO TO done FI
+      OD;
+      done: c
+    END;
+  FOR n TO 30 DO print(steps(n)) OD;
+  print(newline);
+  PROC pick = (INT k) INT:
+    BEGIN
+      INT r := k * 10;
+      IF k > 5 THEN GO TO big FI;
+      r := r + 1;
+      r EXIT
+      big: r := r - 1;
+      IF r > 80 THEN GO TO huge FI;
+      r * 2 EXIT
+      huge: -r
+    END;
+  FOR k TO 10 DO print(pick(k)) OD;
+  print(newline);
+  INT count := 0;
+  INT total =
+    BEGIN
+      INT acc := 0, i := 0;
+      again: i +:= 1;
+      acc +:= i * i;
+      IF i < 20 THEN GO TO again FI;
+      count := i;
+      acc
+    END;
+  print((total, count, newline));
+  REAL avg =
+    BEGIN
+      REAL s := 0.0; INT m := 0;
+      loop: m +:= 1; s +:= m / 3;
+      IF m < 7 THEN GO TO loop FI;
+      s / m
+    END;
+  print((avg, newline));
+  BOOL found =
+    BEGIN
+      INT j := 0;
+      next: j +:= 1;
+      IF j * j = 49 THEN GO TO yes FI;
+      IF j < 10 THEN GO TO next FI;
+      FALSE EXIT
+      yes: TRUE
+    END;
+  print((found, newline))
+END
