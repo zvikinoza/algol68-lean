@@ -778,7 +778,9 @@ def arithError (kind : UInt32) : IO Unit := do
        | 3 => "REAL value is not a number"
        | 4 => "INT value out of bounds"
        | 5 => "REAL division by zero"
-       | _ => "REPR argument out of range")
+       | 6 => "REPR argument out of range"
+       | 7 => "REAL math error"
+       | _ => "invalid INT exponent")
 
 -- ## Reading scalars back into C
 

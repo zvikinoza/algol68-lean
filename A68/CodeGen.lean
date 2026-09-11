@@ -591,6 +591,9 @@ def dyopC (op : String) (opnd : CTy) (a b : String) : Option String :=
   | ">=", _ => some s!"(uint8_t)(({a}) >= ({b}))"
   | _, _ => none
 
+/-- The REAL standard functions compiled to C, each as `a68_m_<name>`. -/
+def nativeMathFns : List String := ["acos", "arccos", "arccosh", "arcsin", "arcsinh", "arctan", "arctanh", "asin", "atan", "cbrt", "cos", "cosh", "curt", "exp", "exp2", "ln", "log", "log10", "log2", "sin", "sinh", "sqrt", "tan", "tanh"]
+
 mutual
 /-- `a[i]` and `a[i, j]` on a row promoted to a C array: the element, with the bounds check
     and the undefined test the evaluator performs. -/
@@ -688,6 +691,11 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
   | .deref (.select f e true) => do
     let ch ← fieldChain env (.select f e true)
     some s!"{ty.selFn}({ch.args})"
+  | .call (.lit (.builtin n)) [arg] =>
+    if ty == .f64 && nativeMathFns.contains n then do
+      let x ← scalarExpr env (.real 0) arg
+      some s!"a68_m_{n}({x})"
+    else none
   | .widen src dst e =>
     -- only the widenings that stay inside a native type
     match src, dst with
@@ -702,6 +710,13 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     let x ← scalarExpr env mm e
     monopC op (← CTy.ofMode mm) x
   | .dyop op m1 m2 l r => do
+    -- exponentiation, as the evaluator computes it for each pair of operand modes
+    if op == "**" then
+      match m1, m2, ty with
+      | .int 0, .int 0, .i64 => return s!"a68_pow_i({← scalarExpr env (.int 0) l}, {← scalarExpr env (.int 0) r})"
+      | .real 0, .int 0, .f64 => return s!"a68_pow_ri({← scalarExpr env (.real 0) l}, {← scalarExpr env (.int 0) r})"
+      | .real 0, .real 0, .f64 => return s!"a68_pow_rr({← scalarExpr env (.real 0) l}, {← scalarExpr env (.real 0) r})"
+      | _, _, _ => none
     if (op == "LWB" || op == "UPB") && ty == .i64 then
       if let some rv := rowName env r then
         match strip l with
@@ -730,6 +745,10 @@ def resultMode : Core → Option Mode
   | .lit (.bits _) => some (.bits 0)
   | .loadCell _ _ => none
   | .dyop op m1 _ _ _ => if op == "LWB" || op == "UPB" then some (.int 0) else dyopResult op m1
+  | .call f [_] =>
+    match strip f with
+    | .lit (.builtin n) => if nativeMathFns.contains n then some (.real 0) else none
+    | _ => none
   | .monop op m _ => if op == "LWB" || op == "UPB" then some (.int 0) else monopResult op m
   | .widen _ d _ => some d
   | _ => none
@@ -1988,6 +2007,7 @@ def prelude : String := "
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define W lean_io_mk_world()
 
@@ -2290,6 +2310,71 @@ static inline double a68_diveq_r(double a, double b) {
   if (b == 0.0) return a68_die_r(3);
   return a / b;
 }
+/* Exponentiation and the REAL standard functions, following the evaluator: INT ** INT and
+   REAL ** INT by square-and-multiply with its checks, REAL ** REAL as exp (y ln x), and each
+   function with its domain check and, except exp and exp2, a check of its result. */
+static inline int64_t a68_pow_i(int64_t m, int64_t n) {
+  if (n < 0) return a68_die_i(8);
+  if (m == 0 && n == 0) return 1;
+  if (m == 0 || m == 1) return m;
+  if (m == -1) return (n % 2 == 0) ? 1 : -1;
+  uint64_t nn = (uint64_t) n, bit = 1; int64_t mm = m, p = 1;
+  for (;;) {
+    if (nn & bit) p = a68_mul_i(p, mm);
+    bit <<= 1;
+    if (bit <= nn) mm = a68_mul_i(mm, mm);
+    if (!(bit <= nn)) break;
+  }
+  return p;
+}
+static inline double a68_pow_ri(double x, int64_t n) {
+  uint64_t nn = n < 0 ? (uint64_t)(-(n + 1)) + 1 : (uint64_t) n;
+  double p;
+  if (x == 0.0 && nn == 0) p = 1.0;
+  else if (x == 0.0 || x == 1.0) p = x;
+  else if (x == -1.0) p = (nn % 2 == 0) ? 1.0 : -1.0;
+  else {
+    uint64_t bit = 1; double mm = x; p = 1.0;
+    for (;;) {
+      if (nn & bit) p = p * mm;
+      bit <<= 1;
+      if (bit <= nn) mm = mm * mm;
+      if (!(bit <= nn)) break;
+    }
+    if (p != p || p > 1.7976931348623157e308 || p < -1.7976931348623157e308) return a68_die_r(2);
+  }
+  return n < 0 ? 1.0 / p : p;
+}
+static inline double a68_pow_rr(double x, double y) {
+  if (y == 0.0) return 1.0;
+  if (x < 0.0) return a68_die_r(7);
+  if (x == 0.0) { if (y < 0.0) return a68_die_r(7); return 0.0; }
+  return exp(y * log(x));
+}
+static inline double a68_m_acos(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(acos(x)); }
+static inline double a68_m_arccos(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(acos(x)); }
+static inline double a68_m_arccosh(double x) { return a68_chk_r(acosh(x)); }
+static inline double a68_m_arcsin(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(asin(x)); }
+static inline double a68_m_arcsinh(double x) { return a68_chk_r(asinh(x)); }
+static inline double a68_m_arctan(double x) { return a68_chk_r(atan(x)); }
+static inline double a68_m_arctanh(double x) { return a68_chk_r(atanh(x)); }
+static inline double a68_m_asin(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(asin(x)); }
+static inline double a68_m_atan(double x) { return a68_chk_r(atan(x)); }
+static inline double a68_m_cbrt(double x) { return a68_chk_r(cbrt(x)); }
+static inline double a68_m_cos(double x) { return a68_chk_r(cos(x)); }
+static inline double a68_m_cosh(double x) { return a68_chk_r(cosh(x)); }
+static inline double a68_m_curt(double x) { return a68_chk_r(cbrt(x)); }
+static inline double a68_m_exp(double x) { return exp(x); }
+static inline double a68_m_exp2(double x) { return exp2(x); }
+static inline double a68_m_ln(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(log(x)); }
+static inline double a68_m_log(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(log10(x)); }
+static inline double a68_m_log10(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(log10(x)); }
+static inline double a68_m_log2(double x) { return a68_chk_r(log2(x)); }
+static inline double a68_m_sin(double x) { return a68_chk_r(sin(x)); }
+static inline double a68_m_sinh(double x) { return a68_chk_r(sinh(x)); }
+static inline double a68_m_sqrt(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(sqrt(x)); }
+static inline double a68_m_tan(double x) { return a68_chk_r(tan(x)); }
+static inline double a68_m_tanh(double x) { return a68_chk_r(tanh(x)); }
 static inline int64_t a68_entier(double x) {
   if (x < -2147483647.0 || x > 2147483647.0) return a68_die_i(4);
   return (int64_t) __builtin_floor(x);
