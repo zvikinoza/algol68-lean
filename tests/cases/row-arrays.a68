@@ -1,0 +1,47 @@
+# Rows of primitive elements that the C back end keeps as C arrays: fixed bounds,   #
+# used only through subscripts and bounds enquiries.  Each shape here has to behave #
+# exactly as the evaluator's rows do.                                               #
+BEGIN
+  INT n = 12;
+  [n] INT sq;
+  FOR i TO n DO sq[i] := i * i OD;
+  INT s := 0;
+  FOR i FROM LWB sq TO UPB sq DO s +:= sq[i] OD;
+  print((s, LWB sq, UPB sq, newline));
+  sq[3] +:= 1000;
+  sq[4] *:= 2;
+  print((sq[3], sq[4], newline));
+  [-3:3] REAL z;
+  FOR i FROM LWB z TO UPB z DO z[i] := i / 2.0 OD;
+  print((z[-3], z[0], z[3], newline));
+  [2, 3] INT m;
+  FOR i TO 1 UPB m DO FOR j TO 2 UPB m DO m[i, j] := 10 * i + j OD OD;
+  print((m[1, 1], m[2, 3], 1 LWB m, 2 UPB m, newline));
+  [0:20] BOOL sieve;
+  FOR i FROM 0 TO 20 DO sieve[i] := i >= 2 OD;
+  FOR i FROM 2 TO 4 DO
+    IF sieve[i] THEN INT j := i * i; WHILE j <= 20 DO sieve[j] := FALSE; j +:= i OD FI
+  OD;
+  FOR i FROM 0 TO 20 DO IF sieve[i] THEN print((i)) FI OD;
+  print(newline);
+  [5] CHAR word;
+  FOR i TO 5 DO word[i] := REPR (ABS "a" + i - 1) OD;
+  FOR i FROM 5 BY -1 TO 1 DO print(word[i]) OD;
+  print(newline);
+  [1:0] INT empty;
+  print((LWB empty, UPB empty, newline));
+  INT total := 0;
+  FOR k TO 3 DO
+    [k] INT fresh;
+    FOR i TO k DO fresh[i] := k + i OD;
+    FOR i TO k DO total +:= fresh[i] OD
+  OD;
+  print((total, newline));
+  [4] INT shown;
+  FOR i TO 4 DO shown[i] := i OD;
+  print((shown, newline));
+  PROC twice = (INT x) INT: 2 * x;
+  [3] INT args;
+  FOR i TO 3 DO args[i] := twice(i) OD;
+  print((twice(args[3]), newline))
+END

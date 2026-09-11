@@ -1,0 +1,35 @@
+# Rows of structures whose fields are all primitive, which the C back end keeps as one  #
+# C array per field.  Fields are read, written and updated, whole elements are assigned #
+# from structure displays, and the row is used with LWB and UPB; each has to behave as  #
+# the evaluator's rows of structures do, including a field that was never given a value.#
+BEGIN
+  MODE POINT = STRUCT (INT x, INT y, REAL w, BOOL on, CHAR tag);
+  MODE CELL = STRUCT (INT count, REAL total);
+  INT n = 6;
+  [n] POINT pts;
+  FOR i TO UPB pts DO pts[i] := (i, i * i, i / 2, ODD i, REPR (ABS "a" + i)) OD;
+  FOR step TO 3 DO
+    FOR i FROM LWB pts TO UPB pts DO
+      x OF pts[i] := x OF pts[i] + y OF pts[i] MOD 7;
+      w OF pts[i] *:= 1.5;
+      IF on OF pts[i] THEN y OF pts[i] +:= step FI
+    OD
+  OD;
+  INT sx := 0, sy := 0; REAL sw := 0.0;
+  FOR i TO n DO sx +:= x OF pts[i]; sy +:= y OF pts[i]; sw +:= w OF pts[i] OD;
+  print((sx, sy, sw, newline));
+  FOR i TO n DO print(tag OF pts[i]) OD;
+  print(newline);
+  [2, 3] CELL grid;
+  FOR i TO 1 UPB grid DO FOR j TO 2 UPB grid DO grid[i, j] := (0, 0.0) OD OD;
+  FOR k TO 20 DO
+    INT i = k MOD 2 + 1, j = k MOD 3 + 1;
+    count OF grid[i, j] +:= 1;
+    total OF grid[i, j] +:= k
+  OD;
+  FOR i TO 2 DO FOR j TO 3 DO print((count OF grid[i, j], total OF grid[i, j])) OD; print(newline) OD;
+  [3] POINT partial;
+  x OF partial[2] := 42;
+  print((x OF partial[2], newline));
+  print((y OF partial[2], newline))
+END

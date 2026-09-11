@@ -1,0 +1,20 @@
+# Exponentiation and the REAL standard functions, which the C back end computes     #
+# natively.  Each value and each unchecked overflow has to be exactly the evaluator's. #
+BEGIN
+  print((2 ** 10, 3 ** 0, 0 ** 0, 0 ** 5, 1 ** 1000, (-1) ** 7, (-1) ** 8, (-2) ** 5, 7 ** 11, newline));
+  INT k := 13;
+  print((k ** 2, 2 ** (k MOD 7), newline));
+  REAL x := 1.5;
+  print((x ** 3, x ** -2, 2.0 ** 0, 0.0 ** 0, 0.0 ** 3, (-1.0) ** 5, (-1.0) ** -4, newline));
+  print((2.0 ** 0.5, 10.0 ** -1.5, 0.0 ** 2.5, x ** 0.0, newline));
+  []REAL vs = (0.25, 0.5, 1.0, 2.0, 10.0);
+  FOR i TO UPB vs DO
+    REAL v = vs[i];
+    print((sqrt(v), exp(-v), ln(v), log(v), newline));
+    print((sin(v), cos(v), tan(v), arctan(v), newline));
+    print((sinh(v), cosh(v), tanh(v), arcsinh(v), newline))
+  OD;
+  print((arcsin(0.5), arccos(-0.25), arcsin(1.0), arccos(1.0), newline));
+  print((exp(1000.0) > 1.0e308, exp(-1000.0), newline));
+  print((sqrt(0.0), ln(1.0), newline))
+END
