@@ -148,6 +148,11 @@ restarts. Details reproduced from a68g:
 * `n k` aligns to column `n` of the current `printf` line.
 * `f(fmt)` enters an embedded format that is left when exhausted.
 * Strings are one value each (not straightened into characters).
+* a68g collects the text of a `printf` in a buffer that it writes out at a new line,
+  a new page and the end of the call. When an item cannot be written (a value that
+  does not fit its pattern), the program stops with that buffer unwritten, so what
+  was produced since the last new line of the call is lost, including items that had
+  succeeded. The same text is dropped here.
 * A `COMPL` is written and read as two `REAL` values, each taking a pattern of its
   own, so `$gl$` puts its parts on two lines.
 * Bits patterns `16r8d`, `n(base)r4z` write and read `BITS` through a mould in any
@@ -265,13 +270,6 @@ reported separately by the test scripts.
   same result; where a68g reports a monitor error the texts of the errors differ.
 * **`open` followed by writing** appends to the file's contents here; a68g writes over
   them from the start without truncating.
-* **Output already written when formatted transput fails.** When a `printf`
-  picture cannot accept the value it is given, a68g discards the characters it
-  had produced for that item and this implementation keeps them. Both fail on
-  the same line with a non-zero status, but the bytes before the failure differ:
-  a68g emits nothing for the item, and `a68lean` emits the part it had already
-  converted. The evaluator and the compiled program agree with each other; it is
-  a68g they differ from. Found by differential fuzzing at seed 9535.
 * **A display coerced to a union** is accepted here and rejected by a68g, which
   is right: a display has no a priori mode, so it cannot be the operand of a
   union coercion. This can only affect programs a68g refuses outright, so it

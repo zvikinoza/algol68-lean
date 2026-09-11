@@ -113,6 +113,17 @@ def emitByte (b : UInt8) : M Unit := do
 def emit (s : String) : M Unit := do
   (← read).out.modify fun o => s.foldl (fun acc c => acc.push c.toNat.toUInt8) o
 
+/-- a68g keeps formatted transput in a buffer that it writes out at a new line, a new page
+    and the end of the call, and a transput error leaves the buffer unwritten.  Drop what
+    has been put out since that point: the start of the call (`start`) or the last new line
+    or new page before the item that failed began (`itemMark`). -/
+def discardUnpurged (start itemMark : Nat) : M Unit := do
+  (← read).out.modify fun o => Id.run do
+    let mut cut := start
+    for i in [start:min itemMark o.size] do
+      if o[i]! == 10 || o[i]! == 12 then cut := i + 1
+    return o.extract 0 cut
+
 def flushOut : M Unit := do
   let r := (← read).out
   let o ← r.get
@@ -3707,6 +3718,7 @@ partial def writeScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (v : Val
 
 partial def printf (fid : Nat) (items : List Value) : M Unit := do
   (← read).col.set 0
+  let start := (← (← read).out.get).size
   let mut st : Option FmtState := none
   for it in items do
     match it with
@@ -3719,7 +3731,15 @@ partial def printf (fid : Nat) (items : List Value) : M Unit := do
       st := some { frames := [{ pics := pics.toArray, cursor := 0, embedded := false }] }
     | .union m v =>
       match st with
-      | some s => st := some (← writeFormatted fid s m v)
+      | some s =>
+        let itemMark := (← (← read).out.get).size
+        try
+          st := some (← writeFormatted fid s m v)
+        catch e =>
+          match e with
+          | .error _ _ => if fid == 0 then discardUnpurged start itemMark
+          | _ => pure ()
+          throw e
       | none => rtErr "no format active in printf"
     | _ => rtErr "internal: printf argument"
   match st with

@@ -1,0 +1,7 @@
+# a68g writes formatted transput at a new line, a new page and the end of printf; #
+# when an item fails, what it had not yet written is lost.                         #
+BEGIN
+  printf(($"x"l"y"3d" "gl$, 5, 7));
+  print("before ");
+  printf(($"a"3d"b"$, 5, $l"c"3d$, 7, 99999))
+END
