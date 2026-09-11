@@ -151,6 +151,9 @@ structure Frame where
   procs  : Array (Option ProcInfo) := #[]
   /-- per slot: the C array a row was promoted to -/
   rows   : Array (Option RowVar) := #[]
+  /-- per slot: its mode, where known; a procedure-valued slot's mode gives the C signature
+      of a plain entry point for whatever routine it holds -/
+  modes  : Array (Option Mode) := #[]
   pushed : Bool := true
   deriving Inhabited
 
@@ -180,6 +183,7 @@ def rowOf (env : List Frame) (d s : Nat) : Option RowVar := do
 def rowName (env : List Frame) (c : Core) : Option RowVar :=
   match c with
   | .at _ e => rowName env e
+  | .loadCell d s => rowOf env d s
   | .deref (.refCell d s) => rowOf env d s
   | .deref (.at _ e) => rowName env (.deref e)
   | _ => none
@@ -207,6 +211,8 @@ structure St where
   frames : List Frame := []   -- innermost first
   nfns   : Array (String × Array String) := #[]   -- plain C entry points: signature, body
   ret    : String := "return;"  -- how the function being emitted returns when a jump leaves it
+  procMode : Option Mode := none   -- the mode of the routine text about to be compiled, if declared
+  nativeOfFn : Array (Nat × Nat) := #[]   -- boxed function index, plain entry point index
   deriving Inhabited
 
 abbrev M := StateM St
@@ -845,6 +851,9 @@ def rowElemIdx (d sl dims : Nat) (c : Core) : Option (List Core) :=
 
 def isRowNameOf (d sl : Nat) (c : Core) : Bool :=
   match strip c with
+  -- the optimiser reads a variable with `loadCell` where it can; for a row variable both
+  -- forms yield the same row value
+  | .loadCell dd ss => dd == d && ss == sl
   | .deref e => match strip e with | .refCell dd ss => dd == d && ss == sl | _ => false
   | _ => false
 
@@ -981,12 +990,38 @@ def staticNat (env : List Frame) (f : Core) : Option ProcInfo := do
     if (varOf env d s).isSome || rtDepthOf env d != 0 then none else some pi
   | _ => none
 
+/-- Does the routine body read or name a frame outside its own?  A body that does not can be
+    run from anywhere, since it needs no environment but its arguments. -/
+partial def outerRef (depth : Nat) (c : Core) : Bool :=
+  match c with
+  | .loadCell d _ | .refCell d _ => d ≥ depth
+  | _ => (childrenD c).any fun (k, ch) => outerRef (depth + k) ch
+
+/-- A call through a procedure-valued slot whose routine cannot be known statically, such as
+    a procedure parameter: the C signature a plain entry point for it would have, when the
+    slot's mode allows one.  Which routine the slot holds is looked up at run time. -/
+def dynNat (env : List Frame) (f : Core) : Option NatSig := do
+  match strip f with
+  | .loadCell d s =>
+    if (varOf env d s).isSome || (staticNat env f).isSome then none else
+    let fr ← env[d]?
+    let m ← (fr.modes[s]?).join
+    match m with
+    | .proc ps r =>
+      let ptys ← ps.mapM CTy.ofMode
+      let rty : Option CTy ← (match r with
+        | .void => some none
+        | _ => (CTy.ofMode r).map some)
+      some { ptys := ptys.toArray, rty := rty }
+    | _ => none
+  | _ => none
+
 /-- Does the native spine of `c` contain such a call? -/
 partial def hasNatCall (env : List Frame) (c : Core) : Bool :=
   match c with
   | .at _ e | .monop _ _ e | .widen _ _ e => hasNatCall env e
   | .dyop _ _ _ l r => hasNatCall env l || hasNatCall env r
-  | .call f _ => (staticNat env f).isSome
+  | .call f _ => (staticNat env f).isSome || (dynNat env f).isSome
   | _ => false
 
 /-- Can `c` be computed as a native value of mode `m`, calls included? -/
@@ -998,7 +1033,12 @@ partial def natOk (env : List Frame) (m : Mode) (c : Core) : Bool :=
     | some pi =>
       CTy.ofMode m == pi.sig.rty && pi.sig.rty.isSome && args.length == pi.sig.ptys.size
         && (List.range args.length).all fun i => natOk env (pi.sig.ptys[i]!).toMode args[i]!
-    | none => false
+    | none =>
+      match dynNat env f with
+      | some sg =>
+        CTy.ofMode m == sg.rty && sg.rty.isSome && args.length == sg.ptys.size
+          && (List.range args.length).all fun i => natOk env (sg.ptys[i]!).toMode args[i]!
+      | none => false
   | .monop op mm e =>
     monopResult op mm == some m && (match CTy.ofMode mm with
       | some t => (monopC op t "x").isSome && natOk env mm e
@@ -1013,7 +1053,10 @@ partial def natOk (env : List Frame) (m : Mode) (c : Core) : Bool :=
 /-- The mode a node yields, counting the calls whose callee is known. -/
 def resultModeE (env : List Frame) (c : Core) : Option Mode :=
   match strip c with
-  | .call f _ => do let pi ← staticNat env f; let t ← pi.sig.rty; some t.toMode
+  | .call f _ =>
+    match staticNat env f with
+    | some pi => do let t ← pi.sig.rty; some t.toMode
+    | none => do let sg ← dynNat env f; let t ← sg.rty; some t.toMode
   | _ => resultMode c
 
 /-- May this operand be left to be evaluated after a call to its right?  Only when doing so
@@ -1096,6 +1139,35 @@ partial def genRowDecl (rv : RowVar) (init : Core) : M Unit := do
     emit s!"{r}_p = ({rv.ty.name}*) a68_row_alloc((size_t)({n}), sizeof({rv.ty.name})); {r}_d = (uint8_t*) a68_row_alloc((size_t)({n}), 1);"
   | _ => pure ()
 
+/-- A call through a procedure-valued slot.  When the routine the slot holds at run time has
+    a plain C entry point that needs no environment, that is called; otherwise the call is
+    boxed.  The slot is read first and the arguments are evaluated after it, once, on
+    whichever path is taken, which is the evaluator's order. -/
+partial def dynCall (sg : NatSig) (f : Core) (args : List Core) (dest : Option String) : M Unit := do
+  match strip f with
+  | .loadCell d s =>
+    let k ← fresh
+    let rtyName := match sg.rty with | some t => t.name | none => "void"
+    let plist := if sg.ptys.isEmpty then "void" else ", ".intercalate (sg.ptys.toList.map CTy.name)
+    let ptrTy := rtyName ++ " (*)(" ++ plist ++ ")"
+    emit s!"void* f{k} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({← rtd d}, {s}, W))];"
+    emit ("if (f" ++ toString k ++ ") {")
+    indent do
+      let as ← natArgs sg.ptys args
+      let callE := "((" ++ ptrTy ++ ") f" ++ toString k ++ ")(" ++ ", ".intercalate as.toList ++ ")"
+      match dest with
+      | some v => emit s!"{v} = {callE};"
+      | none => emit s!"(void) {callE};"
+      jumpCheck
+    emit "} else {"
+    indent do
+      genNode (.call f args)
+      match dest, sg.rty with
+      | some v, some t => emit s!"{v} = {t.popFn}();"
+      | _, _ => emit "a68_v(a68rt_pop(W));"
+    emit "}"
+  | _ => genNode (.call f args)
+
 /-- Put a native expression in a fresh C variable, so that it is evaluated here. -/
 partial def hoistT (t : CTy) (e : String) : M String := do
   let k ← fresh
@@ -1104,12 +1176,12 @@ partial def hoistT (t : CTy) (e : String) : M String := do
 
 /-- The arguments of a direct call, evaluated left to right: an argument is hoisted into a
     C variable whenever a later argument makes a call, unless delaying it is unobservable. -/
-partial def natArgs (pi : ProcInfo) (args : List Core) : M (Array String) := do
+partial def natArgs (ptys : Array CTy) (args : List Core) : M (Array String) := do
   let ev ← env
   let mut as : Array String := #[]
   for i in [0:args.length] do
     let a := args[i]!
-    let pty := pi.sig.ptys[i]!
+    let pty := ptys[i]!
     let x ← anf pty.toMode a
     let later := (args.drop (i + 1)).any (hasNatCall ev)
     let x ← if later && !delayable ev a then hoistT pty x else pure x
@@ -1126,13 +1198,21 @@ partial def anf (m : Mode) (c : Core) : M String := do
   match c with
   | .at _ e => anf m e
   | .call f args =>
-    let pi := (staticNat ev f).get!
-    let as ← natArgs pi args
-    let k ← fresh
-    let rty := pi.sig.rty.get!
-    emit s!"{rty.name} t{k} = a68_nf{pi.nidx}({", ".intercalate as.toList});"
-    jumpCheck
-    return s!"t{k}"
+    match staticNat ev f with
+    | some pi =>
+      let as ← natArgs pi.sig.ptys args
+      let k ← fresh
+      let rty := pi.sig.rty.get!
+      emit s!"{rty.name} t{k} = a68_nf{pi.nidx}({", ".intercalate as.toList});"
+      jumpCheck
+      return s!"t{k}"
+    | none =>
+      let sg := (dynNat ev f).get!
+      let rty := sg.rty.get!
+      let k ← fresh
+      emit s!"{rty.name} t{k};"
+      dynCall sg f args (some s!"t{k}")
+      return s!"t{k}"
   | .monop op mm e =>
     let x ← anf mm e
     return (monopC op (CTy.ofMode mm).get! x).getD "0"
@@ -1292,11 +1372,18 @@ partial def genVoid (c : Core) : M Unit := do
     | some pi =>
       if args.length == pi.sig.ptys.size &&
           (List.range args.length).all (fun i => natOk ev (pi.sig.ptys[i]!).toMode args[i]!) then
-        let as ← natArgs pi args
+        let as ← natArgs pi.sig.ptys args
         emit s!"(void) a68_nf{pi.nidx}({", ".intercalate as.toList});"
         jumpCheck
       else do gen c; emit "a68_v(a68rt_pop(W));"
-    | none => do gen c; emit "a68_v(a68rt_pop(W));"
+    | none =>
+      match dynNat ev f with
+      | some sg =>
+        if args.length == sg.ptys.size &&
+            (List.range args.length).all (fun i => natOk ev (sg.ptys[i]!).toMode args[i]!) then
+          dynCall sg f args none
+        else do gen c; emit "a68_v(a68rt_pop(W));"
+      | none => do gen c; emit "a68_v(a68rt_pop(W));"
   | _ => gen c; emit "a68_v(a68rt_pop(W));"
 
 /-- `x +:= e` in statement position: the variable or cell is updated in place, with
@@ -1669,7 +1756,10 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
     | .label _ | .exit => true | _ => false
   emit "{"
   indent do
-    emit s!"uint32_t e{n} = a68_env_depth(); uint32_t s{n} = a68_stack_depth();"
+    -- the depths are only wanted where a jump lands on one of this block's labels, and
+    -- reading them is two calls into the runtime, so a block without labels skips them
+    if stmts.any (fun st => match st with | .label _ => true | _ => false) then
+      emit s!"uint32_t e{n} = a68_env_depth(); uint32_t s{n} = a68_stack_depth();"
     for i in [0:size] do
       match fr.vars[i]? with
       | some (some (v, ty, u)) =>
@@ -1681,7 +1771,7 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
         emit s!"int64_t {rv.name}_l0 = 1, {rv.name}_u0 = 0, {rv.name}_l1 = 1, {rv.name}_u1 = 0; {rv.ty.name} *{rv.name}_p = NULL; uint8_t *{rv.name}_d = NULL;"
       | _ => pure ()
     if fr.pushed then emit s!"a68_v(a68rt_enter({size}, W));"
-    modify fun st => { st with frames := { fr with procs := Array.replicate size none } :: st.frames }
+    modify fun st => { st with frames := { fr with procs := Array.replicate size none, modes := modes } :: st.frames }
     if onStack then emit "a68_v(a68rt_push_void(W));"
     let mut produced := false
     for i in [0:stmts.size] do
@@ -1707,8 +1797,21 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
           match fr.rows[slot]? with
           | some (some rv) => genRowDecl rv init
           | _ =>
+            -- a routine text: its boxed function learns its parameter modes, and when it has a
+            -- plain entry point that needs no environment, the table of entry points records
+            -- it for calls through procedure parameters
+            let fb := (← get).fns.size
+            match strip init, modes[slot]?.join with
+            | .routine _ _ _, some pm@(.proc _ _) => modify fun st => { st with procMode := some pm }
+            | _, _ => pure ()
             gen init
+            modify fun st => { st with procMode := none }
             emit s!"a68_v(a68rt_store(0, {slot}, W));"
+            match strip init, procsFinal[slot]?.join with
+            | .routine _ _ body, some pi =>
+              if !outerRef 1 body then
+                modify fun st => { st with nativeOfFn := st.nativeOfFn.push (fb, pi.nidx) }
+            | _, _ => pure ()
       | .unit e =>
         if vp[i]! == true then genVoid e
         else if onStack then do gen e; emit "a68_v(a68rt_nip(W));"
@@ -1831,9 +1934,14 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   let savedLabels := s.labels
   let savedDepth := s.depth
   let savedFrames := s.frames
-  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;" }
+  -- a declared routine's parameter modes, so that calls through its procedure parameters
+  -- know the C signature of a plain entry point
+  let pmodes : Array (Option Mode) := match s.procMode with
+    | some (.proc ps _) => (Array.range frameSize).map fun i => ps[i]?
+    | _ => #[]
+  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;", procMode := none }
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
-  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, pushed := true }] }
+  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pushed := true }] }
   gen body
   emit "a68_v(a68rt_leave(W));"
   let st ← get
@@ -2105,6 +2213,7 @@ lean_object* a68rt_append(uint32_t d, uint32_t s, lean_object* w);
 /* A promoted variable read before it was assigned: report exactly what the evaluator
    would have reported for an uninitialised cell of that mode. */
 lean_object* a68rt_index_error(int64_t i, int64_t l, int64_t u, lean_object* w);
+lean_object* a68rt_cell_cproc(uint32_t d, uint32_t s, lean_object* w);
 static int64_t  a68_und_i(void) { a68_v(a68rt_undef_error(0, W)); return 0; }
 static double   a68_und_r(void) { a68_v(a68rt_undef_error(1, W)); return 0.0; }
 static uint8_t  a68_und_b(void) { a68_v(a68rt_undef_error(2, W)); return 0; }
@@ -2220,6 +2329,14 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : 
     if sg != "" then out := out ++ sg ++ ";\n"
   for f in st.fns do
     out := out ++ s!"static void {f.name}(void);\n"
+  -- the plain entry point of each compiled routine, indexed by boxed function index plus one,
+  -- for calls through procedure parameters; NULL where there is none
+  let natTab := (Array.range (st.fns.size + 1)).map fun i =>
+    if i == 0 then "NULL" else
+    match st.nativeOfFn.find? (fun (fi, _) => fi + 1 == i) with
+    | some (_, k) => s!"(void*) a68_nf{k}"
+    | none => "NULL"
+  out := out ++ "static void* const a68_nf_of_fn[] = { " ++ ", ".intercalate natTab.toList ++ " };\n"
   for h in st.holes do
     out := out ++ s!"static void {h.name}(void);\n"
   out := out ++ "\n"

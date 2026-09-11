@@ -752,6 +752,16 @@ def undefError (kind : UInt32) : IO Unit := do
        | 3 => "attempt to use an uninitialised CHAR value"
        | _ => "attempt to use an uninitialised BITS value")
 
+/-- The compiled routine a procedure-valued cell holds, as its function index plus one, or 0
+    when it holds anything else.  Compiled code uses it to call a routine through a
+    procedure parameter by its plain C entry point, when that routine has one. -/
+@[export a68rt_cell_cproc]
+def cellCproc (depth slot : UInt32) : IO UInt32 :=
+  val (do
+    match (← run (Interp.readCell (← cellOf depth slot)) .undef) with
+    | .cproc fn _ _ => return UInt32.ofNat (fn + 1)
+    | _ => return 0) 0
+
 /-- A subscript out of bounds in a row compiled to a C array, reported in the evaluator's
     words. -/
 @[export a68rt_index_error]
