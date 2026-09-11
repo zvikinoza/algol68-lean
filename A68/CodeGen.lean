@@ -2911,6 +2911,7 @@ lean_object* a68rt_dup(lean_object* w);
 lean_object* a68rt_pop_int(lean_object* w);
 lean_object* a68rt_pop_bool(lean_object* w);
 lean_object* a68rt_take_top(lean_object* w);
+lean_object* a68rt_undef_result(lean_object* w);
 lean_object* a68rt_deref(lean_object* w);
 lean_object* a68rt_deproc(lean_object* w);
 lean_object* a68rt_widen(uint32_t a, uint32_t b, lean_object* w);
@@ -3311,7 +3312,7 @@ static inline uint32_t a68_repr(int64_t x) {
 
 /-- Emit the whole program. -/
 def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
-    (echoes : List String := []) : String := Id.run do
+    (echoes : List String := []) (srcName : String := "prog.a68") : String := Id.run do
   let (_, st) := (do
       let idx ← genFunction 0 0 core
       pure idx : M Nat).run { modeTab := modes }
@@ -3356,13 +3357,13 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   for i in [0:st.fns.size] do
     out := out ++ s!"    case {i}: a68_fn{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68_jump() ? a68rt_undef_result(lean_io_mk_world()) : a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   out := out ++ "lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_object* w) {\n"
   out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n  switch (idx) {\n"
   for i in [0:st.holes.size] do
     out := out ++ s!"    case {i}: a68_hole{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68_jump() ? a68rt_undef_result(lean_io_mk_world()) : a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   -- main
   out := out ++ "int main(int argc, char** argv) {\n"
   -- `PR echo` texts are printed when the program is read, before anything it prints
@@ -3374,7 +3375,11 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   out := out ++ "  if (lean_io_result_is_error(ir)) { a68_fail(ir); }\n  lean_dec_ref(ir);\n"
   out := out ++ "  lean_io_mark_end_initialization();\n  lean_init_task_manager();\n"
   out := out ++ "  lean_object* args = lean_mk_empty_array();\n"
-  out := out ++ "  for (int i = 0; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));\n"
+  -- the program sees the arguments a68g would give it: `a68g`, the source file, and then
+  -- the arguments the binary was run with, as `a68lean run` does
+  out := out ++ "  args = lean_array_push(args, lean_mk_string(\"a68g\"));\n"
+  out := out ++ "  args = lean_array_push(args, lean_mk_string(" ++ cstring srcName ++ "));\n"
+  out := out ++ "  for (int i = 1; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));\n"
   out := out ++ s!"  a68_set_state(a68_take(a68rt_boot(lean_mk_string(A68_BLOB), {ll}, {if regression then 1 else 0}, args, W)));\n"
   out := out ++ "  a68_fn0();\n"
   out := out ++ "  uint32_t rc = a68_u32(a68rt_finish(W));\n  return (int) rc;\n}\n"

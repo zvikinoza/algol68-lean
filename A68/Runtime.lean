@@ -346,6 +346,11 @@ def takeTop : IO Value := do
   | some v => (← state).stack.set st.pop; pure v
   | none => throw (IO.userError "operand stack underflow")
 
+/-- The result of a compiled procedure that left by a jump: it pushed none, and the value is
+    never used, since the caller goes to the label. -/
+@[export a68rt_undef_result]
+def undefResult : IO Value := pure .undef
+
 @[export a68rt_push_array]
 def pushArray (a : Array Value) : IO Unit := go do
   for v in a do push v
