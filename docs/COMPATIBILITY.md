@@ -33,6 +33,19 @@ re-implemented in Lean.
   of the standard operators (`LONG 1 + 1`, `1.5 + LONG 1`). User-defined
   operators receive only firm coercions (no widening), exactly as in a68g.
 * `SHORT` modes are identical to the base modes.
+* `COMPL` multiplication, division and `**` use a68g's own expressions, and its
+  complex functions (`complex sqrt`, `complex arctanh`, …) call the C library as
+  a68g does. The C compiler a68g was built with fuses a multiplication and an
+  addition inside one expression into a single operation, which changes the last
+  bits of a result (the imaginary part of a root of `3x² + 4x + 5` put back into
+  the polynomial is `2.5e-17` in a68g, not 0). Those expressions therefore live in
+  `csrc/sys.c`, compiled the same way, rather than in Lean, whose floating-point
+  operations are never fused.
+* `LONG BITS` and `LONG LONG BITS` are multi-precision numbers in this build, 162 and
+  279 bits wide (`MP_BITS_WIDTH`). `LENG` of a `BITS` goes through `int_to_mp`, which
+  reads the bits as an `INT`: a value with its top bit set becomes that `INT` plus 2³²,
+  kept to as many radix-10⁷ digits as the `INT`'s magnitude has, so `LENG NOT BIN 0`
+  is 4967295.
 
 ## LONG and LONG LONG arithmetic
 
@@ -209,7 +222,12 @@ reported separately by the test scripts.
 
 * Uninitialised `INT`, `REAL`, `BOOL`, `CHAR` values raise a runtime error
   when used; uninitialised `STRING`s are empty; copying a struct with
-  uninitialised fields is allowed.
+  uninitialised fields is allowed.  A union never given a value, or given `SKIP`,
+  can be copied and passed, and a conformity clause takes none of its alternatives.
+* `dpi`, `qsqrt` and the other short names a68g gives the `LONG` and `LONG LONG`
+  routines and constants are known.
+* An exponent is read with blanks after `e` and after its sign, as a68g writes it
+  (`+2.9e -51`).
 * `p IS NIL` never dereferences the variable `p` (a name is never `NIL`).
 * Row assignment to a non-`FLEX` name requires identical bounds.
 * `~` is `NOT` before an operand and `SKIP` otherwise; `~=` is `/=`;
@@ -258,8 +276,11 @@ reported separately by the test scripts.
   is right: a display has no a priori mode, so it cannot be the operand of a
   union coercion. This can only affect programs a68g refuses outright, so it
   cannot change the output of a program a68g accepts.
-* **`COMPL` division** has no reference behaviour to match: a68g 3.13.3 stops
-  with a memory access violation on `z / w` and `z /:= w` for complex `z` and
-  `w`, whatever their values. a68lean divides, and reports a zero divisor.
+* **Running out of memory.** a68g's heap has a fixed size, and a program that
+  outgrows it stops with *not enough memory* after printing what it had printed.
+  Here memory grows until the system refuses it, so such a program keeps running
+  (a random program that triples a string 36 times is the case the fuzzer found).
+  Where a68g stops depends on its garbage collector's accounting, which is not
+  reproduced.
 * **Runtime error messages** are not byte-identical; only standard output
   and the non-zero exit status are.
