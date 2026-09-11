@@ -686,6 +686,31 @@ def mpMathFn (fn : String) (arg : Value) : M (Option Value) := do
   if !r.isFinite then rtErr s!"{mn} value is not finite"
   return some (.mp r)
 
+/-- `long complex sqrt` and the other `LONG` / `LONG LONG COMPLEX` functions
+    (`C_CL_FUNCTION`: a non-finite part is a math error). -/
+def mpComplFn (fn : String) (arg : Value) : M (Option Value) := do
+  let some (n, base0) := splitLong fn | return none
+  let base := if base0.startsWith "complex" then String.ofList (base0.toList.drop 7) else ""
+  if base.isEmpty then return none
+  let f? : Option (MP.MP → MP.MP → Nat → MP.MM (MP.MP × MP.MP)) := match base with
+    | "sqrt" => some fun r i d => MP.lift (MP.csqrtMp r i d)
+    | "exp" => some MP.cexpMp
+    | "ln" => some MP.clnMp
+    | "sin" => some (MP.csinCosMp false)
+    | "cos" => some (MP.csinCosMp true)
+    | "tan" => some MP.ctanMp
+    | "arcsin" => some (MP.casinAcosMp false)
+    | "arccos" => some (MP.casinAcosMp true)
+    | "arctan" => some MP.catanMp
+    | "sinh" | "cosh" | "tanh" | "arcsinh" | "arccosh" | "arctanh" => some (MP.chypMp base)
+    | "atanh" => some (MP.chypMp "arctanh")
+    | _ => none
+  let some f := f? | return none
+  let (re, im) ← expectLongCompl arg
+  let (r, i) ← runMM (f re im (← mpDigitsOf n))
+  if !r.isFinite || !i.isFinite then rtErr s!"math error in {Mode.toString (.compl n)}"
+  return some (.struct #[.mp r, .mp i])
+
 /-- The `LONG` / `LONG LONG` constants and generators of the prelude. -/
 def mpConst (fn : String) : M (Option Value) := do
   let some (n, base) := splitLong fn | return none
@@ -2522,6 +2547,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
       | _ => rtErr s!"unsupported standard procedure {fn}/0"
   | fn, [x] =>
     if let some v ← mpMathFn fn x then return v
+    if let some v ← mpComplFn fn x then return v
     if ["sqrt","exp","ln","log","log10","log2","exp2","sin","cos","tan","arcsin","arccos","arctan",
         "asin","acos","atan","sinh","cosh","tanh","arcsinh","arccosh","arctanh","cbrt","curt",
         "longsqrt","longexp","longln","longlog","longsin","longcos","longtan","longarcsin","longarccos",

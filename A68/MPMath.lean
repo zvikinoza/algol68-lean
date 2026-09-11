@@ -739,6 +739,209 @@ def cdivMp (a b c d : MP) (digs : Nat) : MPE (MP × MP) := do
     let d1 ← divMp d1 d1 r digs
     return (moveMp a c1 digs, moveMp b d1 digs)
 
+-- ## LONG COMPLEX functions (`mp-complex.c`)
+
+/-- `SET_MP_MINUS_ONE`. -/
+def setMinusOne (z : MP) (digs : Nat) : MP := setMp z (-1) 0 digs
+
+/-- `csqrt_mp (r, i, digs)`. -/
+def csqrtMp (r i : MP) (digs : Nat) : MPE (MP × MP) := do
+  let gdigs := digs + guards
+  let mut re := lenMp r digs gdigs
+  let mut im := lenMp i digs gdigs
+  if re.isZero && im.isZero then
+    re := setZero re gdigs
+    im := setZero im gdigs
+  else
+    let c1 := lit gdigs 1 0
+    let x := moveMp (nil gdigs) re gdigs
+    let x := x.setDig 1 (x.dig 1).natAbs
+    let y := moveMp (nil gdigs) im gdigs
+    let y := y.setDig 1 (y.dig 1).natAbs
+    let mut w ← subMp (nil gdigs) x y gdigs
+    let mut u := nil gdigs
+    let mut v := nil gdigs
+    if w.dig 1 ≥ 0 then
+      let t ← divMp (nil gdigs) y x gdigs
+      v ← mulMp v t t gdigs
+      u ← addMp u c1 v gdigs
+      v ← sqrtMp v u gdigs
+      u ← addMp u c1 v gdigs
+      v ← halfMp v u gdigs
+      u ← sqrtMp u v gdigs
+      v ← sqrtMp v x gdigs
+      w ← mulMp w u v gdigs
+    else
+      let t ← divMp (nil gdigs) x y gdigs
+      v ← mulMp v t t gdigs
+      u ← addMp u c1 v gdigs
+      v ← sqrtMp v u gdigs
+      u ← addMp u t v gdigs
+      v ← halfMp v u gdigs
+      u ← sqrtMp u v gdigs
+      v ← sqrtMp v y gdigs
+      w ← mulMp w u v gdigs
+    if re.dig 1 ≥ 0 then
+      re := moveMp re w gdigs
+      u ← addMp u w w gdigs
+      im ← divMp im im u gdigs
+    else
+      if im.dig 1 < 0 then w := w.negate1
+      v ← addMp v w w gdigs
+      re ← divMp re im v gdigs
+      im := moveMp im w gdigs
+  return (← shortenMp r digs re gdigs, ← shortenMp i digs im gdigs)
+
+/-- `cexp_mp (r, i, digs)`. -/
+def cexpMp (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let gdigs := digs + guards
+  let mut re := lenMp r digs gdigs
+  let mut im := lenMp i digs gdigs
+  if im.isZero then
+    re ← lift (expMp re re gdigs)
+  else
+    let u ← lift (expMp (nil gdigs) re gdigs)
+    re ← cosMp re im gdigs
+    im ← sinMp im im gdigs
+    re ← lift (mulMp re re u gdigs)
+    im ← lift (mulMp im im u gdigs)
+  return (← lift (shortenMp r digs re gdigs), ← lift (shortenMp i digs im gdigs))
+
+/-- `cln_mp (r, i, digs)`. -/
+def clnMp (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let gdigs := digs + guards
+  let re := lenMp r digs gdigs
+  let im := lenMp i digs gdigs
+  let s ← lift (hypotMp (nil gdigs) (moveMp (nil gdigs) re gdigs) (moveMp (nil gdigs) im gdigs) gdigs)
+  let t ← atan2Mp (nil gdigs) (moveMp (nil gdigs) re gdigs) (moveMp (nil gdigs) im gdigs) gdigs
+  let re ← lnMp re s gdigs
+  let im := moveMp im t gdigs
+  return (← lift (shortenMp r digs re gdigs), ← lift (shortenMp i digs im gdigs))
+
+/-- `csin_mp`, and `ccos_mp` with `cosine := true`. -/
+def csinCosMp (cosine : Bool) (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let gdigs := digs + guards
+  let mut re := lenMp r digs gdigs
+  let mut im := lenMp i digs gdigs
+  if im.isZero then
+    re ← if cosine then cosMp re re gdigs else sinMp re re gdigs
+    im := setZero im gdigs
+  else
+    let s ← sinMp (nil gdigs) re gdigs
+    let c ← cosMp (nil gdigs) re gdigs
+    let (sh, ch) ← lift (hypMp (nil gdigs) (nil gdigs) im gdigs)
+    if cosine then
+      re ← lift (mulMp re c ch gdigs)
+      im ← lift (mulMp im s sh.negate1 gdigs)
+    else
+      re ← lift (mulMp re s ch gdigs)
+      im ← lift (mulMp im c sh gdigs)
+  return (← lift (shortenMp r digs re gdigs), ← lift (shortenMp i digs im gdigs))
+
+/-- `ctan_mp (r, i, digs)`: `csin / ccos` at the same precision. -/
+def ctanMp (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let (su, sv) ← csinCosMp false (moveMp (nil digs) r digs) (moveMp (nil digs) i digs) digs
+  let (cu, cv) ← csinCosMp true (moveMp (nil digs) r digs) (moveMp (nil digs) i digs) digs
+  let (s, t) ← lift (cdivMp (moveMp (nil digs) su digs) (moveMp (nil digs) sv digs) cu cv digs)
+  return (moveMp r s digs, moveMp i t digs)
+
+/-- `casin_mp`, and `cacos_mp` with `arccos := true`. -/
+def casinAcosMp (arccos : Bool) (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let gdigs := digs + guards
+  let re := lenMp r digs gdigs
+  let im := lenMp i digs gdigs
+  let negim := im.dig 1 < 0
+  let c1 := lit gdigs 1 0
+  let a ← lift (addMp (nil gdigs) re c1 gdigs)
+  let b ← lift (subMp (nil gdigs) re c1 gdigs)
+  let u ← lift (hypotMp (nil gdigs) a im gdigs)
+  let v ← lift (hypotMp (nil gdigs) b im gdigs)
+  let a ← lift (addMp a u v gdigs)
+  let a ← lift (halfMp a a gdigs)
+  let b ← lift (subMp b u v gdigs)
+  let b ← lift (halfMp b b gdigs)
+  let u ← lift (mulMp u a a gdigs)
+  let u ← lift (subMp u u c1 gdigs)
+  let u ← lift (sqrtMp u u gdigs)
+  let u ← lift (addMp u a u gdigs)
+  let im ← lnMp im u gdigs
+  let re ← if arccos then acosMp re b gdigs else asinMp re b gdigs
+  let flipIm := if arccos then !negim else negim
+  let im := if flipIm then im.negate1 else im
+  return (← lift (shortenMp r digs re gdigs), ← lift (shortenMp i digs im gdigs))
+
+/-- `catan_mp (r, i, digs)`. -/
+def catanMp (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let gdigs := digs + guards
+  let re := lenMp r digs gdigs
+  let im := lenMp i digs gdigs
+  let mut u := nil gdigs
+  let mut v := nil gdigs
+  if im.isZero then
+    u ← atanMp u re gdigs
+    v := setZero v gdigs
+  else
+    let c1 := lit gdigs 1 0
+    let mut a ← lift (addMp (nil gdigs) im c1 gdigs)
+    let mut b ← lift (subMp (nil gdigs) im c1 gdigs)
+    u ← lift (hypotMp u re a gdigs)
+    v ← lift (hypotMp v re b gdigs)
+    u ← lift (divMp u u v gdigs)
+    v ← lnMp v u gdigs
+    v ← lift (halfMp v v gdigs)
+    a ← lift (mulMp a re re gdigs)
+    b ← lift (mulMp b im im gdigs)
+    a ← lift (addMp a a b gdigs)
+    u ← lift (subMp u c1 a gdigs)
+    if u.isZero then
+      u ← piMp u .halfPi gdigs
+    else
+      let neg := u.dig 1 < 0
+      a ← lift (addMp a re re gdigs)
+      a ← lift (divMp a a u gdigs)
+      u ← atanMp u a gdigs
+      if neg then
+        a ← piMp a .pi gdigs
+        u ← if re.dig 1 < 0 then lift (subMp u u a gdigs) else lift (addMp u u a gdigs)
+      u ← lift (halfMp u u gdigs)
+  return (← lift (shortenMp r digs u gdigs), ← lift (shortenMp i digs v gdigs))
+
+/-- `csinh_mp`, `ccosh_mp`, `ctanh_mp`, `casinh_mp`, `cacosh_mp`, `catanh_mp`: the
+    circular functions of `± i z`, multiplied back, as `mp-complex.c` composes them
+    (`ctanh_mp` overwrites its intermediate result before the last multiplication, so it
+    always yields 1). -/
+def chypMp (name : String) (r i : MP) (digs : Nat) : MM (MP × MP) := do
+  let gdigs := digs + guards
+  let re := lenMp r digs gdigs
+  let im := lenMp i digs gdigs
+  let zero := nil gdigs
+  let one := setOne (nil gdigs) gdigs
+  let minusOne := setMinusOne (nil gdigs) gdigs
+  let (re, im) ← match name with
+    | "sinh" => do
+      let (a, b) ← lift (cmulMp re im zero one gdigs)
+      let (a, b) ← csinCosMp false a b gdigs
+      lift (cmulMp a b zero minusOne gdigs)
+    | "cosh" => do
+      let (a, b) ← lift (cmulMp re im zero one gdigs)
+      csinCosMp true a b gdigs
+    | "tanh" => do
+      let (a, b) ← lift (cmulMp re im zero one gdigs)
+      let (a, b) ← ctanMp a b gdigs
+      lift (cmulMp (setZero a gdigs) (setMinusOne b gdigs) zero one gdigs)
+    | "arcsinh" => do
+      let (a, b) ← lift (cmulMp re im zero minusOne gdigs)
+      let (a, b) ← casinAcosMp false a b gdigs
+      lift (cmulMp a b zero one gdigs)
+    | "arccosh" => do
+      let (a, b) ← casinAcosMp true re im gdigs
+      lift (cmulMp a b zero one gdigs)
+    | _ => do  -- arctanh
+      let (a, b) ← lift (cmulMp re im zero minusOne gdigs)
+      let (a, b) ← catanMp a b gdigs
+      lift (cmulMp a b zero one gdigs)
+  return (← lift (shortenMp r digs re gdigs), ← lift (shortenMp i digs im gdigs))
+
 -- ## The degree and π-scaled variants
 
 def recOf (f : MP → MP → Nat → MM MP) (z x : MP) (digs : Nat) : MM MP := do

@@ -56,13 +56,20 @@ def longRealFnNames : List String :=
    "sindg", "cosdg", "tandg", "cotdg", "cscdg", "secdg",
    "arcsindg", "arccosdg", "arctandg", "arccotdg", "arccscdg", "arcsecdg", "cas"]
 
+/-- The `LONG` / `LONG LONG COMPLEX` functions of the prelude (`long complex sqrt`, …). -/
+def longComplFnNames : List String :=
+  ["sqrt", "exp", "ln", "sin", "cos", "tan", "arcsin", "arccos", "arctan",
+   "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "atanh"]
+
 /-- `long sqrt`, `long long sqrt`, …, the two-argument `arctan2`s and the generators. -/
 def longProcs : List (String × Mode) :=
   (longRealFnNames.map fun b => ("long" ++ b, realFn 1)) ++
   (longRealFnNames.map fun b => ("longlong" ++ b, realFn 2)) ++
   [("longarctan2", proc [LREAL, LREAL] LREAL), ("longlongarctan2", proc [real 2, real 2] (real 2)),
    ("longarctan2dg", proc [LREAL, LREAL] LREAL), ("longlongarctan2dg", proc [real 2, real 2] (real 2)),
-   ("longnextrandom", proc [] LREAL), ("longlongnextrandom", proc [] (real 2))]
+   ("longnextrandom", proc [] LREAL), ("longlongnextrandom", proc [] (real 2))] ++
+  (longComplFnNames.map fun b => ("longcomplex" ++ b, proc [compl 1] (compl 1))) ++
+  (longComplFnNames.map fun b => ("longlongcomplex" ++ b, proc [compl 2] (compl 2)))
 
 /-- Procedures (name, mode). -/
 def procs : List (String × Mode) := longProcs ++
