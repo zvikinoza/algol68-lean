@@ -727,6 +727,12 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | none => do
       let ch ← fieldChain env (.select f e true)
       some s!"{ty.selFn}({ch.args})"
+  | .cond c t e => do
+    -- C evaluates only the branch it takes, as the evaluator does
+    let cc ← scalarExpr env .bool c
+    let a ← scalarExpr env m t
+    let b ← scalarExpr env m e
+    some s!"({cc} ? {a} : {b})"
   | .call (.lit (.builtin n)) [arg] =>
     if ty == .f64 && nativeMathFns.contains n then do
       let x ← scalarExpr env (.real 0) arg
@@ -787,6 +793,10 @@ def resultMode : Core → Option Mode
     | _ => none
   | .monop op m _ => if op == "LWB" || op == "UPB" then some (.int 0) else monopResult op m
   | .widen _ d _ => some d
+  | .cond _ t e =>
+    match resultMode t with
+    | some m => some m
+    | none => resultMode e
   | _ => none
 
 /-- A native expression for a node whose mode is not supplied by the caller. -/
