@@ -1872,14 +1872,15 @@ static inline double a68_chk_r(double x) {
   if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) return a68_die_r(2);
   return x;
 }
+/* REAL division checks the divisor, not the quotient, as a68g does: an infinite or NaN
+   result is reported only by a later operation that checks.  `/:=` behaves the same. */
 static inline double a68_div_r(double a, double b) {
   if (b == 0.0) return a68_die_r(3);
-  return a68_chk_r(a / b);
+  return a / b;
 }
-/* `/:=` reports a different message from `/` when the divisor is zero. */
 static inline double a68_diveq_r(double a, double b) {
-  if (b == 0.0) return a68_die_r(5);
-  return a68_chk_r(a / b);
+  if (b == 0.0) return a68_die_r(3);
+  return a / b;
 }
 static inline int64_t a68_entier(double x) {
   if (x < -2147483647.0 || x > 2147483647.0) return a68_die_i(4);

@@ -1020,9 +1020,10 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
           | "+:=" => pure (x + y)
           | "-:=" => pure (x - y)
           | "*:=" => pure (x * y)
-          | "/:=" => if y == 0.0 then rtErr "REAL division by zero" else pure (x / y)
+          | "/:=" => if y == 0.0 then rtErr "REAL value is not a number" else pure (x / y)
           | _ => rtErr s!"internal: assigning operator {op} on REAL"
-        Value.real <$> checkReal r
+        -- as for `/`, the quotient of `/:=` is not checked
+        if op == "/:=" then pure (Value.real r) else Value.real <$> checkReal r
       | .compl _ => do
         match cur, b with
         | .struct #[.real ar, .real ai], .struct #[.real br, .real bi] =>
@@ -1089,7 +1090,9 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     | "+" => Value.real <$> checkReal (x + y)
     | "-" => Value.real <$> checkReal (x - y)
     | "*" => Value.real <$> checkReal (x * y)
-    | "/" => if y == 0.0 then rtErr "REAL value is not a number" else Value.real <$> checkReal (x / y)
+    -- a68g checks the divisor but not the quotient: an infinite or NaN result is only
+    -- reported by a later operation that checks, as `*` and printing do
+    | "/" => if y == 0.0 then rtErr "REAL value is not a number" else return .real (x / y)
     | "I" => return mkCompl x y
     | "**" =>
       if y == 0.0 then return .real 1.0

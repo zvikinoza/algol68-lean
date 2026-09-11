@@ -1,0 +1,22 @@
+# REAL division as a68g does it: the divisor is checked, the quotient is not.  An     #
+# infinite or NaN quotient is only reported by a later operation that checks, such as #
+# `*` or printing; and a zero divisor is "REAL value is not a number" for `/` and      #
+# `/:=` alike.  The last line divides by zero, so the program ends with an error.      #
+BEGIN
+  REAL big = 1.0e308, tiny = 1.0e-10;
+  REAL inf = big / tiny;
+  print((inf > 0.0, -big / tiny < 0.0, newline));
+  print((arctan(inf), newline));
+  REAL nan = inf / inf;
+  print((nan > 0.0, nan < 0.0, nan = nan, newline));
+  REAL x := big;
+  x /:= tiny;
+  print((x > big, newline));
+  REAL y := 3.0;
+  y /:= 2.0;
+  print((y, 7.0 / 2.0, newline));
+  print((arctan(exp(769.9) / 1000.0), newline));
+  REAL z := 1.0;
+  z /:= 0.0;
+  print(("not reached", newline))
+END
