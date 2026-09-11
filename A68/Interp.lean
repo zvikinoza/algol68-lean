@@ -4,6 +4,7 @@ import A68.Numfmt
 import A68.Parser
 import A68.MPMath
 import A68.MPFmt
+import A68.Blob
 
 /-!
 # A68.Interp — evaluator for the elaborated `Core` representation
@@ -71,10 +72,22 @@ structure Rt where
   ll    : Nat := Numfmt.defaultLLDigits
   regression : Bool := false
   col   : IO.Ref Nat                        -- characters on the current formatted-output line
+  /-- the mode table of a compiled program (`A68.Serial`), by index, which the services
+      extend when a value crosses with a mode the program did not serialise -/
+  mtab  : IO.Ref (Array Mode)
+  /-- the format texts of a compiled program, by index -/
+  fmts  : IO.Ref (Array (List CoreFmt))
 
 abbrev M := ReaderT Rt (ExceptT Ctrl IO)
 
 abbrev Env := List (Array Nat)
+
+/-- The environment a format text or an `evaluate` call sees: the evaluator's frames, or
+    the frame of a compiled program, which lives in C. -/
+inductive FEnv where
+  | lean (env : Env)
+  | c (frame : UInt64)
+  deriving Inhabited
 
 instance : Inhabited (M α) := ⟨fun _ => throw default⟩
 
@@ -289,8 +302,69 @@ partial def updatePath (v : Value) (path : List Sel) (nv : Value) : M Value := d
       | _ => rtErr "internal: path continues after sub-row"
     | _ => rtErr "internal: sub-row update of non-row"
 
+-- ## The C memory of a compiled program (`csrc/rt.c`)
+--
+-- Names, closures and formats of a compiled program are C objects; the Lean services reach
+-- them through these entry points, with values crossing in the `A68.Blob` encoding.  The
+-- `a68lean` binary links stubs for them (`csrc/stubs.c`), since the evaluator never makes
+-- such a value.
+
+@[extern "a68c_load"] opaque cLoad (a : UInt64) (o : UInt32) : IO ByteArray
+@[extern "a68c_store"] opaque cStore (a : UInt64) (o : UInt32) (b : @& ByteArray) : IO Unit
+@[extern "a68c_assign"] opaque cAssign (a : UInt64) (o : UInt32) (b : @& ByteArray) (flex : UInt8) : IO Unit
+@[extern "a68c_field"] opaque cField (a : UInt64) (o : UInt32) (i : UInt32) : IO ByteArray
+@[extern "a68c_elem"] opaque cElem (a : UInt64) (o : UInt32) (i : UInt32) : IO ByteArray
+@[extern "a68c_call"] opaque cCall (fn np : UInt32) (frame : UInt64) (args : @& ByteArray) (nargs : UInt32) : IO ByteArray
+@[extern "a68c_hole"] opaque cHole (fn idx : UInt32) (frame : UInt64) : IO ByteArray
+
+/-- The united modes inside a value, which have to be in the mode table before the value
+    is encoded. -/
+partial def unionModes : Value → List Mode
+  | .union m v => m :: unionModes v
+  | .row _ _ es => es.toList.flatMap unionModes
+  | .struct fs => fs.toList.flatMap unionModes
+  | _ => []
+
+def idxOfMode (m : Mode) : M Nat := do
+  let t ← (← read).mtab.get
+  match t.findIdx? (· == m) with
+  | some i => return i
+  | none => (← read).mtab.set (t.push m); return t.size
+
+def encodeValue (v : Value) : M ByteArray := do
+  for m in unionModes v do let _ ← idxOfMode m
+  let t ← (← read).mtab.get
+  return Blob.encode (fun m => (t.findIdx? (· == m)).getD 0) ByteArray.empty v
+
+def decodeValue (b : ByteArray) : M Value := do
+  let t ← (← read).mtab.get
+  match Blob.decodeAll (fun i => t[i]?.getD .void) b with
+  | .ok (v, _) => return v
+  | .error e => rtErr e
+
+def decodeValues (b : ByteArray) (n : Nat) : M (List Value) := do
+  let t ← (← read).mtab.get
+  match Blob.decodeMany (fun i => t[i]?.getD .void) b n with
+  | .ok vs => return vs
+  | .error e => rtErr e
+
+/-- A name the C side describes as eight bytes of address and four of offset. -/
+def crefOf (b : ByteArray) : M Value := do
+  if b.size < 12 then rtErr "internal: bad C name"
+  let a := (List.range 8).foldl (fun acc k => acc ||| ((b.get! k).toUInt64 <<< (UInt64.ofNat (8 * k)))) (0 : UInt64)
+  let o := (List.range 4).foldl (fun acc k => acc ||| ((b.get! (8 + k)).toUInt32 <<< (UInt32.ofNat (8 * k)))) (0 : UInt32)
+  return .cref a o
+
+/-- The name of field `i` of the structure a name refers to. -/
+def refField (r : Value) (i : Nat) : M Value := do
+  match r with
+  | .ref c path => return .ref c (path ++ [.field i])
+  | .cref a o => crefOf (← cElem a o 0 |> fun _ => cField a o (UInt32.ofNat i))
+  | _ => rtErr "internal: field of a non-REF"
+
 def readRef : Value → M Value
   | .ref c path => do readPath (← readCell c) path
+  | .cref a o => do decodeValue (← cLoad a o)
   -- `stand in` and the other standard files are names of files, represented by the file
   | .file id => return .file id
   | .nil => rtErr "attempt to dereference NIL"
@@ -304,6 +378,7 @@ def takeCell (c : Nat) : M Value := do
 
 def writeRef (r : Value) (nv : Value) : M Unit := do
   match r with
+  | .cref a o => cStore a o (← encodeValue nv)
   | .ref c [] => writeCell c nv
   | .ref c path =>
     let old ← takeCell c
@@ -350,6 +425,7 @@ def appendOne (c : Nat) (v : Value) : M Bool := do
 /-- Extend a ref path by an element selection, composing through a sub-row view. -/
 def refElem (r : Value) (i : Nat) : M Value := do
   match r with
+  | .cref a o => crefOf (← cElem a o (UInt32.ofNat i))
   | .ref c path =>
     match path.getLast? with
     | some (.sub _ _ offs) => return .ref c (path.dropLast ++ [.elem offs[i]!])
@@ -973,7 +1049,7 @@ where
 def fileIdOf (f : Value) : M Nat := do
   match f with
   | .file id => return id
-  | .ref _ _ =>
+  | .ref _ _ | .cref _ _ =>
     match (← readRef f) with
     | .file id => return id
     | _ => rtErr "internal: file expected"
@@ -994,7 +1070,7 @@ inductive Pic where
   | general (args : List Int)
   | bool_ (flip flop : Option String)
   | choice (alts : List String)
-  | include (items : List CoreFmt) (env : Env)
+  | include (items : List CoreFmt) (env : FEnv)
   | col (n : Nat)
   | cpat (flags : String) (width after : Option Int)   -- a68g C-style pattern, `%-8.2f`
   | hgen (args : List Int)                            -- a68g `h` pattern
@@ -1227,8 +1303,8 @@ opaque setJumpFlag (v : UInt32) : BaseIO UInt32
     what lets an event routine such as an `on logical file end` handler leave with a
     `GO TO`: the jump unwinds through the transput that called it, exactly as it does
     when the routine is evaluated rather than compiled. -/
-def fromCompiled (act : IO Value) : ReaderT Rt (ExceptT Ctrl IO) Value := do
-  let v ← (act : IO Value)
+def fromCompiled (act : IO α) : ReaderT Rt (ExceptT Ctrl IO) α := do
+  let v ← (act : IO α)
   let j ← ((getJumpFlag () : BaseIO UInt32) : IO UInt32)
   if j != 0 then
     let _ ← ((setJumpFlag 0 : BaseIO UInt32) : IO UInt32)
@@ -1542,6 +1618,7 @@ partial def sliceValue (base : Value) (idx : List IdxVal) (viaRef : Bool) : M Va
 
 partial def assignTo (d : Value) (v : Value) (flex : Bool) : M Unit := do
   match d with
+  | .cref a o => cAssign a o (← encodeValue v) (if flex then 1 else 0)
   | .ref _ path =>
     match v with
     | .row vl vu _ =>
@@ -1658,6 +1735,11 @@ partial def callValue (f : Value) (args : List Value) : M Value := do
       frame := frame.push (← alloc v)
     eval (frame :: cenv) body
   | .cproc fn _ cenv => fromCompiled (dispatchProc (USize.ofNat fn) cenv args.toArray)
+  | .cclos fn np fr =>
+    let mut ab := ByteArray.empty
+    for a in args do ab := ab ++ (← encodeValue a)
+    let rb ← fromCompiled (cCall (UInt32.ofNat fn) (UInt32.ofNat np) fr ab (UInt32.ofNat args.length))
+    decodeValue rb
   | .builtin name => callBuiltin name args
   | .nil => rtErr "attempt to call NIL"
   | .undef => rtErr "attempt to call an uninitialised procedure"
@@ -2303,9 +2385,7 @@ partial def readInto (fid : Nat) (m : Mode) (r : Value) : M Unit := do
       | none => rtErr s!"cannot read INT from \"{tok}\""
     | .struct fs =>
       for (i, (_, fm)) in (List.range fs.length).zip fs do
-        match r with
-        | .ref c path => readInto fid (.ref fm) (.ref c (path ++ [.field i]))
-        | _ => rtErr "internal: struct read"
+        readInto fid (.ref fm) (← refField r i)
     | .real n =>
       let tok ← readNumber fid true
       if n ≥ 1 then
@@ -2333,14 +2413,11 @@ partial def readInto (fid : Nat) (m : Mode) (r : Value) : M Unit := do
       for i in [0:es.size] do
         readInto fid (.ref em) (← refElem r i)
     | .compl n =>
-      match r with
-      | .ref c path =>
-        match (← readRef r) with
-        | .struct _ => pure ()
-        | _ => writeRef r (mkCompl 0.0 0.0 |> fun _ => .struct #[.undef, .undef])
-        readInto fid (.ref (.real n)) (.ref c (path ++ [.field 0]))
-        readInto fid (.ref (.real n)) (.ref c (path ++ [.field 1]))
-      | _ => rtErr "internal: COMPL read"
+      match (← readRef r) with
+      | .struct _ => pure ()
+      | _ => writeRef r (.struct #[.undef, .undef])
+      readInto fid (.ref (.real n)) (← refField r 0)
+      readInto fid (.ref (.real n)) (← refField r 1)
     | .union _ =>
       -- a68g reads a value of the mode the united value currently has
       match (← readRef r) with
@@ -2369,20 +2446,15 @@ partial def readFormatted (fid : Nat) (st : FmtState) (m : Mode) (r : Value) : M
   | .struct fs =>
     let mut st := st
     for (i, (_, fm)) in (List.range fs.length).zip fs do
-      match r with
-      | .ref c path => st ← readFormatted fid st (.ref fm) (.ref c (path ++ [.field i]))
-      | _ => rtErr "internal: struct read"
+      st ← readFormatted fid st (.ref fm) (← refField r i)
     return st
   | .row 1 _ .char => readScalarFormatted fid st m r
   | .compl n =>
-    match r with
-    | .ref c path =>
-      match (← readRef r) with
-      | .struct _ => pure ()
-      | _ => writeRef r (.struct #[.undef, .undef])
-      let st ← readFormatted fid st (.ref (.real n)) (.ref c (path ++ [.field 0]))
-      readFormatted fid st (.ref (.real n)) (.ref c (path ++ [.field 1]))
-    | _ => rtErr "internal: COMPL read"
+    match (← readRef r) with
+    | .struct _ => pure ()
+    | _ => writeRef r (.struct #[.undef, .undef])
+    let st ← readFormatted fid st (.ref (.real n)) (← refField r 0)
+    readFormatted fid st (.ref (.real n)) (← refField r 1)
   | .union _ =>
     match (← readRef r) with
     | .union um uv =>
@@ -2594,10 +2666,11 @@ partial def getfItems (fid : Nat) (es : Array Value) : M Unit := do
   try
     for e in es do
       match e with
-      | .union .format (.fmt env fitems) =>
+      | .union .format f =>
         match st with
         | some s => purgeRead fid s
         | none => pure ()
+        let (env, fitems) ← fmtOf f
         let pics ← expandFormat env fitems
         st := some { frames := [{ pics := pics.toArray, cursor := 0, embedded := false }] }
       | .union m v =>
@@ -3049,8 +3122,9 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let w := if name == "bytespack" then 32 else 256
     if str.length > w then rtErr s!"the string is longer than {w} characters"
     return .row #[1] #[w] ((str.toList.map fun c => Value.char c.toNat) ++ List.replicate (w - str.length) (Value.char 0)).toArray
-  | "evaluate", [code, .fmt env items] => evaluateCall (← strOf code) env items
-  | "evaluate", [code] => evaluateCall (← strOf code) [] []
+  | "evaluate", [code, f@(.fmt _ _)] => let (env, items) ← fmtOf f; evaluateCall (← strOf code) env items
+  | "evaluate", [code, f@(.cfmt _ _)] => let (env, items) ← fmtOf f; evaluateCall (← strOf code) env items
+  | "evaluate", [code] => evaluateCall (← strOf code) (.lean []) []
   | "abend", [msg] => rtErr (← strOf msg)
   | "system", [cmd] =>
     let c ← strOf cmd
@@ -3292,9 +3366,9 @@ partial def readBin (fid : Nat) (m : Mode) (r : Value) : M Unit := do
     | .row 1 _ .char, _ =>
       let n := int32At (← readBinBytes fid 4) 0
       writeRef r (Value.ofString (bytesStr (← readBinBytes fid n.toNat)))
-    | .struct fs, .ref c path =>
+    | .struct fs, _ =>
       for i in [0:fs.length] do
-        readBin fid (.ref (fs[i]!).2) (.ref c (path ++ [.field i]))
+        readBin fid (.ref (fs[i]!).2) (← refField r i)
     | .row 1 _ em, _ =>
       let (_, _, es) ← expectRow (← readRef r)
       for i in [0:es.size] do
@@ -3327,17 +3401,26 @@ partial def writeBin (fid : Nat) (m : Mode) (v : Value) : M Unit := do
     arrive as a format text (`Elab.evaluateScope`), run it, and give its value as `print`
     would write it.  A text that does not parse or elaborate gets a68g's monitor error on
     standard output, and is itself the result. -/
-partial def evaluateCall (src : String) (env : Env) (items : List CoreFmt) : M Value := do
+partial def evaluateCall (src : String) (env : FEnv) (items : List CoreFmt) : M Value := do
   let mut names : List (String × Binding) := []
   let mut ops : List OpBinding := []
   let mut frame : Array Nat := #[]
+  let mut copies : List (Value × Nat) := []   -- C names copied into cells, written back after
   let mut tag : String := ""
   for it in items do
     match it with
     | .literal s => tag := s
     | .general [e] =>
       match (← evalFmtExpr env e) with
-      | .union m (.ref c []) =>
+      | .union m r@(.ref _ _) | .union m r@(.cref _ _) =>
+        -- a name of the compiled program is copied into a cell of the evaluator's: the
+        -- text sees its current value, and an assignment it makes is not seen outside
+        let c ← match r with
+          | .ref c [] => pure c
+          | _ => do
+            let c ← alloc (← readRef r)
+            copies := copies ++ [(r, c)]
+            pure c
         let slot := frame.size
         frame := frame.push c
         let n := String.ofList (tag.toList.drop 1)
@@ -3358,6 +3441,7 @@ partial def evaluateCall (src : String) (env : Env) (items : List CoreFmt) : M V
     | .error e => failed e.msg
     | .ok (core, mode) =>
       let v ← eval [frame, #[]] core
+      for (r, c) in copies do writeRef r (← readCell c)
       if (← resolveM mode) == .void then return Value.ofString ""
       return Value.ofString (← withStringFile fun fid => printValue fid mode v)
 
@@ -3365,17 +3449,29 @@ partial def evaluateCall (src : String) (env : Env) (items : List CoreFmt) : M V
 
 /-- Evaluate an expression embedded in a format text.  In a compiled program these are
     `hole` nodes that call straight into the compiled code, so no syntax is walked. -/
-partial def evalFmtExpr (env : Env) (e : Core) : M Value := do
-  match e with
-  | .hole fn idx => fromCompiled (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env)
-  | _ => eval env e
+partial def evalFmtExpr (env : FEnv) (e : Core) : M Value := do
+  match e, env with
+  | .hole fn idx, .lean env => fromCompiled (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env)
+  | .hole fn idx, .c frame => decodeValue (← fromCompiled (cHole (UInt32.ofNat fn) (UInt32.ofNat idx) frame))
+  | _, .lean env => eval env e
+  | _, .c _ => eval [#[]] e
+
+/-- The environment and items of a format value. -/
+partial def fmtOf (v : Value) : M (FEnv × List CoreFmt) := do
+  match v with
+  | .fmt env items => return (.lean env, items)
+  | .cfmt frame skel =>
+    match (← (← read).fmts.get)[skel]? with
+    | some items => return (.c frame, items)
+    | none => rtErr "internal: format index out of range"
+  | _ => rtErr "format expected"
 
 /-- Expand the format items of a format value into a flat picture list. -/
-partial def expandFormat (env : Env) (items : List CoreFmt) : M (List Pic) := do
+partial def expandFormat (env : FEnv) (items : List CoreFmt) : M (List Pic) := do
   let b ← walkFormat env items {}
   return b.flush
 
-partial def walkFormat (env : Env) (items : List CoreFmt) (b0 : FmtBuild) : M FmtBuild := do
+partial def walkFormat (env : FEnv) (items : List CoreFmt) (b0 : FmtBuild) : M FmtBuild := do
   let mut b := b0
   for it in items do
     match it with
@@ -3390,7 +3486,7 @@ partial def walkFormat (env : Env) (items : List CoreFmt) (b0 : FmtBuild) : M Fm
     | .char_ => b := b.addFrame .a
     | .rep n dyn .col =>
       let k ← match dyn with
-        | some e => do pure (← expectInt (← eval env e)).toNat
+        | some e => do pure (← expectInt (← evalFmtExpr env e)).toNat
         | none => pure n
       b := { pics := b.flush ++ [.col k] }
     | .rep n dyn .radix =>
@@ -3438,9 +3534,8 @@ partial def walkFormat (env : Env) (items : List CoreFmt) (b0 : FmtBuild) : M Fm
     | .strings => b := { pics := b.flush }
     | .sep => b := { pics := b.flush }
     | .include f =>
-      match (← evalFmtExpr env f) with
-      | .fmt fenv fitems => b := b.addPic (.include fitems fenv)
-      | _ => rtErr "format expected in f(...)"
+      let (fenv, fitems) ← fmtOf (← evalFmtExpr env f)
+      b := b.addPic (.include fitems fenv)
   return b
 
 /-- Get the next pattern, writing insertions passed on the way. Embedded formats (`f(...)`) are
@@ -3722,11 +3817,12 @@ partial def printf (fid : Nat) (items : List Value) : M Unit := do
   let mut st : Option FmtState := none
   for it in items do
     match it with
-    | .union .format (.fmt env fitems) =>
+    | .union .format f =>
       -- purge the previous format
       match st with
       | some s => let _ ← nextPattern fid s false
       | none => pure ()
+      let (env, fitems) ← fmtOf f
       let pics ← expandFormat env fitems
       st := some { frames := [{ pics := pics.toArray, cursor := 0, embedded := false }] }
     | .union m v =>
@@ -3757,7 +3853,7 @@ def run (core : Core) (modes : Mode.Table) (args : Array String) (ll : Nat := Nu
   let rt : Rt := {
     heap := ← IO.mkRef #[], out := ← IO.mkRef ByteArray.empty, pos := ← IO.mkRef {},
     modes := modes, files := ← IO.mkRef #[{}, {}, {}, {}], rng := ← IO.mkRef (tausSet 1), args := args, ll := ll,
-    regression := regression, col := ← IO.mkRef 0 }
+    regression := regression, col := ← IO.mkRef 0, mtab := ← IO.mkRef #[], fmts := ← IO.mkRef #[] }
   let res ← (eval [#[]] core).run rt |>.run
   -- flush files written by the program
   let files ← rt.files.get

@@ -38,6 +38,9 @@ def valueStr : Value → String
   | .builtin n => s!"builtin {n}"
   | .cproc fn np _ => s!"cproc#{fn}/{np}"
   | .fmt .. => "format"
+  | .cref a o => s!"cref#{a}+{o}"
+  | .cclos fn np _ => s!"cclos#{fn}/{np}"
+  | .cfmt _ k => s!"cformat#{k}"
   | .file id => s!"file {id}"
 
 mutual

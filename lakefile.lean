@@ -21,11 +21,21 @@ target sys.o pkg : FilePath := do
   let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
   buildO oFile srcJob flags
 
+/-- The C runtime of compiled programs: their values, frames and operand stack in C memory
+    (docs/GC-DESIGN.md).  Linked into compiled programs; the interpreter links stubs for the
+    few entry points the Lean side calls. -/
+target rt.o pkg : FilePath := do
+  let oFile := pkg.buildDir / "csrc" / "rt.o"
+  let srcJob ← inputTextFile <| pkg.dir / "csrc" / "rt.c"
+  let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
+  buildO oFile srcJob flags
+
 extern_lib liba68stubs pkg := do
   let name := nameToStaticLib "a68stubs"
   let job ← fetch <| pkg.target ``stubs.o
   let sysJob ← fetch <| pkg.target ``sys.o
-  buildStaticLib (pkg.staticLibDir / name) #[job, sysJob]
+  let rtJob ← fetch <| pkg.target ``rt.o
+  buildStaticLib (pkg.staticLibDir / name) #[job, sysJob, rtJob]
 
 @[default_target]
 lean_lib A68 where

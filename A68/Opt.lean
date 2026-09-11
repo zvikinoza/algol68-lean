@@ -44,7 +44,8 @@ def isLit : Core → Bool
 private def scratchRt : IO Interp.Rt := do
   return { heap := ← IO.mkRef #[], out := ← IO.mkRef ByteArray.empty, pos := ← IO.mkRef {},
            modes := {}, files := ← IO.mkRef #[], rng := ← IO.mkRef (Interp.tausSet 1),
-           args := #[], ll := Numfmt.defaultLLDigits, regression := false, col := ← IO.mkRef 0 }
+           args := #[], ll := Numfmt.defaultLLDigits, regression := false, col := ← IO.mkRef 0,
+           mtab := ← IO.mkRef #[], fmts := ← IO.mkRef #[] }
 
 /-- Evaluate a constant unit with the run-time evaluator; `none` if it would fail. -/
 def evalConst (rt : Interp.Rt) (c : Core) : IO (Option Value) := do

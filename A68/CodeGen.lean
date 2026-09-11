@@ -2856,7 +2856,122 @@ def prelude : String := "
 #include <string.h>
 #include <math.h>
 
-#define W lean_io_mk_world()
+
+/* The C runtime (csrc/rt.c).  Every entry point takes a trailing dummy argument `W`, a
+   leftover of the Lean-backed runtime this one replaced, kept so that the generator's
+   call sites read the same. */
+#define W 0
+void a68rt_boot(const char* blob, uint32_t ll, uint8_t reg, int argc, char** argv, const char* src);
+uint32_t a68rt_finish(int w);
+void a68rt_line(uint32_t l, int w);
+void a68rt_stop(int w);
+uint32_t a68rt_jump_pending(int w);
+void a68rt_jump_clear(int w);
+void a68rt_raise_jump(uint32_t l, int w);
+void a68rt_enter(uint32_t n, int w);
+void a68rt_enter_args(uint32_t n, uint32_t k, int w);
+uint32_t a68rt_heap_mark(int w);
+void a68rt_heap_release(uint32_t m, int w);
+void a68rt_leave(int w);
+uint32_t a68rt_env_depth(int w);
+void a68rt_env_truncate(uint32_t d, int w);
+uint32_t a68rt_stack_depth(int w);
+void a68rt_stack_truncate(uint32_t d, int w);
+void a68rt_push_int(int64_t v, int w);
+void a68rt_push_bigint(uint32_t i, int w);
+void a68rt_push_bigbits(uint32_t i, int w);
+void a68rt_push_real(double v, int w);
+void a68rt_push_bool(uint8_t v, int w);
+void a68rt_push_char(uint32_t v, int w);
+void a68rt_push_bits(uint64_t v, int w);
+void a68rt_push_str(uint32_t i, int w);
+void a68rt_push_undef(int w);
+void a68rt_push_nil(int w);
+void a68rt_push_void(int w);
+void a68rt_push_builtin(uint32_t i, int w);
+void a68rt_push_file(uint32_t i, int w);
+void a68rt_push_skip(uint32_t m, int w);
+void a68rt_push_cell(uint32_t d, uint32_t s, int w);
+void a68rt_push_ref(uint32_t d, uint32_t s, int w);
+void a68rt_push_proc(uint32_t fn, uint32_t np, int w);
+void a68rt_push_format(uint32_t k, int w);
+void a68rt_store(uint32_t d, uint32_t s, int w);
+void a68rt_bind_cell(uint32_t d, uint32_t s, int w);
+void a68rt_set_int(uint32_t d, uint32_t s, int64_t v, int w);
+void a68rt_pop(int w);
+void a68rt_nip(int w);
+void a68rt_dup(int w);
+int64_t a68rt_pop_int(int w);
+uint8_t a68rt_pop_bool(int w);
+double a68rt_pop_real(int w);
+uint32_t a68rt_pop_char(int w);
+uint64_t a68rt_pop_bits(int w);
+void a68rt_deref(int w);
+void a68rt_deproc(int w);
+void a68rt_widen(uint32_t a, uint32_t b, int w);
+void a68rt_row_of(int w);
+void a68rt_unite(uint32_t m, int w);
+void a68rt_voiding(int w);
+void a68rt_assign(uint8_t flex, int w);
+void a68rt_ident_rel(uint8_t isnt, int w);
+void a68rt_dyop(uint32_t op, uint32_t m1, uint32_t m2, int w);
+void a68rt_monop(uint32_t op, uint32_t m, int w);
+void a68rt_call(uint32_t n, int w);
+void a68rt_select(uint32_t i, uint8_t viaRef, int w);
+void a68rt_slice(uint32_t n, uint64_t kinds, uint8_t viaRef, int w);
+void a68rt_new_row(uint32_t n, uint8_t flex, int w);
+void a68rt_gen(int w);
+void a68rt_collateral(uint32_t n, uint8_t st, uint32_t dims, int w);
+uint32_t a68rt_case_index(uint32_t n, int w);
+uint8_t a68rt_conform(uint32_t m, uint8_t bind, int w);
+int64_t a68rt_cell_int(uint32_t d, uint32_t s, int w);
+double a68rt_cell_real(uint32_t d, uint32_t s, int w);
+uint8_t a68rt_cell_bool(uint32_t d, uint32_t s, int w);
+uint32_t a68rt_cell_char(uint32_t d, uint32_t s, int w);
+uint64_t a68rt_cell_bits(uint32_t d, uint32_t s, int w);
+void a68rt_set_cell_int(uint32_t d, uint32_t s, int64_t v, int w);
+void a68rt_set_cell_real(uint32_t d, uint32_t s, double v, int w);
+void a68rt_set_cell_bool(uint32_t d, uint32_t s, uint8_t v, int w);
+void a68rt_set_cell_char(uint32_t d, uint32_t s, uint32_t v, int w);
+void a68rt_set_cell_bits(uint32_t d, uint32_t s, uint64_t v, int w);
+void a68rt_arith_error(uint32_t k, int w);
+void a68rt_undef_error(uint32_t k, int w);
+int64_t a68rt_row_int(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int w);
+double a68rt_row_real(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int w);
+uint8_t a68rt_row_bool(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int w);
+uint32_t a68rt_row_char(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int w);
+uint64_t a68rt_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int w);
+void a68rt_set_row_int(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int64_t v, int w);
+void a68rt_set_row_real(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, double v, int w);
+void a68rt_set_row_bool(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint8_t v, int w);
+void a68rt_set_row_char(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint32_t v, int w);
+void a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint64_t v, int w);
+void a68rt_sel_push(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+int64_t a68rt_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+double a68rt_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+uint8_t a68rt_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+uint32_t a68rt_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+uint64_t a68rt_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+void a68rt_set_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int64_t v, int w);
+void a68rt_set_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, double v, int w);
+void a68rt_set_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint8_t v, int w);
+void a68rt_set_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint32_t v, int w);
+void a68rt_set_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint64_t v, int w);
+uint8_t a68rt_cell_isnil(uint32_t d, uint32_t s, int w);
+void a68rt_sel_store(uint32_t dd, uint32_t ds, uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int w);
+void a68rt_append_char(uint32_t d, uint32_t s, uint32_t ch, int w);
+void a68rt_append(uint32_t d, uint32_t s, int w);
+void a68rt_index_error(int64_t i, int64_t l, int64_t u, int w);
+uint32_t a68rt_cell_cproc(uint32_t d, uint32_t s, int w);
+void a68rt_push_bytes(const uint8_t* p, int64_t n, int64_t l, int w);
+int64_t a68rt_pop_bytes(uint8_t** out, int64_t* l, int w);
+/* the results of the runtime are plain C values now; these wrappers are identities */
+#define a68_v(x)   ((void) (x))
+#define a68_u32(x) (x)
+#define a68_i64(x) (x)
+#define a68_u8(x)  (x)
+#define a68_f64(x) (x)
+#define a68_u64(x) (x)
 
 
 void lean_initialize_runtime_module(void);
@@ -2864,105 +2979,15 @@ void lean_io_mark_end_initialization(void);
 void lean_init_task_manager(void);
 char** lean_setup_args(int argc, char** argv);
 
-lean_object* a68rt_boot(lean_object* blob, uint32_t ll, uint8_t reg, lean_object* args, lean_object* w);
-lean_object* a68rt_finish(lean_object* w);
-lean_object* a68rt_line(uint32_t l, lean_object* w);
 extern uint32_t a68_line_no;
 #define a68_line(n) (a68_line_no = (n))
-lean_object* a68rt_jump_pending(lean_object* w);
 extern uint32_t a68_jump_flag;
-lean_object* a68rt_jump_clear(lean_object* w);
-lean_object* a68rt_raise_jump(uint32_t l, lean_object* w);
-lean_object* a68rt_stop(lean_object* w);
-lean_object* a68rt_enter(uint32_t n, lean_object* w);
-lean_object* a68rt_enter_args(uint32_t n, uint32_t k, lean_object* w);
-lean_object* a68rt_leave(lean_object* w);
-lean_object* a68rt_env_depth(lean_object* w);
-lean_object* a68rt_env_truncate(uint32_t d, lean_object* w);
-lean_object* a68rt_env_set(lean_object* env, lean_object* w);
-lean_object* a68rt_env_restore(lean_object* w);
-lean_object* a68rt_stack_depth(lean_object* w);
-lean_object* a68rt_stack_truncate(uint32_t d, lean_object* w);
-lean_object* a68rt_push_int(int64_t v, lean_object* w);
-lean_object* a68rt_push_bigint(uint32_t i, lean_object* w);
-lean_object* a68rt_push_bigbits(uint32_t i, lean_object* w);
-lean_object* a68rt_push_real(double v, lean_object* w);
-lean_object* a68rt_push_bool(uint8_t v, lean_object* w);
-lean_object* a68rt_push_char(uint32_t v, lean_object* w);
-lean_object* a68rt_push_bits(uint64_t v, lean_object* w);
-lean_object* a68rt_push_str(uint32_t i, lean_object* w);
-lean_object* a68rt_push_undef(lean_object* w);
-lean_object* a68rt_push_nil(lean_object* w);
-lean_object* a68rt_push_void(lean_object* w);
-lean_object* a68rt_push_builtin(uint32_t i, lean_object* w);
-lean_object* a68rt_push_file(uint32_t i, lean_object* w);
-lean_object* a68rt_push_skip(uint32_t m, lean_object* w);
-lean_object* a68rt_push_cell(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_push_ref(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_push_proc(uint32_t fn, uint32_t np, lean_object* w);
-lean_object* a68rt_push_format(uint32_t k, lean_object* w);
-lean_object* a68rt_push_array(lean_object* a, lean_object* w);
-lean_object* a68rt_store(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_bind_cell(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_set_int(uint32_t d, uint32_t s, int64_t v, lean_object* w);
-lean_object* a68rt_pop(lean_object* w);
-lean_object* a68rt_nip(lean_object* w);
-lean_object* a68rt_dup(lean_object* w);
-lean_object* a68rt_pop_int(lean_object* w);
-lean_object* a68rt_pop_bool(lean_object* w);
-lean_object* a68rt_take_top(lean_object* w);
-lean_object* a68rt_undef_result(lean_object* w);
-lean_object* a68rt_deref(lean_object* w);
-lean_object* a68rt_deproc(lean_object* w);
-lean_object* a68rt_widen(uint32_t a, uint32_t b, lean_object* w);
-lean_object* a68rt_row_of(lean_object* w);
-lean_object* a68rt_unite(uint32_t m, lean_object* w);
-lean_object* a68rt_voiding(lean_object* w);
-lean_object* a68rt_assign(uint8_t flex, lean_object* w);
-lean_object* a68rt_ident_rel(uint8_t isnt, lean_object* w);
-lean_object* a68rt_dyop(uint32_t op, uint32_t m1, uint32_t m2, lean_object* w);
-lean_object* a68rt_monop(uint32_t op, uint32_t m, lean_object* w);
-lean_object* a68rt_call(uint32_t n, lean_object* w);
-lean_object* a68rt_select(uint32_t i, uint8_t viaRef, lean_object* w);
-lean_object* a68rt_slice(uint32_t n, uint64_t kinds, uint8_t viaRef, lean_object* w);
-lean_object* a68rt_new_row(uint32_t n, uint8_t flex, lean_object* w);
-lean_object* a68rt_gen(lean_object* w);
-lean_object* a68rt_collateral(uint32_t n, uint8_t st, uint32_t dims, lean_object* w);
-lean_object* a68rt_case_index(uint32_t n, lean_object* w);
-lean_object* a68rt_conform(uint32_t m, uint8_t bind, lean_object* w);
 lean_object* initialize_algol68_A68_Runtime(uint8_t builtin);
 void a68_set_state(lean_object* s);
 
 static void a68_fail(lean_object* r) {
   lean_io_result_show_error(r);
   exit(1);
-}
-static inline lean_object* a68_take(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  lean_object* v = lean_io_result_take_value(r);
-  return v;
-}
-static inline void a68_v(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  lean_dec_ref(r);
-}
-static inline uint32_t a68_u32(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  uint32_t v = lean_unbox_uint32(lean_io_result_get_value(r));
-  lean_dec_ref(r);
-  return v;
-}
-static inline int64_t a68_i64(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  int64_t v = (int64_t) lean_unbox_uint64(lean_io_result_get_value(r));
-  lean_dec_ref(r);
-  return v;
-}
-static inline uint8_t a68_u8(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  uint8_t v = lean_unbox(lean_io_result_get_value(r));
-  lean_dec_ref(r);
-  return v;
 }
 #define a68_jump()        a68_jump_flag
 #define a68_jump_clear()  (a68_jump_flag = 0)
@@ -2980,30 +3005,6 @@ static inline uint8_t a68_u8(lean_object* r) {
    a failure through a68rt_arith_error, which prints and exits like any other
    runtime error. */
 
-lean_object* a68rt_cell_int(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_cell_real(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_cell_bool(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_cell_char(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_cell_bits(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_set_cell_int(uint32_t d, uint32_t s, int64_t v, lean_object* w);
-lean_object* a68rt_set_cell_real(uint32_t d, uint32_t s, double v, lean_object* w);
-lean_object* a68rt_set_cell_bool(uint32_t d, uint32_t s, uint8_t v, lean_object* w);
-lean_object* a68rt_set_cell_char(uint32_t d, uint32_t s, uint32_t v, lean_object* w);
-lean_object* a68rt_set_cell_bits(uint32_t d, uint32_t s, uint64_t v, lean_object* w);
-lean_object* a68rt_arith_error(uint32_t k, lean_object* w);
-
-static inline double a68_f64(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  double v = lean_unbox_float(lean_io_result_get_value(r));
-  lean_dec_ref(r);
-  return v;
-}
-static inline uint64_t a68_u64(lean_object* r) {
-  if (lean_io_result_is_error(r)) a68_fail(r);
-  uint64_t v = lean_unbox_uint64(lean_io_result_get_value(r));
-  lean_dec_ref(r);
-  return v;
-}
 
 #define a68_cell_i(d,s)   a68_i64(a68rt_cell_int(d, s, W))
 #define a68_cell_r(d,s)   a68_f64(a68rt_cell_real(d, s, W))
@@ -3016,20 +3017,6 @@ static inline uint64_t a68_u64(lean_object* r) {
 #define a68_set_c(d,s,v)  a68_v(a68rt_set_cell_char(d, s, v, W))
 #define a68_set_u(d,s,v)  a68_v(a68rt_set_cell_bits(d, s, v, W))
 
-lean_object* a68rt_pop_real(lean_object* w);
-lean_object* a68rt_pop_char(lean_object* w);
-lean_object* a68rt_pop_bits(lean_object* w);
-lean_object* a68rt_undef_error(uint32_t k, lean_object* w);
-lean_object* a68rt_row_int(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
-lean_object* a68rt_row_real(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
-lean_object* a68rt_row_bool(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
-lean_object* a68rt_row_char(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
-lean_object* a68rt_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, lean_object* w);
-lean_object* a68rt_set_row_int(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, int64_t v, lean_object* w);
-lean_object* a68rt_set_row_real(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, double v, lean_object* w);
-lean_object* a68rt_set_row_bool(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint8_t v, lean_object* w);
-lean_object* a68rt_set_row_char(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint32_t v, lean_object* w);
-lean_object* a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, int64_t j, uint64_t v, lean_object* w);
 
 #define a68_row_i(d,s,r,i,j)  a68_i64(a68rt_row_int(d, s, r, i, j, W))
 #define a68_row_r(d,s,r,i,j)  a68_f64(a68rt_row_real(d, s, r, i, j, W))
@@ -3045,20 +3032,7 @@ lean_object* a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, i
 /* One field of a structure a cell holds, or that is an element of a row a cell holds, or
    that a cell points at.  `spec` and `fields` describe the chain of selectors; see the
    runtime.  Anything that does not fit the shape falls back to the general machinery. */
-lean_object* a68rt_sel_push(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
-lean_object* a68rt_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
-lean_object* a68rt_cell_isnil(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_sel_store(uint32_t dd, uint32_t ds, uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 #define a68_isnil(d,s)  a68_u8(a68rt_cell_isnil(d, s, W))
-lean_object* a68rt_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
-lean_object* a68rt_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
-lean_object* a68rt_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
-lean_object* a68rt_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
-lean_object* a68rt_set_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, int64_t v, lean_object* w);
-lean_object* a68rt_set_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, double v, lean_object* w);
-lean_object* a68rt_set_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint8_t v, lean_object* w);
-lean_object* a68rt_set_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint32_t v, lean_object* w);
-lean_object* a68rt_set_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, uint64_t v, lean_object* w);
 
 #define a68_sel_i(d,s,sp,i,j,f)  a68_i64(a68rt_sel_int(d, s, sp, i, j, f, W))
 #define a68_sel_r(d,s,sp,i,j,f)  a68_f64(a68rt_sel_real(d, s, sp, i, j, f, W))
@@ -3072,8 +3046,6 @@ lean_object* a68rt_set_sel_bits(uint32_t d, uint32_t s, uint32_t sp, int64_t i, 
 #define a68_set_sel_u(d,s,sp,i,j,f,v)  a68_v(a68rt_set_sel_bits(d, s, sp, i, j, f, v, W))
 
 /* `s +:= c` and `s +:= t` where `s` is a row a cell holds: appended in place. */
-lean_object* a68rt_append_char(uint32_t d, uint32_t s, uint32_t ch, lean_object* w);
-lean_object* a68rt_append(uint32_t d, uint32_t s, lean_object* w);
 #define a68_appendc(d,s,ch)  a68_v(a68rt_append_char(d, s, ch, W))
 
 #define a68_pop_i()  a68_i64(a68rt_pop_int(W))
@@ -3084,12 +3056,6 @@ lean_object* a68rt_append(uint32_t d, uint32_t s, lean_object* w);
 
 /* A promoted variable read before it was assigned: report exactly what the evaluator
    would have reported for an uninitialised cell of that mode. */
-lean_object* a68rt_index_error(int64_t i, int64_t l, int64_t u, lean_object* w);
-lean_object* a68rt_cell_cproc(uint32_t d, uint32_t s, lean_object* w);
-lean_object* a68rt_heap_mark(lean_object* w);
-lean_object* a68rt_heap_release(uint32_t m, lean_object* w);
-lean_object* a68rt_push_bytes(lean_object* b, uint64_t l, lean_object* w);
-lean_object* a68rt_pop_bytes(lean_object* w);
 static int64_t  a68_und_i(void) { a68_v(a68rt_undef_error(0, W)); return 0; }
 static double   a68_und_r(void) { a68_v(a68rt_undef_error(1, W)); return 0.0; }
 static uint8_t  a68_und_b(void) { a68_v(a68rt_undef_error(2, W)); return 0; }
@@ -3161,26 +3127,20 @@ static int a68_str_cmp(const uint8_t* a, int64_t na, const uint8_t* b, int64_t n
   return na < nb ? -1 : (na > nb ? 1 : 0);
 }
 static void a68_str_push(const a68_str* s) {
-  lean_object* b = lean_alloc_sarray(1, (size_t) s->n, (size_t) s->n);
-  if (s->n) memcpy(lean_sarray_cptr(b), s->p, (size_t) s->n);
-  a68_v(a68rt_push_bytes(b, (uint64_t) s->l, W));
+  a68rt_push_bytes(s->p, s->n, s->l, W);
 }
 static void a68_str_pop(a68_str* s) {
-  lean_object* b = a68_take(a68rt_pop_bytes(W));
-  size_t n = lean_sarray_size(b);
-  const uint8_t* q = lean_sarray_cptr(b);
-  uint64_t l = 0;
-  for (int k = 7; k >= 0; k--) l = (l << 8) | q[k];
-  a68_str_setn(s, (const char*) q + 8, (int64_t) n - 8, (int64_t) l);
-  lean_dec(b);
+  uint8_t* q = NULL; int64_t l = 1;
+  int64_t n = a68rt_pop_bytes(&q, &l, W);
+  a68_str_setn(s, (const char*) q, n, l);
+  free(q);
 }
 static void a68_str_popadd(a68_str* s) {
-  lean_object* b = a68_take(a68rt_pop_bytes(W));
-  size_t n = lean_sarray_size(b);
-  a68_str_addn(s, (const char*) lean_sarray_cptr(b) + 8, (int64_t) n - 8);
-  lean_dec(b);
+  uint8_t* q = NULL; int64_t l = 1;
+  int64_t n = a68rt_pop_bytes(&q, &l, W);
+  a68_str_addn(s, (const char*) q, n);
+  free(q);
 }
-
 #define A68_INT_MAX 2147483647LL
 
 static int64_t a68_die_i(uint32_t k) { a68_v(a68rt_arith_error(k, W)); return 0; }
@@ -3351,19 +3311,14 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   for (sg, body) in st.nfns do
     if sg != "" then out := out ++ sg ++ " {\n" ++ "\n".intercalate body.toList ++ "\n}\n\n"
   -- dispatchers called from the runtime
-  out := out ++ "lean_object* a68_dispatch_proc(size_t fn, lean_object* env, lean_object* args, lean_object* w) {\n"
-  out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n"
-  out := out ++ "  lean_inc(args);\n  a68_v(a68rt_push_array(args, W));\n  switch (fn) {\n"
+  out := out ++ "void a68_dispatch_proc(size_t fn) {\n  switch (fn) {\n"
   for i in [0:st.fns.size] do
     out := out ++ s!"    case {i}: a68_fn{i}(); break;\n"
-  out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68_jump() ? a68rt_undef_result(lean_io_mk_world()) : a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
-  out := out ++ "lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_object* w) {\n"
-  out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n  switch (idx) {\n"
+  out := out ++ "    default: break;\n  }\n}\n\n"
+  out := out ++ "void a68_dispatch_hole(size_t idx) {\n  switch (idx) {\n"
   for i in [0:st.holes.size] do
     out := out ++ s!"    case {i}: a68_hole{i}(); break;\n"
-  out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68_jump() ? a68rt_undef_result(lean_io_mk_world()) : a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "    default: break;\n  }\n}\n\n"
   -- main
   out := out ++ "int main(int argc, char** argv) {\n"
   -- `PR echo` texts are printed when the program is read, before anything it prints
@@ -3374,15 +3329,11 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   out := out ++ "  lean_object* ir = initialize_algol68_A68_Runtime(1);\n"
   out := out ++ "  if (lean_io_result_is_error(ir)) { a68_fail(ir); }\n  lean_dec_ref(ir);\n"
   out := out ++ "  lean_io_mark_end_initialization();\n  lean_init_task_manager();\n"
-  out := out ++ "  lean_object* args = lean_mk_empty_array();\n"
   -- the program sees the arguments a68g would give it: `a68g`, the source file, and then
-  -- the arguments the binary was run with, as `a68lean run` does
-  out := out ++ "  args = lean_array_push(args, lean_mk_string(\"a68g\"));\n"
-  out := out ++ "  args = lean_array_push(args, lean_mk_string(" ++ cstring srcName ++ "));\n"
-  out := out ++ "  for (int i = 1; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));\n"
-  out := out ++ s!"  a68_set_state(a68_take(a68rt_boot(lean_mk_string(A68_BLOB), {ll}, {if regression then 1 else 0}, args, W)));\n"
+  -- the arguments the binary was run with, as `a68lean run` does; the runtime builds that
+  out := out ++ s!"  a68rt_boot(A68_BLOB, {ll}, {if regression then 1 else 0}, argc, argv, " ++ cstring srcName ++ ");\n"
   out := out ++ "  a68_fn0();\n"
-  out := out ++ "  uint32_t rc = a68_u32(a68rt_finish(W));\n  return (int) rc;\n}\n"
+  out := out ++ "  uint32_t rc = a68rt_finish(W);\n  return (int) rc;\n}\n"
   return out
 
 end A68.CodeGen

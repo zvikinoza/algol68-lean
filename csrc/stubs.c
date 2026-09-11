@@ -67,3 +67,16 @@ uint32_t a68_set_jump(uint32_t v) {
   a68_jump_flag = v;
   return v;
 }
+
+/* The C memory of a compiled program (`csrc/rt.c`).  The evaluator never makes a value
+   that lives there, so `a68lean run` never reaches these; they exist so that the
+   interpreter binary links. */
+#define A68_NO_C_MEMORY(name) \
+  fprintf(stderr, "a68lean: internal: " name " reached in interpreted mode\n"); exit(1);
+__attribute__((weak)) lean_object* a68c_load(uint64_t a, uint32_t o, lean_object* w) { (void) a; (void) o; (void) w; A68_NO_C_MEMORY("a68c_load") }
+__attribute__((weak)) lean_object* a68c_store(uint64_t a, uint32_t o, lean_object* b, lean_object* w) { (void) a; (void) o; (void) b; (void) w; A68_NO_C_MEMORY("a68c_store") }
+__attribute__((weak)) lean_object* a68c_assign(uint64_t a, uint32_t o, lean_object* b, uint8_t f, lean_object* w) { (void) a; (void) o; (void) b; (void) f; (void) w; A68_NO_C_MEMORY("a68c_assign") }
+__attribute__((weak)) lean_object* a68c_field(uint64_t a, uint32_t o, uint32_t i, lean_object* w) { (void) a; (void) o; (void) i; (void) w; A68_NO_C_MEMORY("a68c_field") }
+__attribute__((weak)) lean_object* a68c_elem(uint64_t a, uint32_t o, uint32_t i, lean_object* w) { (void) a; (void) o; (void) i; (void) w; A68_NO_C_MEMORY("a68c_elem") }
+__attribute__((weak)) lean_object* a68c_call(uint32_t fn, uint32_t np, uint64_t fr, lean_object* b, uint32_t n, lean_object* w) { (void) fn; (void) np; (void) fr; (void) b; (void) n; (void) w; A68_NO_C_MEMORY("a68c_call") }
+__attribute__((weak)) lean_object* a68c_hole(uint32_t fn, uint32_t idx, uint64_t fr, lean_object* w) { (void) fn; (void) idx; (void) fr; (void) w; A68_NO_C_MEMORY("a68c_hole") }

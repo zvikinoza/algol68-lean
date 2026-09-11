@@ -45,6 +45,13 @@ inductive Value where
   | cproc (fn : Nat) (nparams : Nat) (env : List (Array Nat))   -- compiled procedure
   | fmt (env : List (Array Nat)) (items : List CoreFmt)
   | file (id : Nat)
+  -- Values that live in the C memory of a compiled program (`csrc/rt.c`) and reach the
+  -- Lean services by address: a name (an object and a byte offset into it), a compiled
+  -- routine with the frame it captured, and a format text with its frame.  The Lean side
+  -- reads and writes through them by calling back into C; see `A68.Blob`.
+  | cref (addr : UInt64) (off : UInt32)
+  | cclos (fn nparams : Nat) (frame : UInt64)
+  | cfmt (frame : UInt64) (skel : Nat)
   deriving Inhabited, Repr
 
 /-- An indexer whose bounds have already been evaluated. -/
