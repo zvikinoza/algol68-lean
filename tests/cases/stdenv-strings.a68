@@ -1,0 +1,66 @@
+# a68g standard-environment extensions: regular expressions, string transput, evaluate #
+STRING s := "The quick brown fox";
+INT b, e;
+print((grep in string("q[a-z]+", s, b, e), " ", b, " ", e, newline));
+print((grep in string("^quick", s, NIL, NIL), grep in string("[", s, NIL, NIL), newline));
+print((grep in substring("^quick", s[5:], b, e), " ", b, " ", e, newline));
+print((sub in string("b[a-z]+", "red", s), " ", s, newline));
+STRING t;
+puts(t, ("x=", 42, " ", TRUE));
+print(("puts {", t, "}", newline));
+putsf(t, ($"y="g(0)"|"3d$, 7, 12));
+print(("putsf {", t, "}", newline));
+print((stringf(HEAP STRING, ($%g$, pi)), newline));
+print((string(LOC STRING, (1, 2)), newline));
+STRING src := "12 3.5 word";
+INT i; REAL r; STRING w;
+gets(src, (i, r, w));
+print((i, r, " ", w, newline));
+STRING src2 := "34 567";
+getsf(src2, ($2d, x, 3d$, i, b));
+print((i, b, newline));
+# evaluate sees the names of its caller #
+INT n := 6;
+PROC twice = (INT k) INT: 2 * k;
+print((evaluate("n * 7"), newline));
+print((evaluate("n := 9"), n, newline));
+PROC with x = (STRING code, INT x) STRING: evaluate(code);
+print((with x("x ** 2", 5), with x("code", 1), newline));
+# BYTES #
+BYTES by = bytes pack("Hello");
+print((STRING(by), "|", UPB STRING(by), 1 ELEM by, ABS (6 ELEM by), newline));
+print((by = bytes pack("Hello"), by < bytes pack("Help"), newline));
+# a NUL ends what a68g's C-string buffers pass on #
+print(("a" + REPR 0 + "b", "c", newline));
+printf(($"nul:"g"!"l$, null character));
+printf(($"after"l$));
+# BITS read as a C int, unions within unions #
+print((ABS NOT BIN 3, ABS (BIN 1 SHL 31), newline));
+MODE BASIC = UNION (STRING, INT);
+MODE VALUE = UNION (VOID, BASIC);
+PROC show = (VALUE v) VOID:
+   CASE v IN (VOID): print("void"), (BASIC x): CASE x IN (STRING s): print(s), (INT k): print(k) ESAC ESAC;
+show(EMPTY); show(5); BASIC bb := "str"; show(bb); print(newline);
+# associated strings: emptied when writing starts, appended to afterwards #
+FILE f; STRING as := "old";
+associate(f, as);
+put(f, ("ab"));
+print(("1 {", as, "}", newline));
+as := "";
+put(f, ("cd"));
+print(("2 {", as, "}", newline));
+print((reset possible(f), set possible(f), get possible(f), bin possible(f), reidf possible(f), newline));
+rewind(f);
+put(f, ("ef"));
+print(("3 {", as, "}", newline));
+FILE g; STRING gs := "one" + REPR 10 + "two";
+associate(g, gs);
+STRING line; get(g, (line, newline));
+print((line, " ", eof(g), newline));
+print((reset possible(stand in), put possible(stand out), get possible(stand out), newline));
+# the C library #
+print((strerror(2), newline));
+print((file is directory("."), file is regular("."), file is directory("no such dir"), newline));
+print((fixed(gamma(0.5), 0, 12), " ", fixed(ln gamma(10.0), 0, 10), " ", fixed(erf(0.5), 0, 12), newline));
+print((is nan(nan), is inf(inf), is finite(1.0), is minus inf(minus inf), newline));
+print((ABS blank character, ABS newline character, ABS tab character, ABS formfeed character, newline))

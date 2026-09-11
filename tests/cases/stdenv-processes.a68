@@ -1,0 +1,19 @@
+# a68g process procedures: system, fork, wait pid, execve child pipe, execve output #
+print("before ");
+INT rc = system("echo from system");
+print(("status", rc, newline));
+print(("exit status", system("exit 3"), newline));
+INT pid = fork;
+IF pid = 0 THEN
+   print(("child", newline))
+ELSE
+   INT st = wait pid(pid);
+   print(("parent after child", st, newline))
+FI;
+REF FILE pr = read OF execve child pipe("/bin/echo", ("echo", "through", "a pipe"), "");
+STRING got;
+get(pr, got);
+print(("pipe: ", got, newline));
+STRING out;
+INT st = execve output("/bin/sh", ("sh", "-c", "echo captured; exit 2"), "", out);
+print(("output: ", out, "status", st, newline))
