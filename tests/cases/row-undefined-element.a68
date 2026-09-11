@@ -1,0 +1,8 @@
+# Reading an element of a row kept as a C array that was never given a value is an #
+# error, as it is for the evaluator's rows.                                         #
+BEGIN
+  [4] INT a;
+  a[1] := 1; a[2] := 2; a[4] := 4;
+  print((a[1] + a[2] + a[4], newline));
+  print((a[3], newline))
+END

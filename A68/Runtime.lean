@@ -752,6 +752,12 @@ def undefError (kind : UInt32) : IO Unit := do
        | 3 => "attempt to use an uninitialised CHAR value"
        | _ => "attempt to use an uninitialised BITS value")
 
+/-- A subscript out of bounds in a row compiled to a C array, reported in the evaluator's
+    words. -/
+@[export a68rt_index_error]
+def indexError (i l u : Int64) : IO Unit := do
+  die s!"index {i.toInt} out of bounds [{l.toInt}:{u.toInt}]"
+
 /-- Report a failure detected by native arithmetic in compiled code. -/
 @[export a68rt_arith_error]
 def arithError (kind : UInt32) : IO Unit := do
