@@ -746,6 +746,17 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | none => do
       let ch ← fieldChain env (.select f e true)
       some s!"{ty.selFn}({ch.args})"
+  | .andThen l r => do
+    -- `&&` and `||` look at their right operand only when the evaluator would
+    if ty != .u8 then none else
+    let a ← scalarExpr env .bool l
+    let b ← scalarExpr env .bool r
+    some s!"((uint8_t)(({a}) && ({b})))"
+  | .orElse l r => do
+    if ty != .u8 then none else
+    let a ← scalarExpr env .bool l
+    let b ← scalarExpr env .bool r
+    some s!"((uint8_t)(({a}) || ({b})))"
   | .cond c t e => do
     -- C evaluates only the branch it takes, as the evaluator does
     let cc ← scalarExpr env .bool c
@@ -816,6 +827,7 @@ def resultMode : Core → Option Mode
     match resultMode t with
     | some m => some m
     | none => resultMode e
+  | .andThen _ _ | .orElse _ _ => some .bool
   | _ => none
 
 /-- A native expression for a node whose mode is not supplied by the caller. -/
