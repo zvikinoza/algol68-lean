@@ -1,0 +1,30 @@
+# An event routine that jumps out.  `on logical file end` installs a routine the     #
+# runtime calls when a read reaches the end of the file; here it leaves with a GO TO. #
+# Compiled, the routine is a C function that sets the pending jump and returns, and   #
+# the runtime once took its dummy result as the routine's answer and reported         #
+# "logical file end" instead of jumping.  Standard input is empty when this runs.     #
+BEGIN
+  INT lines := 0;
+  PROC finish = (REF FILE f) BOOL: GO TO done;
+  FILE text;
+  STRING data := "alpha" + REPR 10 + "beta" + REPR 10;
+  on logical file end (stand in, finish);
+  DO
+    STRING s;
+    read ((s, newline));
+    lines +:= 1
+  OD;
+done:
+  print (("lines read:", lines, newline));
+  BEGIN
+    associate (text, data);
+    on logical file end (text, (REF FILE f) BOOL: GO TO end of text);
+    DO
+      STRING word;
+      get (text, (word, newline));
+      print ((word, newline))
+    OD;
+  end of text:
+    print (("end", newline))
+  END
+END

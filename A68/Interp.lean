@@ -574,6 +574,28 @@ opaque dispatchHole (fn : USize) (idx : USize) (env : @& Env) : IO Value
 @[extern "a68_dispatch_proc"]
 opaque dispatchProc (fn : USize) (env : @& Env) (args : @& Array Value) : IO Value
 
+/-- The pending-jump flag compiled code keeps in a C variable (`csrc/stubs.c`).  A routine
+    compiled to C leaves by a jump by setting the flag and returning, so what it returns is
+    a dummy; after every call into compiled code the flag has to be turned back into the
+    jump the evaluator itself would have raised, before anything looks at that value. -/
+@[extern "a68_get_jump"]
+opaque getJumpFlag (u : Unit) : BaseIO UInt32
+
+@[extern "a68_set_jump"]
+opaque setJumpFlag (v : UInt32) : BaseIO UInt32
+
+/-- Call into compiled code, and raise the jump it left pending, if it left one.  This is
+    what lets an event routine such as an `on logical file end` handler leave with a
+    `GO TO`: the jump unwinds through the transput that called it, exactly as it does
+    when the routine is evaluated rather than compiled. -/
+def fromCompiled (act : IO Value) : ReaderT Rt (ExceptT Ctrl IO) Value := do
+  let v ← (act : IO Value)
+  let j ← ((getJumpFlag () : BaseIO UInt32) : IO UInt32)
+  if j != 0 then
+    let _ ← ((setJumpFlag 0 : BaseIO UInt32) : IO UInt32)
+    throw (.jump (j.toNat - 1))
+  return v
+
 -- ## Evaluation
 
 mutual
@@ -722,7 +744,7 @@ partial def eval (env : Env) (c : Core) : M Value := do
     if (← expectBool (← eval env l)) then return .bool true else eval env r
   | .fmt items => return .fmt env items
   | .stop => throw .stop
-  | .hole fn idx => (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env : IO Value)
+  | .hole fn idx => fromCompiled (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env)
   | .seq a b => do let _ ← eval env a; eval env b
   | .at p e =>
     (← read).pos.set p
@@ -952,7 +974,7 @@ partial def callValue (f : Value) (args : List Value) : M Value := do
       let v := if i < n then argsArr[i]! else .undef
       frame := frame.push (← alloc v)
     eval (frame :: cenv) body
-  | .cproc fn _ cenv => (dispatchProc (USize.ofNat fn) cenv args.toArray : IO Value)
+  | .cproc fn _ cenv => fromCompiled (dispatchProc (USize.ofNat fn) cenv args.toArray)
   | .builtin name => callBuiltin name args
   | .nil => rtErr "attempt to call NIL"
   | .undef => rtErr "attempt to call an uninitialised procedure"
@@ -2072,7 +2094,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     `hole` nodes that call straight into the compiled code, so no syntax is walked. -/
 partial def evalFmtExpr (env : Env) (e : Core) : M Value := do
   match e with
-  | .hole fn idx => (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env : IO Value)
+  | .hole fn idx => fromCompiled (dispatchHole (USize.ofNat fn) (USize.ofNat idx) env)
   | _ => eval env e
 
 /-- Expand the format items of a format value into a flat picture list. -/
