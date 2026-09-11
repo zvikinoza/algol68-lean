@@ -1,0 +1,25 @@
+# ANDF and OREL look at their right operand only when they must. #
+BEGIN
+  INT never;
+  INT hits := 0;
+  PROC note = (BOOL b) BOOL: (hits +:= 1; b);
+  FOR i FROM -3 TO 12 DO
+    BOOL a = i /= 0 ANDF 12 MOD i = 0;
+    BOOL b = i = 0 OREL 12 OVER i > 2;
+    BOOL c = ((i > 100 ANDF never > 0) OREL (i < -100 ANDF never < 0)) OREL ODD i;
+    BOOL d = NOT (i > 5 OREL i < 0) ANDF (i = 2 OREL (i = 3 ANDF TRUE));
+    BOOL e = note(ODD i) ANDF note(i > 4);
+    print((a, b, c, d, e, " "))
+  OD;
+  print((newline, hits, newline));
+  INT x := 27, steps := 0;
+  WHILE x /= 1 ANDF x < 1000000 DO
+    x := (ODD x | 3 * x + 1 | x OVER 2);
+    steps +:= 1
+  OD;
+  print((steps, newline));
+  BOOL flag := FALSE;
+  flag := flag OREL steps > 100;
+  print((flag, newline));
+  print((TRUE ANDF never = 0))
+END

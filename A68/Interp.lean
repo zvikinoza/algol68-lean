@@ -1019,6 +1019,7 @@ partial def defaultOf (m : Mode) : M Value := do
   match (← resolveM m) with
   | .void => return .void
   | .row d _ _ => return .row (Array.replicate d 1) (Array.replicate d 0) #[]
+  | .union _ => return Value.emptyUnion
   | _ => return .undef
 
 partial def evalSlice (env : Env) (arr : Core) (idx : List CoreIdx) (viaRef : Bool) : M Value := do

@@ -1,0 +1,23 @@
+# Conditional clauses as operands: only the branch taken is elaborated. #
+BEGIN
+  INT total := 0;
+  INT never;
+  REAL z := 0.0;
+  FOR i TO 20 DO
+    BOOL b = ODD i;
+    total := (total + (b | 3 | 5)) MOD 1000003;
+    total +:= (i > 10 | i OVER 3 | i * 2);
+    total -:= (i = 7 | 1 | (i > 100 | never | 2));
+    REAL x = (b | 1.5 | i / 2);
+    z := z + (x > 2.0 | x * 2.0 | x - 1.0);
+    total +:= (i < 5 | 1 | (i < 15 | 2 | 3)) * (NOT b | 10 | 1 OVER (i - i + 1))
+  OD;
+  print((total, " ", z, newline));
+  CHAR c = (total > 0 | "p" | "n");
+  print((c, (total < 0 | ABS "a" | ABS c), newline));
+  FOR i FROM 3 DOWNTO 0 DO print(((i = 0 | 0 | 12 OVER i), " ")) OD;
+  print(newline);
+  # the branch taken reads a variable that was never given a value #
+  INT k := 5;
+  print((k > 1 | never | 0))
+END

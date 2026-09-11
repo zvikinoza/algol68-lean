@@ -94,6 +94,10 @@ def CTy.undefFn : CTy → String
   | .i64 => "a68_und_i" | .f64 => "a68_und_r" | .u8 => "a68_und_b"
   | .u32 => "a68_und_c" | .u64 => "a68_und_u"
 
+/-- The member of the `a68_uv` payload of a row of unions that holds a value of this type. -/
+def CTy.uvField : CTy → String
+  | .f64 => "r" | .u64 => "u" | _ => "i"
+
 /-- How a scalar of this type is written straight into a cell, without boxing it first. -/
 def CTy.setFn : CTy → String
   | .i64 => "a68_set_i" | .f64 => "a68_set_r" | .u8 => "a68_set_b"
@@ -126,6 +130,11 @@ structure RowVar where
   /-- for a row of structures, the type of each field, each kept in `{name}_p{k}` with its
       flags in `{name}_d{k}`; empty for a row of primitive elements -/
   fields : Array CTy := #[]
+  /-- for a row of unions of primitive modes, the constituent modes and their types.  The
+      tag of an element, one plus the index of its constituent or zero while it is undefined,
+      is kept in `{name}_d`, and its value in the `a68_uv` payload `{name}_p` -/
+  umodes : Array Mode := #[]
+  utys : Array CTy := #[]
   deriving Inhabited
 
 /-- The C signature of a routine that is also compiled as a plain C function: parameters
@@ -157,6 +166,9 @@ structure Frame where
   /-- per slot: its mode, where known; a procedure-valued slot's mode gives the C signature
       of a plain entry point for whatever routine it holds -/
   modes  : Array (Option Mode) := #[]
+  /-- per slot of a routine's parameters: the C variable of the current C function that keeps
+      the plain entry point of the routine a procedure parameter holds, once looked up -/
+  pcache : Array (Option String) := #[]
   pushed : Bool := true
   deriving Inhabited
 
@@ -352,18 +364,37 @@ partial def strip : Core → Core
   | .at _ e => strip e
   | c => c
 
+/-- A clause that chooses among units, which `genInto` computes into a C variable branch by
+    branch instead of boxing each branch's value. -/
+def isChoice (c : Core) : Bool :=
+  match strip c with
+  | .cond .. | .caseInt .. | .block .. | .seq .. => true
+  | _ => false
+
 /-- Which statements of a block are generated in statement position, where the value is
     thrown away.  Without labels only the last unit supplies the block's value, so every
-    earlier unit is a statement; with labels any unit can be the value the block exits
-    with, so only an explicit VOIDing is safe to treat that way. -/
+    earlier unit is a statement.  With labels and completers, the value a block exits with
+    is that of the unit elaborated last before an `EXIT` or the end; a jump to a label starts
+    again from no value.  So a unit followed by another unit before any `EXIT` is a
+    statement too: whatever path reaches the next `EXIT` or the end passes through that
+    later unit, which replaces the value. -/
 def voidPositions (stmts : Array CoreStmt) (wantValue : Bool) : Array Bool := Id.run do
   let hasLbl := stmts.any fun st => match st with | .label _ | .exit => true | _ => false
   if !wantValue then
     return stmts.map fun st => match st with | .unit _ => true | _ => false
   if hasLbl then
-    return stmts.map fun st => match st with
-      | .unit e => (match strip e with | .voiding _ => true | _ => false)
-      | _ => false
+    let mut out : Array Bool := Array.replicate stmts.size false
+    -- walking backwards: is there a unit ahead before the next EXIT?
+    let mut unitAhead := false
+    for k in [0:stmts.size] do
+      let i := stmts.size - 1 - k
+      match stmts[i]! with
+      | .unit e =>
+        out := out.set! i (unitAhead || (match strip e with | .voiding _ => true | _ => false))
+        unitAhead := true
+      | .exit => unitAhead := false
+      | _ => pure ()
+    return out
   let mut last : Option Nat := none
   for i in [0:stmts.size] do
     match stmts[i]! with | .unit _ => last := some i | _ => pure ()
@@ -626,7 +657,7 @@ partial def rowReadC (env : List Frame) (ty : CTy) (base : Core) (idx : List Cor
     | .refCell d sl => some (d, sl)
     | _ => none
   let rv ← rowOf env d sl
-  if !rv.fields.isEmpty || rv.ty != ty || idx.length != rv.dims then none else
+  if !rv.fields.isEmpty || !rv.umodes.isEmpty || rv.ty != ty || idx.length != rv.dims then none else
   let is ← idx.mapM fun | .index e => scalarExpr env (.int 0) e | _ => none
   let r := rv.name
   if rv.dims == 1 then
@@ -718,6 +749,23 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | none => do
       let ch ← fieldChain env (.select f e true)
       some s!"{ty.selFn}({ch.args})"
+  | .andThen l r => do
+    -- `&&` and `||` look at their right operand only when the evaluator would
+    if ty != .u8 then none else
+    let a ← scalarExpr env .bool l
+    let b ← scalarExpr env .bool r
+    some s!"((uint8_t)(({a}) && ({b})))"
+  | .orElse l r => do
+    if ty != .u8 then none else
+    let a ← scalarExpr env .bool l
+    let b ← scalarExpr env .bool r
+    some s!"((uint8_t)(({a}) || ({b})))"
+  | .cond c t e => do
+    -- C evaluates only the branch it takes, as the evaluator does
+    let cc ← scalarExpr env .bool c
+    let a ← scalarExpr env m t
+    let b ← scalarExpr env m e
+    some s!"({cc} ? {a} : {b})"
   | .call (.lit (.builtin n)) [arg] =>
     if ty == .f64 && nativeMathFns.contains n then do
       let x ← scalarExpr env (.real 0) arg
@@ -778,6 +826,11 @@ def resultMode : Core → Option Mode
     | _ => none
   | .monop op m _ => if op == "LWB" || op == "UPB" then some (.int 0) else monopResult op m
   | .widen _ d _ => some d
+  | .cond _ t e =>
+    match resultMode t with
+    | some m => some m
+    | none => resultMode e
+  | .andThen _ _ | .orElse _ _ => some .bool
   | _ => none
 
 /-- A native expression for a node whose mode is not supplied by the caller. -/
@@ -877,7 +930,7 @@ def rowDecl (stmts : Array CoreStmt) (slot : Nat) : Option (List (Core × Core))
         match strip init with
         | .newRow bs ei false =>
           match strip ei with
-          | .lit .undef => return some bs
+          | .lit .undef | .lit (.union _ .undef) => return some bs
           | _ => return none
         | _ => return none
     | _ => pure ()
@@ -1081,6 +1134,113 @@ partial def srowEscapesStmts (tys : Array CTy) (d sl dims : Nat) (stmts : Array 
   return false
 end
 
+/-- A fixed row of a union whose constituents are all primitive, seen through declared mode
+    names: its dimensions, the constituents in the union's order, and their types. -/
+def rowUnionTy (tab : Mode.Table) : Mode → Option (Nat × Array Mode × Array CTy)
+  | .ref (.row dims false e) | .row dims false e =>
+    if dims == 1 || dims == 2 then
+      match Mode.resolve tab e with
+      | .union ms =>
+        match ms.mapM (fun cm => CTy.ofMode (Mode.resolve tab cm)) with
+        | some tys => if tys.isEmpty || tys.length > 200 then none else some (dims, ms.toArray, tys.toArray)
+        | none => none
+      | _ => none
+    else none
+  | _ => none
+
+/-- The constituent a value of mode `m` is united as: the index the evaluator's conformity
+    test would match it with. -/
+def unionTag (tab : Mode.Table) (cms : Array Mode) (m : Mode) : Option Nat :=
+  cms.findIdx? fun cm => Mode.eqv tab cm m
+
+/-- A source a row of unions can store without boxing it: a primitive value united to one of
+    the constituents, `SKIP`, or a choice between such sources. -/
+partial def unionSrcOk (tab : Mode.Table) (cms : Array Mode) : Core → Bool
+  | .at _ e => unionSrcOk tab cms e
+  | .unite m _ => (unionTag tab cms m).isSome && (CTy.ofMode (Mode.resolve tab m)).isSome
+  | .skip _ => true
+  | .seq _ b => unionSrcOk tab cms b
+  | .cond _ t e => unionSrcOk tab cms t && unionSrcOk tab cms e
+  | .caseInt _ alts out => alts.all (unionSrcOk tab cms) && unionSrcOk tab cms out
+  | _ => false
+
+mutual
+/-- What a row of unions kept as C arrays supports: an element as the selector of a
+    conformity clause whose every alternative names a constituent, an element assigned such a
+    source in statement position, and the bounds enquiries.  Anything else keeps the cell. -/
+partial def urowEscapes (tab : Mode.Table) (cms : Array Mode) (d sl dims : Nat) (c : Core) : Bool :=
+  match c with
+  | .at _ e => urowEscapes tab cms d sl dims e
+  | .refCell dd ss | .loadCell dd ss => dd == d && ss == sl
+  | .caseConf sel alts out =>
+    let rest := urowEscapes tab cms d sl dims out
+      || alts.any fun (_, _, b) => urowEscapes tab cms (d + 1) sl dims b
+    match strip sel with
+    | .deref e =>
+      match rowElemIdx d sl dims e with
+      | some ixs =>
+        ixs.any (urowEscapes tab cms d sl dims) || rest
+          || alts.any fun (m, _, _) =>
+               (unionTag tab cms m).isNone || (CTy.ofMode (Mode.resolve tab m)).isNone
+      | none => urowEscapes tab cms d sl dims sel || rest
+    | _ => urowEscapes tab cms d sl dims sel || rest
+  | .monop op _ e =>
+    if (op == "LWB" || op == "UPB") && isRowNameOf d sl e then false
+    else urowEscapes tab cms d sl dims e
+  | .dyop op _ _ l r =>
+    if (op == "LWB" || op == "UPB") && isRowNameOf d sl r &&
+        (match strip l with | .lit (.int k) => k ≥ 1 && k ≤ (dims : Int) | _ => false) then false
+    else urowEscapes tab cms d sl dims l || urowEscapes tab cms d sl dims r
+  | .voiding e => urowEscapesV tab cms d sl dims e
+  | .block _ stmts _ _ => urowEscapesStmts tab cms (d + 1) sl dims stmts true
+  | .loop _ f b t w body =>
+    urowEscapes tab cms d sl dims f || urowEscapes tab cms d sl dims b
+      || (match t with | some e => urowEscapes tab cms d sl dims e | none => false)
+      || (match w with | some e => urowEscapes tab cms (d + 1) sl dims e | none => false)
+      || urowEscapesV tab cms (d + 1) sl dims body
+  | _ => (childrenD c).any fun (k, ch) => urowEscapes tab cms (d + k) sl dims ch
+
+partial def urowEscapesV (tab : Mode.Table) (cms : Array Mode) (d sl dims : Nat) (c : Core) : Bool :=
+  match strip c with
+  | .voiding e => urowEscapesV tab cms d sl dims e
+  | .seq a b => urowEscapesV tab cms d sl dims a || urowEscapesV tab cms d sl dims b
+  | .assign dst src _ =>
+    match rowElemIdx d sl dims dst with
+    | some ixs =>
+      ixs.any (urowEscapes tab cms d sl dims) || !unionSrcOk tab cms src || urowEscapes tab cms d sl dims src
+    | none => urowEscapes tab cms d sl dims dst || urowEscapes tab cms d sl dims src
+  | .cond a b e =>
+    urowEscapes tab cms d sl dims a || urowEscapesV tab cms d sl dims b || urowEscapesV tab cms d sl dims e
+  | .block _ stmts _ _ => urowEscapesStmts tab cms (d + 1) sl dims stmts false
+  | c' => urowEscapes tab cms d sl dims c'
+
+partial def urowEscapesStmts (tab : Mode.Table) (cms : Array Mode) (d sl dims : Nat)
+    (stmts : Array CoreStmt) (wantValue : Bool) : Bool := Id.run do
+  let vp := voidPositions stmts wantValue
+  for i in [0:stmts.size] do
+    let bad := match stmts[i]! with
+      | .decl _ _ init => urowEscapes tab cms d sl dims init
+      | .unit e => if vp[i]! == true then urowEscapesV tab cms d sl dims e else urowEscapes tab cms d sl dims e
+      | .label _ | .exit => false
+    if bad then return true
+  return false
+end
+
+/-- The selector of a conformity clause that is an element of a promoted row of unions. -/
+def unionRowSel (env : List Frame) (sel : Core) : Option (RowVar × List CoreIdx) :=
+  match strip sel with
+  | .deref e =>
+    match strip e with
+    | .slice base idx true =>
+      match strip base with
+      | .refCell d s =>
+        match rowOf env d s with
+        | some rv => if rv.umodes.isEmpty || idx.length != rv.dims then none else some (rv, idx)
+        | none => none
+      | _ => none
+    | _ => none
+  | _ => none
+
 /-- Is this an assigning operator, whose left operand is a name it writes through? -/
 def isAssignOpName (op : String) : Bool :=
   ["+:=", "-:=", "*:=", "/:=", "%:=", "%*:=", "&:=", "|:="].contains op
@@ -1186,7 +1346,16 @@ def planFrame (tag : Nat) (size : Nat) (slotModes : Array (Option Mode))
             rows := rows.push none; all := false
           else
             rows := rows.push (some { name := s!"r{tag}_{i}", ty := tys[0]!, dims := dims, fields := tys })
-        | _, _ => rows := rows.push none; all := false
+        | _, _ =>
+          -- a fixed row of a union of primitive modes can be a tag array and a payload array
+          match (slotModes[i]?.join).bind (rowUnionTy tab), rowDecl stmts i with
+          | some (dims, cms, tys), some bs =>
+            if bs.length != dims || seenElsewhere i
+                || urowEscapesStmts tab cms 0 i dims stmts wantValue then
+              rows := rows.push none; all := false
+            else
+              rows := rows.push (some { name := s!"r{tag}_{i}", ty := .i64, dims := dims, umodes := cms, utys := tys })
+          | _, _ => rows := rows.push none; all := false
   return { vars := vars, rows := rows, pushed := others || !all }
 
 def env : M (List Frame) := do return (← get).frames
@@ -1369,7 +1538,9 @@ partial def genRowDecl (rv : RowVar) (init : Core) : M Unit := do
     let r := rv.name
     let n0 := s!"({r}_u0 >= {r}_l0 ? {r}_u0 - {r}_l0 + 1 : 0)"
     let n := if rv.dims == 2 then s!"{n0} * ({r}_u1 >= {r}_l1 ? {r}_u1 - {r}_l1 + 1 : 0)" else n0
-    if rv.fields.isEmpty then
+    if !rv.umodes.isEmpty then
+      emit s!"{r}_p = (a68_uv*) a68_row_alloc((size_t)({n}), sizeof(a68_uv)); {r}_d = (uint8_t*) a68_row_alloc((size_t)({n}), 1);"
+    else if rv.fields.isEmpty then
       emit s!"{r}_p = ({rv.ty.name}*) a68_row_alloc((size_t)({n}), sizeof({rv.ty.name})); {r}_d = (uint8_t*) a68_row_alloc((size_t)({n}), 1);"
     else
       for fk in [0:rv.fields.size] do
@@ -1388,7 +1559,13 @@ partial def dynCall (sg : NatSig) (f : Core) (args : List Core) (dest : Option S
     let rtyName := match sg.rty with | some t => t.name | none => "void"
     let plist := if sg.ptys.isEmpty then "void" else ", ".intercalate (sg.ptys.toList.map CTy.name)
     let ptrTy := rtyName ++ " (*)(" ++ plist ++ ")"
-    emit s!"void* f{k} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({← rtd d}, {s}, W))];"
+    let ev ← env
+    match (ev[d]?).bind (fun fr => (fr.pcache[s]?).join) with
+    | some pc =>
+      let dd ← rtd d
+      emit s!"if (__builtin_expect({pc} == (void*) 1, 0)) {pc} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({dd}, {s}, W))];"
+      emit s!"void* f{k} = {pc};"
+    | none => emit s!"void* f{k} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({← rtd d}, {s}, W))];"
     emit ("if (f" ++ toString k ++ ") {")
     indent do
       let as ← natArgs sg.ptys args
@@ -1482,7 +1659,7 @@ partial def genNative (k : Nat) (sg : NatSig) (body : Core) (outer : List Frame)
     vars := (List.range sg.ptys.size).toArray.map fun i => some (s!"a{k}_{i}", sg.ptys[i]!, false),
     pushed := false }
   let ret := match sg.rty with | some _ => "return 0;" | none => "return;"
-  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := pf :: outer, ret := ret }
+  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := pf :: outer.map (fun f => { f with pcache := #[] }), ret := ret }
   match sg.rty with
   | some t =>
     emit s!"{t.name} rv{k} = 0;"
@@ -1504,7 +1681,7 @@ partial def gen (c : Core) : M Unit := do
     | .refCell d sl =>
       match rowOf (← env) d sl with
       | some rv =>
-        if !rv.fields.isEmpty then pure () else
+        if !rv.fields.isEmpty || !rv.umodes.isEmpty then pure () else
         let o ← rowOffset rv idx
         emit s!"a68_v({rv.ty.pushFn}(({rv.name}_d[{o}] ? {rv.name}_p[{o}] : {rv.ty.undefFn}()), W));"
         return
@@ -1568,6 +1745,17 @@ partial def genInto (ty : CTy) (v : String) (c : Core) : M Unit := do
       emit ("if (!" ++ v ++ ") {")
       indent (genInto ty v r)
       emit "}"
+  | .caseInt sel alts out =>
+    genCaseHead sel alts.length
+    let mut k := 1
+    for a in alts do
+      emit ("case " ++ toString k ++ ": {")
+      indent (genInto ty v a)
+      emit "} break;"
+      k := k + 1
+    emit "default: {"
+    indent (genInto ty v out)
+    emit "} }"
   | c' => genFallbackInto ty v c'
 
 partial def genFallbackInto (ty : CTy) (v : String) (c : Core) : M Unit := do
@@ -1610,6 +1798,20 @@ partial def genVoid (c : Core) : M Unit := do
     emit "}"
   | .block size stmts lb nl => genBlockAt size stmts lb nl false
   | .loop slot f b t w body => genLoopAt slot f b t w body false
+  | .caseConf sel alts out =>
+    if (unionRowSel (← env) sel).isSome then genConformity sel alts out false
+    else do gen c; emit "a68_v(a68rt_pop(W));"
+  | .caseInt sel alts out =>
+    genCaseHead sel alts.length
+    let mut k := 1
+    for a in alts do
+      emit ("case " ++ toString k ++ ": {")
+      indent (genVoid a)
+      emit "} break;"
+      k := k + 1
+    emit "default: {"
+    indent (genVoid out)
+    emit "} }"
   | .goto l => genNode (.goto l)
   | .stop => emit "a68_v(a68rt_stop(W));"
   | .call f args =>
@@ -1642,7 +1844,7 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : M Bool := d
     match strip base with
     | .refCell dd ss =>
       if let some rv := rowOf (← env) dd ss then
-        if !rv.fields.isEmpty || !assignsNatively rv.ty op then return false
+        if !rv.fields.isEmpty || !rv.umodes.isEmpty || !assignsNatively rv.ty op then return false
         let o ← rowOffset rv idx
         let rs ← rowValue rv.ty r
         let cur := s!"({rv.name}_d[{o}] ? {rv.name}_p[{o}] : {rv.ty.undefFn}())"
@@ -1733,6 +1935,13 @@ partial def storeScalar (dst src : Core) : M Bool := do
         if hasNatCall ev src && natOk ev ty.toMode src then
           let e ← anf ty.toMode src
           emit s!"{v} = {e};{setFlag}"
+        else if isChoice src then do
+          -- into a temporary first: until the clause has its value, its units still read the
+          -- variable's old value
+          let k ← fresh
+          emit s!"{ty.name} w{k} = 0;"
+          genInto ty s!"w{k}" src
+          emit s!"{v} = w{k};{setFlag}"
         else do gen src; emit s!"{v} = {ty.popFn}();{setFlag}"
       return true
     | none =>
@@ -1761,7 +1970,9 @@ partial def storeScalar (dst src : Core) : M Bool := do
       if let some rv := rowOf (← env) dd ss then
         -- a promoted row: subscripts and bounds first, then the value, as the evaluator does
         let o ← rowOffset rv idx
-        if rv.fields.isEmpty then
+        if !rv.umodes.isEmpty then
+          genUnionStore rv o src
+        else if rv.fields.isEmpty then
           let v ← rowValue rv.ty src
           emit s!"{rv.name}_p[{o}] = {v}; {rv.name}_d[{o}] = 1;"
         else
@@ -1903,8 +2114,7 @@ partial def genNode (c : Core) : M Unit := do
     indent (gen e)
     emit "}"
   | .caseInt sel alts out =>
-    gen sel
-    emit ("switch (a68_case(" ++ toString alts.length ++ ")) {")
+    genCaseHead sel alts.length
     let mut k := 1
     for a in alts do
       emit ("case " ++ toString k ++ ": {")
@@ -1951,6 +2161,9 @@ partial def genLit (v : Value) : M Unit := do
   | .void => emit "a68_v(a68rt_push_void(W));"
   | .nil => emit "a68_v(a68rt_push_nil(W));"
   | .undef => emit "a68_v(a68rt_push_undef(W));"
+  | .union m .undef =>
+    emit "a68_v(a68rt_push_undef(W));"
+    emit s!"a68_v(a68rt_unite({← putMode m}, W));"
   | .builtin n => emit s!"a68_v(a68rt_push_builtin({← putStr n}, W));"
   | .file id => emit s!"a68_v(a68rt_push_file({id}, W));"
   | .row _ _ es =>
@@ -2039,7 +2252,8 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
     for i in [0:size] do
       match fr.rows[i]? with
       | some (some rv) =>
-        emit s!"int64_t {rv.name}_l0 = 1, {rv.name}_u0 = 0, {rv.name}_l1 = 1, {rv.name}_u1 = 0; {rv.ty.name} *{rv.name}_p = NULL; uint8_t *{rv.name}_d = NULL;"
+        let pty := if rv.umodes.isEmpty then rv.ty.name else "a68_uv"
+        emit s!"int64_t {rv.name}_l0 = 1, {rv.name}_u0 = 0, {rv.name}_l1 = 1, {rv.name}_u1 = 0; {pty} *{rv.name}_p = NULL; uint8_t *{rv.name}_d = NULL;"
         for k in [0:rv.fields.size] do
           emit s!"{(rv.fields[k]!).name} *{rv.name}_p{k} = NULL; uint8_t *{rv.name}_d{k} = NULL;"
       | _ => pure ()
@@ -2120,7 +2334,14 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
 partial def genBlock (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels : Nat) : M Unit :=
   genBlockAt size stmts labelBase nLabels true
 
-partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)) (out : Core) : M Unit := do
+partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)) (out : Core)
+    (wantValue : Bool := true) : M Unit := do
+  if let some (rv, idx) := unionRowSel (← env) sel then
+    match sel with
+    | .at p _ => emit s!"a68_line({p.line});"
+    | _ => pure ()
+    genUnionConformity rv idx alts out wantValue
+    return
   gen sel
   let n ← fresh
   emit s!"int done{n} = 0;"
@@ -2146,6 +2367,96 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
     gen out
     emit "a68_v(a68rt_nip(W));"
   emit "}"
+
+/-- The head of the `switch` of an integer case clause.  A selector with a native value is
+    switched on directly, and a value outside `1..n` falls to `default`, which is the
+    alternative the runtime's case index would have chosen. -/
+partial def genCaseHead (sel : Core) (n : Nat) : M Unit := do
+  match scalarExpr (← env) (.int 0) sel with
+  | some se => emit ("switch (" ++ se ++ ") {")
+  | none => do gen sel; emit ("switch (a68_case(" ++ toString n ++ ")) {")
+
+/-- A conformity clause on an element of a row of unions kept as C arrays: a `switch` on the
+    element's tag.  The element is subscripted and checked against the bounds first, since
+    the evaluator dereferences it before it looks at any alternative.  Tag zero, an element
+    never given a value or given `SKIP`, takes no alternative.  The first alternative naming a
+    constituent takes it, and the value it binds is a C variable unless something needs a
+    cell for it. -/
+partial def genUnionConformity (rv : RowVar) (idx : List CoreIdx) (alts : List (Mode × Option Nat × Core))
+    (out : Core) (wantValue : Bool) : M Unit := do
+  let tab := (← get).modeTab
+  let o ← rowOffset rv idx
+  let n ← fresh
+  let r := rv.name
+  emit s!"uint8_t t{n} = {r}_d[{o}];"
+  emit ("switch (t" ++ toString n ++ ") {")
+  let mut taken : Array Bool := Array.replicate rv.umodes.size false
+  for (m, slot, body) in alts do
+    let some k := unionTag tab rv.umodes m | continue
+    if taken[k]! then continue
+    taken := taken.set! k true
+    let t := rv.utys[k]!
+    let payload := s!"(({t.name}) {r}_p[{o}].{t.uvField})"
+    emit ("case " ++ toString (k + 1) ++ ": {")
+    indent do
+      if !hasOtherFn body && (slot.isNone || !slotEscapes (assignsNatively t) 0 0 body) then
+        -- nothing reaches the alternative's frame through the run-time environment
+        let vars : Array (Option (String × CTy × Bool)) :=
+          if slot.isSome then #[some (s!"c{n}_{k}", t, false)] else #[]
+        if slot.isSome then emit s!"{t.name} c{n}_{k} = {payload};"
+        modify fun st => { st with frames := { vars := vars, pushed := false } :: st.frames }
+        if wantValue then gen body else genVoid body
+        modify fun st => { st with frames := st.frames.tail }
+      else
+        if slot.isSome then
+          emit s!"a68_v({t.pushFn}({payload}, W));"
+          emit "a68_v(a68rt_enter(1, W));"
+          emit "a68_v(a68rt_bind_cell(0, 0, W));"
+        else emit "a68_v(a68rt_enter(0, W));"
+        modify fun st => { st with frames := { vars := #[none], pushed := true } :: st.frames }
+        if wantValue then gen body else genVoid body
+        modify fun st => { st with frames := st.frames.tail }
+        emit "a68_v(a68rt_leave(W));"
+    emit "} break;"
+  emit "default: {"
+  indent (if wantValue then gen out else genVoid out)
+  emit "} }"
+
+/-- Store a source `unionSrcOk` accepts into an element of a row of unions kept as C arrays:
+    along each branch of the clauses that choose it, the constituent's tag and the value. -/
+partial def genUnionStore (rv : RowVar) (o : String) (src : Core) : M Unit := do
+  let tab := (← get).modeTab
+  match src with
+  | .at p e => emit s!"a68_line({p.line});"; genUnionStore rv o e
+  | .seq a b => genVoid a; genUnionStore rv o b
+  | .skip _ => emit s!"{rv.name}_d[{o}] = 0;"
+  | .unite m e =>
+    match unionTag tab rv.umodes m with
+    | some k =>
+      let t := rv.utys[k]!
+      let v ← rowValue t e
+      emit s!"{rv.name}_p[{o}].{t.uvField} = {v}; {rv.name}_d[{o}] = {k + 1};"
+    | none => pure ()
+  | .cond c t e =>
+    match scalarExpr (← env) .bool c with
+    | some ce => emit ("if (" ++ ce ++ ") {")
+    | none => do gen c; emit "if (a68_bool()) {"
+    indent (genUnionStore rv o t)
+    emit "} else {"
+    indent (genUnionStore rv o e)
+    emit "}"
+  | .caseInt sel alts out =>
+    genCaseHead sel alts.length
+    let mut i := 1
+    for a in alts do
+      emit ("case " ++ toString i ++ ": {")
+      indent (genUnionStore rv o a)
+      emit "} break;"
+      i := i + 1
+    emit "default: {"
+    indent (genUnionStore rv o out)
+    emit "} }"
+  | _ => pure ()
 
 partial def genLoopAt (slot : Option Nat) (f b : Core) (t : Option Core) (w : Option Core)
     (body : Core) (wantValue : Bool) : M Unit := do
@@ -2224,7 +2535,18 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;", procMode := none }
   if reclaim then emit "uint32_t a68_hm = a68_u32(a68rt_heap_mark(W));"
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
-  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pushed := true }] }
+  -- A parameter is an identity, so the routine a procedure parameter holds cannot change
+  -- during the call: the plain entry point is looked up at the first call through it and
+  -- kept for the rest of this invocation.  `(void*) 1` is not yet looked up.
+  let pcache : Array (Option String) := (Array.range frameSize).map fun i =>
+    if i < nparams then
+      match pmodes[i]?.join with
+      | some (.proc _ _) => some s!"a68_pc{i}"
+      | _ => none
+    else none
+  for pc in pcache do
+    if let some v := pc then emit s!"void* {v} = (void*) 1;"
+  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pcache := pcache, pushed := true }] }
   gen body
   emit "a68_v(a68rt_leave(W));"
   if reclaim then emit "a68_v(a68rt_heap_release(a68_hm, W));"
@@ -2518,6 +2840,8 @@ static inline size_t a68_ao2(int64_t l0, int64_t u0, int64_t l1, int64_t u1, int
   if (__builtin_expect(j < l1 || j > u1, 0)) a68_index_error(j, l1, u1);
   return (size_t)((i - l0) * (u1 - l1 + 1) + (j - l1));
 }
+/* the value of an element of a row of unions; its tag says which member holds it */
+typedef union { int64_t i; double r; uint64_t u; } a68_uv;
 static void* a68_row_alloc(size_t n, size_t sz) {
   void* p = calloc(n ? n : 1, sz);
   if (!p) exit(1);
