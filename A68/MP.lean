@@ -189,9 +189,11 @@ def truncDiv (x y : Int) : Int :=
     1.4·10⁻⁷.  When the plain quotient is further than 10⁻⁶ from every integer, both
     therefore truncate to the same integer; otherwise the exact computation decides. -/
 def qDigit (tm1 t0 t1 t2 den : Int) (denF : Float) : Int :=
-  let lim : Int := 4503599627370496   -- 2⁵²
-  if tm1.natAbs < lim.natAbs && t0.natAbs < lim.natAbs && t1.natAbs < lim.natAbs
-      && t2.natAbs < lim.natAbs && denF > 0.0 then
+  -- 2⁵² as a `Nat` literal: an `Int` literal this large is rebuilt from its digits on
+  -- every call, while a `Nat` below 2⁶³ is an unboxed scalar
+  let lim : Nat := 4503599627370496
+  if tm1.natAbs < lim && t0.natAbs < lim && t1.natAbs < lim
+      && t2.natAbs < lim && denF > 0.0 then
     let rF : Float := 10000000.0
     let nomF := ((Float.ofInt tm1 * rF + Float.ofInt t0) * rF + Float.ofInt t1) * rF + Float.ofInt t2
     let qF := nomF / denF
@@ -499,9 +501,9 @@ def mulMpDigit (z x : MP) (y : Int) (digs : Nat) : MPE MP := do
     stage that had to round is too large for the later small terms to cancel), which is
     decided by divisibility by `R` on small integers.  Otherwise the chain is evaluated. -/
 def nomZero (tm1 t0 t1 t2 : Int) : Bool :=
-  let lim : Int := 4503599627370496   -- 2⁵²
-  if tm1.natAbs < lim.natAbs && t0.natAbs < lim.natAbs && t1.natAbs < lim.natAbs
-      && t2.natAbs < lim.natAbs then
+  let lim : Nat := 4503599627370496   -- 2⁵², unboxed (see `qDigit`)
+  if tm1.natAbs < lim && t0.natAbs < lim && t1.natAbs < lim
+      && t2.natAbs < lim then
     if t2 % R != 0 then false
     else
       let s1 := t1 + t2 / R
