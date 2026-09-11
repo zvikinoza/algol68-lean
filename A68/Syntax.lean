@@ -31,6 +31,11 @@ inductive FormatItem where
   | include (f : Expr)                               -- f(format)  (a68g: user format inclusion)
   | sep                                              -- picture separator (",")
   | col                                              -- k: alignment to a column (with replicator)
+  | radix                                            -- r: radix frame of a bits pattern (with replicator)
+  | hpat (args : List Expr)                          -- h, h(a), h(a,m), h(w,a,m), h(w,a,e,m)
+  -- a68g C-style pattern %[-][+][w][.a]letter; `flags` holds the '-' and '+' given and ends
+  -- with the letter; width and after are replicators (static, or dynamic with an expression)
+  | cpat (flags : String) (width after : Option (Nat × Option Expr))
   deriving Repr, Inhabited
 
 /-- Mode syntax (declarers) as written in source. Bounds appear only in actual declarers. -/
@@ -86,6 +91,7 @@ inductive Expr where
   | loop (var : Option String) (from_ by_ to_ : Option Expr) (while_ : Option Serial)
          (body : Serial) (pos : Pos)
   | format (items : List FormatItem) (pos : Pos)
+  | vacant (pos : Pos)                                 -- omitted argument of a partial call `f (x, )`
   deriving Repr, Inhabited
 
 inductive Decl where
@@ -118,6 +124,6 @@ def Expr.pos : Expr → Pos
   | .assign _ _ p | .identity _ _ _ p | .call _ _ p | .slice _ _ p | .select _ _ p
   | .cast _ _ p | .gen _ _ p | .routine _ _ _ p | .goto _ p | .block _ p
   | .collateral _ p | .cond _ _ p | .caseInt _ _ _ p | .caseConf _ _ _ p
-  | .loop _ _ _ _ _ _ p | .format _ p => p
+  | .loop _ _ _ _ _ _ p | .format _ p | .vacant p => p
 
 end A68

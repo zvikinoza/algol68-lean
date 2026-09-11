@@ -125,12 +125,44 @@ def newLabel : Elab Nat := do
   set { s with labelCount := s.labelCount + 1 }
   return s.labelCount
 
+/-- Standard-environ names that a68g lets a program write with any number of `short` or
+    `long` words in front (`parser-taxes.c`, `is_mappable_routine`). -/
+def mappableRoutines : List String :=
+  ["arccos", "arccosdg", "arccot", "arccotdg", "arcsin", "arcsindg", "arctan", "arctandg", "beta",
+   "betainc", "cbrt", "complexarccos", "complexarccosh", "complexarcsin", "complexarcsinh",
+   "complexarctan", "complexarctanh", "complexcos", "complexcosh", "complexexp", "complexln",
+   "complexsin", "complexsinh", "complexsqrt", "complextan", "complextanh", "cos", "cosdg", "cospi",
+   "cot", "cotdg", "cotpi", "curt", "erf", "erfc", "exp", "gamma", "gammainc", "gammaincg",
+   "gammaincgf", "ln", "log", "pi", "sin", "sindg", "sinpi", "sqrt", "tan", "tandg", "tanpi",
+   "nextrandom", "random", "bitspack", "bitswidth", "byteswidth", "expwidth", "intwidth", "maxbits",
+   "maxint", "maxreal", "realwidth", "smallreal"]
+
+def dropPrefix (s pre : String) : String := String.ofList (s.toList.drop pre.length)
+
+partial def isMappable (z pre : String) : Bool :=
+  if pre != "" && z.startsWith pre then isMappable (dropPrefix z pre) pre
+  else mappableRoutines.contains z
+
 def lookup (name : String) : Elab (Option Binding) := do
   let s ← get
   for sc in s.scopes do
     match sc.names.lookup name with
     | some b => return some b
     | none => pure ()
+  -- a68g (`bind_lengthety_identifier`): an undeclared `short …`/`long …` identifier drops
+  -- its leading `short` (or `long`) words one at a time until it names a mappable routine
+  -- of the standard environ, so `long long long max int` is `long long max int` and
+  -- `short short max int` is `max int`
+  let base := s.scopes.getLast?
+  for pre in ["short", "long"] do
+    if name.startsWith pre then
+      let mut u := name
+      repeat
+        u := dropPrefix u pre
+        match base.bind (·.names.lookup u) with
+        | some b => if isMappable u pre then return some b
+        | none => pure ()
+        if !u.startsWith pre then break
   return none
 
 /-- All user operators with a given name, innermost first. -/
@@ -166,7 +198,12 @@ def widenStep : Mode → List Mode
 /-- Is `to` reachable from `from` by widening (bounded search)? -/
 partial def widenable (src dst : Mode) (fuel : Nat := 6) : Bool :=
   if fuel = 0 then false
-  else (widenStep src).any fun m => m == dst || widenable m dst (fuel - 1)
+  else (widenStep src).any fun m => m == dst || sameRow m dst || widenable m dst (fuel - 1)
+where
+  -- `BITS` and `BYTES` widen to a row whether or not the row is flexible (`STRING (bytes)`)
+  sameRow : Mode → Mode → Bool
+    | .row d _ e, .row d' _ e' => d == d' && e == e'
+    | _, _ => false
 
 /-- Dereference and deprocedure fully ("meek" coercion with unknown target). -/
 partial def meekCoerce (c : Core) (m : Mode) : Elab (Core × Mode) := do
@@ -194,6 +231,27 @@ partial def softCoerce (c : Core) (m : Mode) : Elab (Core × Mode) := do
 
 inductive Strength where | strong | firm | meek | soft
   deriving BEq, Inhabited
+
+/-- The members of a union with nested unions expanded: a68g flattens
+    `UNION (UNION (A, B), C)` to `UNION (A, B, C)`, so a united value is always tagged with
+    a mode that is not itself a union. -/
+partial def flatMembers (tb : Mode.Table) (ms : List Mode) (fuel : Nat := 16) : List Mode :=
+  ms.flatMap fun m => match Mode.resolve tb m with
+    | .union ns => if fuel = 0 then [m] else flatMembers tb ns (fuel - 1)
+    | _ => [m]
+
+/-- Unite `c`, already coerced to the member `m` of a union: a value coerced to a member
+    that is itself a union carries its own tag already and is not wrapped again. -/
+def uniteInto (tb : Mode.Table) (m : Mode) (c : Core) : Core :=
+  if Mode.isUnion tb m then c else .unite m c
+
+/-- Uniting a union value into a union that has all of its members keeps the value. -/
+def unionIncluded (tb : Mode.Table) (src : Mode) (dstMembers : List Mode) : Bool :=
+  match Mode.resolve tb src with
+  | .union ss =>
+    let dm := flatMembers tb dstMembers
+    (flatMembers tb ss).all fun s => dm.any (Mode.eqv tb s)
+  | _ => false
 
 /-- Try to coerce `c : from` to `to` with the given strength. -/
 partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12) : Elab (Option Core) := do
@@ -236,8 +294,10 @@ partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12)
     match dstR with
     | .void => return some (.voiding c)
     | .union ms =>
+      let tb ← tbl
       for m in ms do
-        if let some c' ← coerce .firm c src m (fuel - 1) then return some (.unite m c')
+        if let some c' ← coerce .firm c src m (fuel - 1) then return some (uniteInto tb m c')
+      if unionIncluded tb src ms then return some c
       return none
     | .simplout =>
       let (c', m') ← meekCoerce c src
@@ -259,6 +319,19 @@ partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12)
         else
           -- widening to a row (BITS → [] BOOL)
           if widenable srcR dstR then return some (.widen srcR dstR c) else return none
+    | .row d _ em =>
+      -- rowing into a multi-dimensional row, as a68g does: a row of `d - 1` dimensions gains
+      -- a first dimension `1:1`, and a value `M` becomes a `[1:1, …, 1:1] M`.  Both are
+      -- one-element row displays, which both back ends already build.
+      match srcR with
+      | .ref _ => return none
+      | .row k _ em' =>
+        if k + 1 == d && (← eqv em' em) then return some (.collateral [c] false d)
+        else return none
+      | _ =>
+        if let some c' ← coerce .strong c src em (fuel - 1) then
+          return some ((List.range d).foldl (fun acc k => Core.collateral [acc] false (k + 1)) c')
+        else return none
     | .ref (.row 1 _ em) =>
       match srcR with
       | .ref x => if (← eqv x em) then return some (.rowOf c) else return none
@@ -268,8 +341,10 @@ partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12)
   | .firm =>
     match dstR with
     | .union ms =>
+      let tb ← tbl
       for m in ms do
-        if let some c' ← coerce .firm c src m (fuel - 1) then return some (.unite m c')
+        if let some c' ← coerce .firm c src m (fuel - 1) then return some (uniteInto tb m c')
+      if unionIncluded tb src ms then return some c
       return none
     | _ => return none
   | _ => return none
@@ -400,6 +475,10 @@ def builtinDyadic (op : String) (l : Core) (ml : Mode) (r : Core) (mr : Mode) : 
     return some (.dyop op (.int 0) mr l r, .int 0)
   | "=", .row _ _ _, .row _ _ _ | "/=", .row _ _ _, .row _ _ _ =>
     return some (.dyop op ml mr l r, .bool)
+  | "ELEM", .int _, .bytes a => return some (.dyop "ELEM" (.int 0) (.bytes a) l r, .char)
+  | "=", .bytes a, .bytes b | "/=", .bytes a, .bytes b | "<", .bytes a, .bytes b
+  | "<=", .bytes a, .bytes b | ">", .bytes a, .bytes b | ">=", .bytes a, .bytes b =>
+    if a == b then return some (.dyop op (.bytes a) (.bytes b) l r, .bool) else return none
   | _, _, _ => return none
 
 /-- Resolve a builtin monadic operator on a meek-coerced operand. -/
@@ -432,6 +511,10 @@ def builtinMonadic (op : String) (e : Core) (m : Mode) : Elab (Option (Core × M
   | "CONJ", .compl _ => return some (.monop "CONJ" m e, m)
   | "LWB", .row _ _ _ | "UPB", .row _ _ _ => return some (.monop op m e, .int 0)
   | "ELEMS", .row _ _ _ => return some (.monop op m e, .int 0)
+  -- a SEMA is a name of an INT (a68g: `MODE SEMA = STRUCT (REF INT F)`): `LEVEL n` makes
+  -- one holding `n`, and `LEVEL s` reads its level
+  | "LEVEL", .int 0 => return some (.gen e, .sema)
+  | "LEVEL", .sema => return some (.deref e, .int 0)
   | _, _ =>
     let _ := tb
     return none
@@ -463,6 +546,13 @@ def constValue (name : String) (ll : Nat := Numfmt.defaultLLDigits) (fileName : 
   | "nullcharacter" | "nullchar" => .char 0 | "blank" => .char 32 | "flip" => .char 84 | "flop" => .char 70
   | "maxbits" => .bits 4294967295 | "bitsshorths" => .int 1
   | "errorchar" => .char 42
+  | "bytesshorths" => .int 1 | "longbyteswidth" => .int 256 | "standerrorchannel" => .int 2
+  | "blankcharacter" | "blankchar" => .char 32
+  | "formfeedcharacter" | "formfeedchar" => .char 12
+  | "newlinecharacter" | "newlinechar" => .char 10
+  | "tabcharacter" | "tabchar" => .char 9
+  | "eofcharacter" | "eofchar" => .char 255   -- a68g's EOF_CHAR is C's EOF, -1, as a char
+  | "expchar" => .char 101
   | "standout" => .file 0 | "standin" => .file 1 | "standerror" => .file 2 | "standback" => .file 3
   | "standoutchannel" => .int 0 | "standinchannel" => .int 1 | "standbackchannel" => .int 3
   | "nil" => .nil
@@ -488,6 +578,32 @@ def routineMode (e : Expr) : Elab Mode := do
     | some b => return b.mode
     | none => err s!"identifier {n} has not been declared"
   | _ => err "routine text expected"
+
+/-- The names a call of `evaluate` can see, passed to it as a format text.  For each name
+    there is a literal holding its kind (`v` variable, `i` identity, `o` operator) and the
+    name, then a general pattern holding a name of its cell, united with the mode of that
+    name.  The evaluator reaches the cells through the environment a format value
+    captures, and a compiled program keeps a cell for every slot a format text names, so
+    the text given to `evaluate` sees the objects of its caller in both. -/
+def evaluateScope : Elab Core := do
+  let s ← get
+  let d ← depth
+  let mut seen : List String := []
+  let mut items : List CoreFmt := []
+  let capture (tag : String) (m : Mode) (dp sl : Nat) : List CoreFmt :=
+    [.literal tag, .general [.unite (.ref m) (.refCell (d - 1 - dp) sl)]]
+  for sc in s.scopes do
+    for (n, b) in sc.names do
+      if b.depth != 0 && !seen.contains n then
+        seen := n :: seen
+        match b.kind with
+        | .var => items := items ++ capture ("v" ++ n) (match b.mode with | .ref m => m | m => m) b.depth b.slot
+        | .ident => items := items ++ capture ("i" ++ n) b.mode b.depth b.slot
+        | _ => pure ()
+  -- operators in the order `lookupOps` finds them
+  for ob in s.scopes.foldr (fun sc acc => acc ++ sc.ops.filter (·.depth != 0)) [] do
+    items := items ++ capture ("o" ++ ob.name) ob.mode ob.depth ob.slot
+  return .fmt items
 
 mutual
 
@@ -757,9 +873,10 @@ partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
 /-- A priori elaboration of context-free constructs. -/
 partial def elabPrimary (e : Expr) : Elab (Core × Mode) := do
   match e with
-  | .intLit v long _ => return (.lit (.int v), .int long)
-  | .realLit t long _ => return (.lit (.real (Numfmt.parseFloat t)), .real long)
-  | .bitsLit r d long _ => return (.lit (.bits (bitsValue r d)), .bits long)
+  -- a68g: SHORT modes are the base modes, so `SHORT SHORT 5` is an INT (as `Mode.ofSyn`)
+  | .intLit v long _ => return (.lit (.int v), .int (max long 0))
+  | .realLit t long _ => return (.lit (.real (Numfmt.parseFloat t)), .real (max long 0))
+  | .bitsLit r d long _ => return (.lit (.bits (bitsValue r d)), .bits (max long 0))
   | .strLit s _ =>
     if s.length == 1 then return (.lit (.char s.front.toNat), .char)
     else return (.lit (Value.ofString s), .string)
@@ -782,6 +899,7 @@ partial def elabPrimary (e : Expr) : Elab (Core × Mode) := do
   | .format items _ =>
     let cs ← items.mapM elabFormatItem
     return (.fmt cs, .format)
+  | .vacant _ => err "an argument may only be omitted in the actual parameters of a call"
   | _ =>
     -- context-sensitive constructs reached without a context: use firm
     elabUnit e .firm
@@ -809,6 +927,17 @@ partial def elabFormatItem (it : FormatItem) : Elab CoreFmt := do
   | .include f => return .include (← (·.1) <$> elabUnit f (.meek .format))
   | .sep => return .sep
   | .col => return .col
+  | .radix => return .radix
+  | .hpat args =>
+    let cs ← args.mapM fun a => (·.1) <$> elabUnit a (.meek (.int 0))
+    return .group [.hmark, .general cs]
+  | .cpat flags w a =>
+    let repl (r : Option (Nat × Option Expr)) (marker : CoreFmt) : Elab (List CoreFmt) := do
+      match r with
+      | none => return []
+      | some (n, none) => return [.rep n none marker]
+      | some (n, some e) => return [.rep n (some ((← elabUnit e (.meek (.int 0))).1)) marker]
+    return .group ([.cpat flags] ++ (← repl w .cwidth) ++ (← repl a .cafter))
 
 partial def elabRoutine (params : List (ModeSyn × String)) (ret : ModeSyn) (body : Expr) : Elab (Core × Mode) := do
   pushScope
@@ -867,12 +996,57 @@ partial def elabCall (f : Expr) (args : List Expr) : Elab (Core × Mode) := do
   | .proc ps r =>
     if ps.length != args.length then
       err s!"procedure expects {ps.length} arguments, {args.length} given"
+    if args.any (fun a => match a with | .vacant _ => true | _ => false) then
+      return ← elabPartialCall f args ps r
     let mut cs : List Core := []
     for (a, p) in args.zip ps do
       let (c, _) ← elabUnit a (.strong p)
       cs := cs ++ [c]
+    -- `evaluate` elaborates its text in the environment of the call
+    if let .lit (.builtin "evaluate") := fc then cs := cs ++ [← evaluateScope]
     return (.call fc cs, r)
   | _ => err s!"call of a non-procedure of mode {fm}"
+
+/-- Partial parametrisation (a68g implements Lindsey's proposal): `f (a, , c)` with
+    `f : PROC (A, B, C) R` yields a `PROC (B) R`.  The procedure and the arguments that are
+    given are evaluated at the call, in that order, and kept; the omitted ones become the
+    parameters of the new procedure, in their original order.  This is elaborated as a
+    block whose frame holds those values and which yields a routine text over the omitted
+    parameters:
+
+        ( PROC (A, B, C) R p = f; A a = …; C c = …; (B b) R: p (a, b, c) )
+
+    so both back ends need nothing new.  A partial call of a partial procedure composes. -/
+partial def elabPartialCall (f : Expr) (args : List Expr) (ps : List Mode) (r : Mode) : Elab (Core × Mode) := do
+  pushScope
+  let (fc, fm) ← elabUnit f .meekAny
+  let fSlot ← newSlot
+  let mut stmts : List CoreStmt := [.decl fSlot fm fc]
+  let mut given : List (Option Nat) := []    -- the slot holding each given argument
+  let mut missing : List Mode := []
+  for (a, p) in args.zip ps do
+    match a with
+    | .vacant _ =>
+      given := given ++ [none]
+      missing := missing ++ [p]
+    | _ =>
+      let (c, _) ← elabUnit a (.strong p)
+      let s ← newSlot
+      stmts := stmts ++ [.decl s p (.at a.pos c)]
+      given := given ++ [some s]
+  let mut k := 0
+  let mut callArgs : List Core := []
+  for g in given do
+    match g with
+    | some s => callArgs := callArgs ++ [.loadCell 1 s]
+    | none =>
+      callArgs := callArgs ++ [.loadCell 0 k]
+      k := k + 1
+  let body := Core.call (.loadCell 1 fSlot) callArgs
+  let routine := Core.routine missing.length missing.length body
+  let sc ← popScope
+  let labelBase := (← get).labelCount
+  return (.block sc.size (stmts ++ [CoreStmt.unit routine]).toArray labelBase 0, .proc missing r)
 
 partial def elabSlice (arr : Expr) (idx : List Indexer) : Elab (Core × Mode) := do
   let (ac, am) ← elabUnit arr .weak
@@ -1114,9 +1288,15 @@ partial def elabCaseConfBody (sc : Core) (alts : List (ModeSyn × Option String 
   | oc :: revAlts =>
     let altCores := revAlts.reverse
     let mut coreAlts : List (Mode × Option Nat × Core) := []
+    let tb ← tbl
     for (a, c) in alts.zip altCores do
       let (msyn, name, _) := a
-      coreAlts := coreAlts ++ [(modeOf msyn, if name.isSome then some 0 else none, c)]
+      -- a united value is tagged with a mode that is not a union, so an alternative whose
+      -- mode is a union with unions among its members is tested against all of them
+      let am := match Mode.resolve tb (modeOf msyn) with
+        | .union ns => if ns.any (Mode.isUnion tb) then Mode.union (flatMembers tb ns) else modeOf msyn
+        | _ => modeOf msyn
+      coreAlts := coreAlts ++ [(am, if name.isSome then some 0 else none, c)]
     return (.caseConf sc coreAlts oc, m)
   | _ => err "internal: conformity case"
 
@@ -1209,6 +1389,23 @@ def elabProgramWithModes (s : Serial) (ll : Nat := Numfmt.defaultLLDigits) (file
   let st : ElabState := { scopes := [base], llDigits := ll }
   match (elabSerial s (.strong .void)).run st with
   | .ok ((c, _), st') => .ok (c, st'.modes)
+  | .error e => .error e
+
+/-- Elaborate the text given to `evaluate`: the standard prelude, then one scope holding the
+    names the call could see (`evaluateScope`), whose cells the evaluator supplies as the
+    frame below the text's own.  Its labels are numbered far from the program's. -/
+def elabEvaluate (s : Serial) (names : List (String × Binding)) (ops : List OpBinding)
+    (modes : Mode.Table) (ll : Nat) : Except ElabError (Core × Mode) :=
+  let base : Scope := {
+    names := (Builtins.consts.map fun (n, m) =>
+                (n, { mode := m, depth := 0, slot := 0, kind := .builtinConst (constValue n ll "") }))
+             ++ (Builtins.procs.map fun (n, m) =>
+                (n, { mode := m, depth := 0, slot := 0, kind := .builtinProc n })),
+    ops := [], size := 0 }
+  let captured : Scope := { names := names, ops := ops, size := names.length + ops.length }
+  let st : ElabState := { scopes := [captured, base], modes := modes, llDigits := ll, labelCount := 1000000000 }
+  match (elabSerial s .meekAny).run st with
+  | .ok ((c, m), _) => .ok (c, m)
   | .error e => .error e
 
 end Elab

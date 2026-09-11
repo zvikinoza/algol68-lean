@@ -108,6 +108,7 @@ partial def fmtItem (n : Nat) : CoreFmt → String
   | .group items => s!"({" ".intercalate (items.map (fmtItem n))})"
   | .include f => s!"f({core n f})"
   | .sep => "," | .col => "k"
+  | .radix => "r" | .hmark => "h" | .cpat s => "%" ++ s | .cwidth => "<w>" | .cafter => "<a>"
 end
 
 /-- Render a whole program. -/

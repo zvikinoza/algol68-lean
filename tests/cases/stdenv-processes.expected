@@ -1,0 +1,11 @@
+before from system
+status         +0
+exit status       +768
+child
+pipe: through a pipe
+output: captured
+status         +2
+parent after child         +0
+pipe: through a pipe
+output: captured
+status         +2

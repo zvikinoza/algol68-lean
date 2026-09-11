@@ -135,6 +135,11 @@ partial def putFmt (w : Writer) : CoreFmt → Nat × Writer
   | .include f => let (i, w) := putFmtCore w f; w.add s!"f incl {i}"
   | .sep => w.add "f sep"
   | .col => w.add "f col"
+  | .radix => w.add "f radix"
+  | .hmark => w.add "f hmark"
+  | .cpat s => let (i, w) := w.str s; w.add s!"f cpat {i}"
+  | .cwidth => w.add "f cwidth"
+  | .cafter => w.add "f cafter"
 
 /-- Serialise a format text (a list of items) as one entry. -/
 def putFmtList (w : Writer) (items : List CoreFmt) : Nat × Writer :=
@@ -229,6 +234,8 @@ def parse (blob : String) : Reader := Id.run do
           .group ((List.range n).map fun k => r.fmts[field fs (3 + k)]!)
         | "incl" => .include r.cores[field fs 2]!
         | "col" => .col
+        | "radix" => .radix | "hmark" => .hmark | "cwidth" => .cwidth | "cafter" => .cafter
+        | "cpat" => .cpat r.strs[field fs 2]!
         | _ => .sep
     else if kind == "n" then
       r := { r with decls := r.decls.push (r.strs[field fs 1]!, r.modes[field fs 2]!) }

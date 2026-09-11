@@ -1,0 +1,6 @@
+BEGIN # a68g rejects a declaration after a labelled unit in the same serial clause #
+   print (("before", newline));
+   again: print (("labelled", newline));
+   INT x = 2;
+   print (x)
+END

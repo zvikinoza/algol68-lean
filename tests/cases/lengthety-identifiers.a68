@@ -1,0 +1,6 @@
+# a68g maps an undeclared short/long identifier onto a standard routine or constant #
+print ((short short max int, newline));
+print ((short short short max int, newline));
+print ((long long long max int, newline));
+print ((short short int width, short bits width, newline));
+print ((fixed (short short sqrt (2.25), 0, 2), fixed (short pi, 0, 4), newline))

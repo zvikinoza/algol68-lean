@@ -73,6 +73,13 @@ inductive CoreFmt where
   | include (f : Core)
   | sep
   | col
+  -- The items below carry no `Core` of their own, so that every traversal of format
+  -- texts (shifting, substitution, compilation into holes) needs no case for them; the
+  -- expressions they depend on sit in the `rep` and `general` items they are grouped with.
+  | radix                  -- only as `rep r dyn radix`: the radix frame `r` of a bits pattern
+  | hmark                  -- only as `group [hmark, general args]`: an `h` pattern
+  | cpat (flags : String)  -- only as `group (cpat flags :: [rep w dyn cwidth]? ++ [rep a dyn cafter]?)`
+  | cwidth | cafter        -- the width and after replicators of a C-style pattern
   deriving Inhabited, Repr
 
 inductive CoreStmt where

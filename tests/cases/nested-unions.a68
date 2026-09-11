@@ -1,0 +1,18 @@
+# a united value keeps the mode it had; unions nested in unions are flattened #
+MODE A = STRUCT (INT a, INT a2), B = STRUCT (INT b, INT b2), C = STRUCT (INT c, INT c2);
+MODE AB = UNION (A, B), ABC = UNION (AB, C);
+B bv = (2, 3);
+ABC x := bv;
+CASE x IN (AB): print ("in AB"), (C): print ("in C") OUT print ("out") ESAC;
+CASE x IN (A): print (" A"), (B): print (" B") OUT print (" out") ESAC;
+AB y = (x | (AB ab): ab | A (0, 0));
+CASE y IN (B bb): print ((" b=", b OF bb)) OUT print (" nob") ESAC;
+CASE x IN (AB ab): CASE ab IN (B bb): print ((" inner b=", b2 OF bb)) ESAC OUT print (" x") ESAC;
+print (newline);
+MODE IR = UNION (INT, REAL), IRC = UNION (IR, CHAR);
+IR ir = 2.5;
+IRC z := ir;
+CASE z IN (REAL r): print (r), (IR): print ("ir") OUT print ("out") ESAC;
+z := "c";
+CASE z IN (IR): print (" number"), (CHAR ch): print ((" char ", ch)) ESAC;
+print (newline)

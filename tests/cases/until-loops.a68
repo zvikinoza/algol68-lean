@@ -1,0 +1,19 @@
+# a68g's UNTIL part: checked after the body of every iteration #
+INT i := 0;
+DO i +:= 1; INT j = i * 2; SKIP UNTIL j > 5 OD;
+print ((i, newline));
+i := 0;
+DO UNTIL (i +:= 1; i = 3) OD;
+print ((i, newline));
+FOR k FROM 1 TO 2 DO print (k) UNTIL FALSE OD;
+print (newline);
+FOR k FROM 1 WHILE k < 10 DO print (k) UNTIL k = 3 OD;
+print (newline);
+INT n := 0;
+WHILE n < 2 DO n +:= 1 UNTIL FALSE OD;
+print ((n, newline));
+i := 0;
+DO i +:= 1 UNTIL INT t = 2; i > t OD;
+print ((i, newline));
+FOR k BY 2 WHILE INT h = k * k; h < 50 DO print (h) UNTIL h > 20 OD;
+print (newline)

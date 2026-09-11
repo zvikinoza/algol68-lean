@@ -98,7 +98,16 @@ def findBold (src : Array Char) (w : String) (i : Nat) : Nat := Id.run do
       j := j + 1
   return src.size
 
-/-- Read a tag: lower-case letters/digits/underscores with insignificant spaces. -/
+/-- White space that a68g's scanner skips inside tags and numerals (`next_char` with
+    `allow_typo`): blanks, tabs, line ends, vertical tabs and form feeds. -/
+def isTypoSpace (c : Char) : Bool :=
+  c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0b' || c == '\x0c'
+
+/-- Index of the first character at or after `i` that is not typographical white space. -/
+def skipTypo (src : Array Char) (i : Nat) : Nat := scanWhile src isTypoSpace i
+
+/-- Read a tag: lower-case letters/digits/underscores with insignificant white space
+    (a68g joins a tag across blanks and line ends: `new line`, or a tag split over lines). -/
 def scanTag (src : Array Char) (i : Nat) : String × Nat := Id.run do
   let mut j := i
   let mut out : String := ""
@@ -106,9 +115,9 @@ def scanTag (src : Array Char) (i : Nat) : String × Nat := Id.run do
     let c := charAt src j
     if isTagCont c then
       out := out.push c; j := j + 1
-    else if c == ' ' then
-      -- spaces are allowed inside a tag if followed by a tag character
-      let k := scanWhile src (· == ' ') j
+    else if isTypoSpace c then
+      -- white space is allowed inside a tag if a tag character follows
+      let k := skipTypo src j
       if k < src.size && isTagCont (charAt src k) then
         j := k
       else
@@ -117,7 +126,7 @@ def scanTag (src : Array Char) (i : Nat) : String × Nat := Id.run do
       break
   return (out, j)
 
-/-- Read a run of digits with optional embedded spaces. -/
+/-- Read a run of digits with optional embedded white space. -/
 def scanDigits (src : Array Char) (i : Nat) : String × Nat := Id.run do
   let mut j := i
   let mut out : String := ""
@@ -125,33 +134,52 @@ def scanDigits (src : Array Char) (i : Nat) : String × Nat := Id.run do
     let c := charAt src j
     if isDigit c then
       out := out.push c; j := j + 1
-    else if c == ' ' then
-      let k := scanWhile src (· == ' ') j
+    else if isTypoSpace c then
+      let k := skipTypo src j
       if k < src.size && isDigit (charAt src k) then j := k else break
     else break
   return (out, j)
 
 /-- Numeric denotation starting at `i` (a digit, or '.' followed by a digit). -/
 def scanNumber (src : Array Char) (i : Nat) : Tok × Nat := Id.run do
+  -- a68g's scanner reads the characters after a digit with `next_char (…, allow_typo)`, so
+  -- white space may separate the digits, the point, the exponent and the radix digits:
+  -- `3 . 14`, `1 e 3`, `2r 0 1 1`, `16r 44 ff` are all denotations
   let (intPart, j0) := scanDigits src i
   let mut j := j0
+  let isHex (c : Char) := isDigit c || ('a' ≤ c && c ≤ 'f')
+  let isExpChar (c : Char) := c == 'e' || c == 'E' || c == '\\'
+  -- the first character after the digits, skipping white space
+  let k0 := skipTypo src j
   -- radix denotation: 2r1010, 16rff
-  if intPart != "" && charAt src j == 'r' && (isDigit (charAt src (j+1)) || ('a' ≤ charAt src (j+1) && charAt src (j+1) ≤ 'f')) then
-    let e := scanWhile src (fun c => isDigit c || ('a' ≤ c && c ≤ 'f')) (j+1)
-    let digits := String.ofList (src.extract (j+1) e).toList
+  if intPart != "" && charAt src k0 == 'r' && isHex (charAt src (skipTypo src (k0+1))) then
+    let mut e := skipTypo src (k0+1)
+    let mut digits := ""
+    while e < src.size && isHex (charAt src e) do
+      digits := digits.push (charAt src e)
+      let e' := skipTypo src (e+1)
+      e := if e' < src.size && isHex (charAt src e') then e' else e + 1
     return (.bits intPart.toNat! digits, e)
   let mut isReal := false
   let mut text := intPart
-  if charAt src j == '.' && isDigit (charAt src (j+1)) then
-    let (frac, j2) := scanDigits src (j+1)
-    text := text ++ "." ++ frac; j := j2; isReal := true
+  -- is there an exponent at `k` (an exponent character followed by a sign or a digit)?
+  let expAt (k : Nat) : Bool :=
+    isExpChar (charAt src k) && "+-0123456789".contains (charAt src (skipTypo src (k+1)))
+  if charAt src k0 == '.' then
+    let k1 := skipTypo src (k0+1)
+    if isDigit (charAt src k1) then
+      let (frac, j2) := scanDigits src k1
+      text := text ++ "." ++ frac; j := j2; isReal := true
+    else if expAt k1 then
+      -- `1.e5`: a point followed directly by an exponent
+      text := text ++ ".0"; j := k1; isReal := true
   -- exponent
-  let ec := charAt src j
-  if (ec == 'e' || ec == 'E' || ec == '\\') then
-    let mut k := j + 1
+  let ke := skipTypo src j
+  if expAt ke then
+    let mut k := skipTypo src (ke + 1)
     let mut sign := ""
     if charAt src k == '+' || charAt src k == '-' then
-      sign := String.singleton (charAt src k); k := k + 1
+      sign := String.singleton (charAt src k); k := skipTypo src (k + 1)
     if isDigit (charAt src k) then
       let (ex, k2) := scanDigits src k
       text := text ++ "e" ++ sign ++ ex; j := k2; isReal := true
@@ -174,19 +202,58 @@ def scanString (src : Array Char) (i : Nat) : String × Nat := Id.run do
       out := out.push c; j := j + 1
   return (out, j)
 
-/-- Format text body starting after the opening `$` at `i`; strings inside may contain `$`. -/
+/-- Format text body starting after the opening `$` at `i`; returns the raw text (without the
+    outer delimiters) and the index after the closing `$`.
+
+    a68g's tokeniser is recursive (`tokenise_source`): after an `n`, `g`, `h` or `f` item an
+    opening parenthesis switches to ordinary program text until the matching closing
+    parenthesis, and in program text a `$` opens a nested format text.  So
+    `$f(c | $"a"$ | $"b"$)$` is one format whose inclusion holds two formats.  The same
+    nesting is tracked here with an explicit stack: `0` is format text, `d ≥ 1` is program
+    text at parenthesis depth `d`. -/
 def scanFormat (src : Array Char) (i : Nat) : String × Nat := Id.run do
   let mut j := i
   let mut out := ""
+  let mut stack : Array Nat := #[0]
+  let mut lastItem := false     -- the previous format token was `n`, `g`, `h` or `f`
   while j < src.size do
     let c := charAt src j
-    if c == '$' then return (out, j + 1)
+    let top := stack.back?.getD 0
     if c == '"' then
+      -- a string (format literal or string denotation); `""` is two adjacent strings/an
+      -- embedded quote, which copying character by character preserves
       out := out.push c; j := j + 1
       while j < src.size && charAt src j != '"' do
         out := out.push (charAt src j); j := j + 1
       if j < src.size then out := out.push '"'; j := j + 1
+      lastItem := false
+    else if top == 0 then
+      if c == '$' then
+        stack := stack.pop
+        if stack.isEmpty then return (out, j + 1)
+        out := out.push c; j := j + 1
+      else if c == '(' && lastItem then
+        stack := stack.push 1
+        out := out.push c; j := j + 1
+        lastItem := false
+      else
+        if !isTypoSpace c then lastItem := c == 'n' || c == 'g' || c == 'h' || c == 'f'
+        out := out.push c; j := j + 1
     else
+      if c == '$' then
+        stack := stack.push 0
+        lastItem := false
+      else if c == '#' then
+        -- a comment in program text: copy it whole
+        out := out.push c; j := j + 1
+        while j < src.size && charAt src j != '#' do
+          out := out.push (charAt src j); j := j + 1
+        if j >= src.size then return (out, j)
+      else if c == '(' || c == '[' then
+        stack := stack.set! (stack.size - 1) (top + 1)
+      else if c == ')' || c == ']' then
+        if top == 1 then stack := stack.pop
+        else stack := stack.set! (stack.size - 1) (top - 1)
       out := out.push c; j := j + 1
   return (out, j)
 
@@ -285,5 +352,76 @@ end Lexer
 /-- Tokenise a whole program. -/
 def lex (s : String) : Array Token :=
   Lexer.loop s.toList.toArray 0 { line := 1, col := 1 } #[]
+
+/-- Refinements, an a68g extension (`parser-refinement.c`).  A program may be followed by
+    refinements: after the point that ends it come definitions `name : text .`, and each
+    identifier `name` in the program, or in a refinement applied in it, is replaced by the
+    tokens of `text`.  Every refinement must be applied exactly once.
+
+    The program ends at the first point followed by an identifier and a colon; a point
+    followed by the end of the text (`END.`) means there are no refinements.  The result is
+    the substituted program tokens followed by `eof`; an error carries a message and the
+    position a68g reports it at. -/
+def applyRefinements (toks : Array Token) : Except (String × Pos) (Array Token) := Id.run do
+  let n := toks.size
+  let tokAt (k : Nat) : Tok := (toks[k]?.map (·.tok)).getD .eof
+  let isIdent (t : Tok) : Bool := match t with | .ident _ => true | _ => false
+  -- find the point that ends the program
+  let mut p := 0
+  let mut found := false
+  while p < n do
+    if tokAt p == .sym "." then
+      if tokAt (p+1) == .eof then break
+      if isIdent (tokAt (p+1)) && tokAt (p+2) == .sym ":" then
+        found := true
+        break
+    p := p + 1
+  if !found then return .ok toks
+  let mainEnd := p
+  -- the definitions: name, position, and the token range of the text
+  let mut defs : Array (String × Pos × Nat × Nat) := #[]
+  let mut q := p + 1
+  while q < n && isIdent (tokAt q) && tokAt (q+1) == .sym ":" do
+    let name := match tokAt q with | .ident s => s | _ => ""
+    let pos := toks[q]!.pos
+    let b := q + 2
+    let mut e := b
+    while e < n && tokAt e != .sym "." && tokAt e != .eof do
+      e := e + 1
+    if tokAt e != .sym "." then return .error ("invalid refinement", pos)
+    if b == e then return .error ("refinement is empty", pos)
+    if defs.any (·.1 == name) then return .error ("refinement already defined", pos)
+    defs := defs.push (name, pos, b, e)
+    q := e + 1
+  if tokAt q != .eof then
+    return .error ("invalid refinement", (toks[q]?.map (·.pos)).getD {})
+  -- substitute, innermost first; a refinement applied a second time is an error, so the
+  -- expansion is bounded by the number of refinements
+  let mut out : Array Token := #[]
+  let mut applied : Array Bool := Array.replicate defs.size false
+  let mut stack : List (Nat × Nat) := [(0, mainEnd)]
+  while !stack.isEmpty do
+    match stack with
+    | [] => pure ()
+    | (i, e) :: rest =>
+      if i >= e then
+        stack := rest
+      else
+        stack := (i + 1, e) :: rest
+        let t := toks[i]!
+        match t.tok with
+        | .ident nm =>
+          match defs.findIdx? (·.1 == nm) with
+          | some k =>
+            let (_, pos, b, e') := defs[k]!
+            if applied[k]! then return .error ("refinement is applied more than once", pos)
+            applied := applied.set! k true
+            stack := (b, e') :: stack
+          | none => out := out.push t
+        | _ => out := out.push t
+  for k in [0:defs.size] do
+    if !applied[k]! then return .error ("refinement is not applied", defs[k]!.2.1)
+  let endPos := (toks.back?.map (·.pos)).getD {}
+  return .ok (out.push { tok := .eof, pos := endPos })
 
 end A68
