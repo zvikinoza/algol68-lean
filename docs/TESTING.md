@@ -90,20 +90,27 @@ bounds), so that mismatches point at the implementation rather than at the
 generator. `fuzz/run.sh START COUNT` runs both implementations on each program
 and keeps any mismatch in `fuzz/failures/`.
 
-Result: 1,000 of 1,000 generated programs (seeds 1–1000) produce
-identical output and exit status with the final binary; a further 1,500
-programs (seeds 1001–2500) agreed with earlier builds. Fuzzing found two real defects during
-development (a missing uninitialised-value check on identity declarations and
-a generator-independent format bug), both fixed.
+Result on the final binary: 300 of 300 fresh programs (seeds 103000–103299) produce
+identical output and exit status through the evaluator, and 300 of 300 (seeds
+102000–102149 at `-O2`, 102500–102649 at `-O1`) through the C back end. Earlier
+builds agreed on seeds 1–2500. Fuzzing found real defects during development: a
+missing uninitialised-value check on identity declarations, a format bug, and, at
+seeds 9535 and 101236, a `printf` item that failed after part of it had been written,
+whose partial text a68g loses and this implementation used to keep.
 
-`fuzz/run-compiled.sh START COUNT -O1|-O2` does the same through the C back end:
-it compiles each program, runs the binary, and compares with a68g. Every change to
-the back end was fuzzed with 300 fresh programs, 150 at each level, before it was
-merged. This caught two defects. `x +:= e` with a non-trivial right operand wrote
-through a reference to a variable that had been promoted to a C variable and had
-no cell (seed 12102). And `REAL` division checked its quotient, which a68g does
-not: `exp(769.9) / 1000.0` is an infinity a68g carries on with, and only a later
-operation that checks, such as `*` or printing, reports it (seed 60083).
+`fuzz/run-compiled.sh START COUNT -O1|-O2` does the same through the C back end: it
+compiles each program, runs the binary, and compares with a68g. Every change to the
+back end was fuzzed with 300 fresh programs, 150 at each level, before it was merged.
+This caught two defects. `x +:= e` with a non-trivial right operand wrote through a
+reference to a variable that had been promoted to a C variable and had no cell (seed
+12102). And `REAL` division checked its quotient, which a68g does not: `exp(769.9) /
+1000.0` is an infinity a68g carries on with, and only a later operation that checks,
+such as `*` or printing, reports it (seed 60083).
+
+One generated program is not reproduced and is not counted as a mismatch by design:
+a string tripled 36 times exhausts a68g's fixed-size heap, which stops the program with
+*not enough memory*, while here memory grows until the system refuses it (see
+COMPATIBILITY.md).
 
 ## Reproducing
 
