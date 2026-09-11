@@ -516,6 +516,95 @@ def mpMonadic (op : String) (n : Int) (x : MP.MP) : M Value := do
     else return .mp (← liftMP (MP.shortenMp (MP.nil MP.longDigits) MP.longDigits x digs))
   | _ => rtErr s!"internal: monadic operator {op} on {Mode.toString (.real n)}"
 
+def expectLongCompl : Value → M (MP.MP × MP.MP)
+  | .struct #[.mp re, .mp im] => pure (re, im)
+  | .undef => rtErr "attempt to use an uninitialised LONG COMPLEX value"
+  | _ => rtErr "internal: LONG COMPLEX expected"
+
+/-- `LONG COMPLEX` dyadic operators (`genie_*_mp_complex`). -/
+def mpComplDyadic (op : String) (n : Int) (a b : Value) : M Value := do
+  let digs ← mpDigitsOf n
+  let (ar, ai) ← expectLongCompl a
+  let (br, bi) ← expectLongCompl b
+  let mn := Mode.toString (.compl n)
+  match op with
+  | "+" =>
+    let i ← liftMP (MP.addMp ai ai bi digs)
+    let r ← liftMP (MP.addMp ar ar br digs)
+    return .struct #[.mp r, .mp i]
+  | "-" =>
+    let i ← liftMP (MP.subMp ai ai bi digs)
+    let r ← liftMP (MP.subMp ar ar br digs)
+    return .struct #[.mp r, .mp i]
+  | "*" =>
+    let (r, i) ← liftMP (MP.cmulMp ar ai br bi digs)
+    return .struct #[.mp r, .mp i]
+  | "/" =>
+    let (r, i) ← liftMP (MP.cdivMp ar ai br bi digs)
+    if r.isNaN || i.isNaN then rtErr s!"{mn} value is not finite"
+    return .struct #[.mp r, .mp i]
+  | "=" | "/=" =>
+    let i ← liftMP (MP.subMp ai ai bi digs)
+    let r ← liftMP (MP.subMp ar ar br digs)
+    let eq := r.dig 1 == 0 && i.dig 1 == 0
+    return .bool (if op == "=" then eq else !eq)
+  | _ => rtErr s!"internal: {mn} operator {op}"
+
+/-- `LONG COMPLEX ** INT` (`genie_pow_mp_complex_int`). -/
+def mpComplPow (n : Int) (a : Value) (j : Int) : M Value := do
+  let digs ← mpDigitsOf n
+  let (rex, imx) ← expectLongCompl a
+  let mut reZ := MP.lit digs 1 0
+  let mut imZ := MP.nil digs
+  let mut reY := MP.moveMp (MP.nil digs) rex digs
+  let mut imY := MP.moveMp (MP.nil digs) imx digs
+  let mut rea := MP.nil digs
+  let mut acc := MP.nil digs
+  let jj := j.natAbs
+  let mut expo : Nat := 1
+  while expo ≤ jj do
+    if expo &&& jj != 0 then
+      acc ← liftMP (MP.mulMp acc imZ imY digs)
+      rea ← liftMP (MP.mulMp rea reZ reY digs)
+      rea ← liftMP (MP.subMp rea rea acc digs)
+      acc ← liftMP (MP.mulMp acc imZ reY digs)
+      imZ ← liftMP (MP.mulMp imZ reZ imY digs)
+      imZ ← liftMP (MP.addMp imZ imZ acc digs)
+      reZ := MP.moveMp reZ rea digs
+    acc ← liftMP (MP.mulMp acc imY imY digs)
+    rea ← liftMP (MP.mulMp rea reY reY digs)
+    rea ← liftMP (MP.subMp rea rea acc digs)
+    acc ← liftMP (MP.mulMp acc imY reY digs)
+    imY ← liftMP (MP.mulMp imY reY imY digs)
+    imY ← liftMP (MP.addMp imY imY acc digs)
+    reY := MP.moveMp reY rea digs
+    expo := expo <<< 1
+  if j < 0 then
+    return ← mpComplDyadic "/" n (.struct #[.mp (MP.lit digs 1 0), .mp (MP.nil digs)])
+      (.struct #[.mp reZ, .mp imZ])
+  return .struct #[.mp reZ, .mp imZ]
+
+/-- Monadic operators on `LONG COMPLEX`. -/
+def mpComplMonadic (op : String) (n : Int) (v : Value) : M Value := do
+  let digs ← mpDigitsOf n
+  let (re, im) ← expectLongCompl v
+  match op with
+  | "-" => return .struct #[.mp re.negate1, .mp im.negate1]
+  | "+" => return v
+  | "RE" => return .mp re
+  | "IM" => return .mp im
+  | "CONJ" => return .struct #[.mp re, .mp im.negate1]
+  | "ABS" => return .mp (← liftMP (MP.hypotMp (MP.nil digs) re im digs))
+  | "ARG" => return .mp (← runMM (MP.atan2Mp (MP.nil digs) re im digs))
+  | "SHORTEN" =>
+    if n ≤ 1 then
+      return .struct #[.real (← liftMP (MP.mpToReal re digs)), .real (← liftMP (MP.mpToReal im digs))]
+    else
+      let r ← liftMP (MP.shortenMp (MP.nil MP.longDigits) MP.longDigits re digs)
+      let i ← liftMP (MP.shortenMp (MP.nil MP.longDigits) MP.longDigits im digs)
+      return .struct #[.mp r, .mp i]
+  | _ => rtErr s!"internal: monadic operator {op} on {Mode.toString (.compl n)}"
+
 /-- The standard layout of a `LONG` / `LONG LONG REAL` in `print`: `float (x, rw + ew + 4,
     rw - 1, ew + 1)` with the widths of the length. -/
 def mpFloatStd (x : MP.MP) (n : Int) : M String := do
@@ -1263,6 +1352,10 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
       if n ≥ 1 then
         writeRef a (← mpDyadic base n (← expectMP cur) (← expectMP b))
         return a
+    | .compl n =>
+      if n ≥ 1 then
+        writeRef a (← mpComplDyadic base n cur b)
+        return a
     | _ => pure ()
     let res : Value ← match mr with
       | .int n => do
@@ -1391,7 +1484,8 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     | "**" => Value.real <$> powRealInt x y
     | "I" => return mkCompl x (Float.ofInt y)
     | _ => rtErr s!"internal: REAL/INT operator {op} ({n})"
-  | .compl _, .int _ =>
+  | .compl n, .int _ =>
+    if n ≥ 1 then return ← mpComplPow n a (← expectInt b)
     match a with
     | .struct #[.real re, .real im] =>
       let y ← expectInt b
@@ -1412,7 +1506,8 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
         p := (p.1 / den, -p.2 / den)
       return mkCompl p.1 p.2
     | _ => rtErr "internal: COMPL expected"
-  | .compl _, .compl _ =>
+  | .compl n, .compl _ =>
+    if n ≥ 1 then return ← mpComplDyadic op n a b
     match a, b with
     | .struct #[.real ar, .real ai], .struct #[.real br, .real bi] =>
       match op with
@@ -1556,6 +1651,7 @@ partial def valuesEqual (a b : Value) : M Bool := do
   match a, b with
   | .int x, .int y => return x == y
   | .real x, .real y => return x == y
+  | .mp x, .mp y => return x == y
   | .int x, .real y => return Float.ofInt x == y
   | .real x, .int y => return x == Float.ofInt y
   | .bool x, .bool y => return x == y
@@ -1586,6 +1682,9 @@ partial def monadic (op : String) (m : Mode) (v : Value) : M Value := do
       | none => rtErr s!"error in {Mode.toString (.real n)} denotation"
     if n ≥ 1 && ["-", "+", "ABS", "SIGN", "ENTIER", "ROUND", "SHORTEN"].contains op then
       return ← mpMonadic op n (← expectMP v)
+  | .compl n =>
+    if n ≥ 1 && ["-", "+", "RE", "IM", "CONJ", "ABS", "ARG", "SHORTEN"].contains op then
+      return ← mpComplMonadic op n v
   | _ => pure ()
   match op, mr with
   | "-", .int n => do let x ← expectInt v; Value.int <$> checkIntRange (-x) n

@@ -688,6 +688,57 @@ def hypotMp (z x y : MP) (digs : Nat) : MPE MP := do
     let q ← sqrtMp q q digs
     mulMp q v q digs
 
+-- ## LONG COMPLEX
+
+/-- `cmul_mp (a, b, c, d, digs)`: `(a + bi)(c + di)` at two guard digits. -/
+def cmulMp (a b c d : MP) (digs : Nat) : MPE (MP × MP) := do
+  let gdigs := digs + guards
+  let la := lenMp a digs gdigs
+  let lb := lenMp b digs gdigs
+  let lc := lenMp c digs gdigs
+  let ld := lenMp d digs gdigs
+  let ac ← mulMp (nil gdigs) la lc gdigs
+  let bd ← mulMp (nil gdigs) lb ld gdigs
+  let ad ← mulMp (nil gdigs) la ld gdigs
+  let bc ← mulMp (nil gdigs) lb lc gdigs
+  let la ← subMp la ac bd gdigs
+  let lb ← addMp lb ad bc gdigs
+  return (← shortenMp a digs la gdigs, ← shortenMp b digs lb gdigs)
+
+/-- `cdiv_mp (a, b, c, d, digs)`: `(a + bi) / (c + di)` by the method that avoids
+    overflow, dividing by the larger of `|c|` and `|d|`. -/
+def cdivMp (a b c d : MP) (digs : Nat) : MPE (MP × MP) := do
+  if c.dig 1 == 0 && d.dig 1 == 0 then return (setNaN a, setNaN b)
+  let q := moveMp (nil digs) c digs
+  let r := moveMp (nil digs) d digs
+  let q := q.setDig 1 (q.dig 1).natAbs
+  let r := r.setDig 1 (r.dig 1).natAbs
+  let q ← subMp q q r digs
+  if q.dig 1 ≥ 0 then
+    let q ← divMp q d c digs
+    if q.isNaN then return (setNaN a, setNaN b)
+    let r ← mulMp r d q digs
+    let r ← addMp r r c digs
+    let c1 ← mulMp c b q digs
+    let c1 ← addMp c1 c1 a digs
+    let c1 ← divMp c1 c1 r digs
+    let d1 ← mulMp d a q digs
+    let d1 ← subMp d1 b d1 digs
+    let d1 ← divMp d1 d1 r digs
+    return (moveMp a c1 digs, moveMp b d1 digs)
+  else
+    let q ← divMp q c d digs
+    if q.isNaN then return (setNaN a, setNaN b)
+    let r ← mulMp r c q digs
+    let r ← addMp r r d digs
+    let c1 ← mulMp c a q digs
+    let c1 ← addMp c1 c1 b digs
+    let c1 ← divMp c1 c1 r digs
+    let d1 ← mulMp d b q digs
+    let d1 ← subMp d1 d1 a digs
+    let d1 ← divMp d1 d1 r digs
+    return (moveMp a c1 digs, moveMp b d1 digs)
+
 -- ## The degree and π-scaled variants
 
 def recOf (f : MP → MP → Nat → MM MP) (z x : MP) (digs : Nat) : MM MP := do
