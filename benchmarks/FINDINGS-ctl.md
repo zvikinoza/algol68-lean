@@ -1,5 +1,14 @@
 # Control-flow and procedure benchmarks (`ctl_*`)
 
+> **Status.** The times and emitted C below are those of the back end when these
+> benchmarks were written, and observation 1 no longer holds. Primitive values
+> are now native C, and a routine with a primitive signature is a plain C
+> function called directly. Re-measured, best of three CPU seconds:
+> `ctl_fib` 0.05 s, `ctl_mutual` 0.09 s, `calls` 0.04 s, all within a few times
+> their C twins and well ahead of a68g. `ctl_hof` is unchanged at 10.98 s,
+> because its call is through a procedure parameter and cannot be resolved
+> statically. See ROOFLINE.md for the current picture.
+
 Six benchmarks that stress control flow and procedure machinery rather than
 straight-line arithmetic, each with a hand-written C twin in `native/`.
 

@@ -37,18 +37,27 @@ sum and then freed them.
 
 ## Where it is now
 
-Three benchmarks, each timed back to back against its own C twin on the same
-machine in the same minute, best of three, CPU time:
+Each benchmark timed against its own C twin on the same machine, the variants
+interleaved so that load falls on all of them alike, best of three, CPU time.
+a68g is best of two.
 
-| benchmark | what it is | hand-written C | a68lean `-O2` | vs C |
-|---|---|---:|---:|---:|
-| `intloop` | integer arithmetic in a loop | 0.10 s | 0.19 s | **1.9x** |
-| `arraysum` | fill and sum a row, 40 M element accesses | 0.10 s | 5.79 s | 58x |
-| `sieve` | sieve of Eratosthenes over two million | 0.02 s | 4.91 s | ~250x |
+| benchmark | what it is | hand-written C | a68g interpreted | a68lean `-O2` | vs C |
+|---|---|---:|---:|---:|---:|
+| `intloop` | integer arithmetic in a loop | 0.11 s | – | 0.16 s | **1.5x** |
+| `calls` | five million calls of a two-parameter procedure | 0.02 s | 0.96 s | 0.04 s | **2.0x** |
+| `ctl_fib` | naive Fibonacci, 18 million recursive calls | 0.02 s | 2.82 s | 0.05 s | **2.5x** |
+| `ctl_mutual` | three-way mutual recursion, 10 million calls | 0.06 s | 3.05 s | 0.09 s | **1.5x** |
+| `ctl_hof` | a procedure passed as a parameter, called 12 million times | 0.06 s | 2.60 s | 10.98 s | 183x |
+| `arraysum` | fill and sum a row, 40 million element accesses | 0.11 s | – | 3.62 s | 33x |
 
-Scalar code is essentially at C speed. Array code is not, and the reason is
-visible in one line of the emitted C: every element access is still a call into
-the runtime.
+The C twins of `calls` and `ctl_fib` run close to the timer's 10 ms resolution,
+so those two ratios are approximate. Before the last two changes below, `calls`
+took 5.55 s and `ctl_fib` 16.66 s.
+
+Scalar code and procedure calls with primitive signatures are now essentially at
+C speed, and 24 to 56 times faster than a68g's interpreter. Two shapes are not:
+an indirect call through a procedure parameter, and row access, where every
+element is still a call into the runtime.
 
 The loop body `intloop` emits has nothing in it at all:
 
@@ -90,6 +99,36 @@ The changes that got there, in the order the profile called for:
 5. **Row elements are read and written in one call**, and written in place. The
    bounds check used to sit in a `try`, which kept the row alive across the
    update and made every write copy the whole element array.
+6. **Declaring a procedure no longer costs a block its C variables.** A block
+   containing a routine text used to keep every slot in a cell, because the
+   routine is a separate C function that reaches the frame through the run-time
+   environment. Only the slots such a text actually reads or names need that, and
+   the analysis now asks exactly that question.
+7. **Routines with primitive signatures are plain C functions.** A routine whose
+   parameters and result are primitive gets a second entry point that takes its
+   arguments as C arguments and returns its result, and a call whose callee is
+   certain, reachable without an environment switch, goes straight to it. Calls
+   inside expressions are hoisted in the evaluator's order, so C's unspecified
+   operand order never reorders side effects. `fib` compiles to
+
+   ```c
+   static int64_t a68_nf0(int64_t a0_0) {
+     int64_t rv0 = 0;
+     if ((uint8_t)((a0_0) < (2LL))) {
+       rv0 = a0_0;
+     } else {
+       int64_t t1 = a68_nf0(a68_sub_i(a0_0, 1LL));
+       if (a68_jump()) return 0;
+       int64_t t2 = t1;
+       int64_t t3 = a68_nf0(a68_sub_i(a0_0, 2LL));
+       if (a68_jump()) return 0;
+       rv0 = a68_add_i(t2, t3);
+     }
+     return rv0;
+   }
+   ```
+
+   which is the C one would write by hand, plus a jump check that is one load.
 
 `-O0` gains almost none of this, and that is the design: promotion needs the
 block structure flattened first, so that an assignment is a statement rather
@@ -97,21 +136,22 @@ than the value of its own block. The optimiser earns the native code.
 
 ## What is left
 
-The profile has moved, so the ordering has too:
+The profile has moved again, so the ordering has too:
 
-1. **Row and structure access.** `arraysum` and `sieve` spend nearly all their
-   time in one runtime call per element. The call resolves the frame, reads the
-   cell, matches the row, checks the subscript and boxes the result, every time.
+1. **Row access.** `arraysum` and the sieve spend nearly all their time in one
+   runtime call per element. The call resolves the frame, reads the cell,
+   matches the row, checks the subscript and boxes the result, every time.
    Getting array code near C means keeping rows of primitive mode in memory the
    emitted C can address directly, rather than as a Lean array of boxed values.
-2. **Procedure calls.** A call still pushes the procedure and its arguments onto
-   the operand stack, goes through `a68rt_call`, builds a Lean array of
-   arguments, and dispatches back into compiled code with a full save and
-   restore of the environment. The bodies themselves are already native.
-3. **Strings.** `+:=` on a `STRING` allocates a fresh row each time.
-4. **Frame cells are never reclaimed.** Three million procedure calls reach
-   232 MB resident, because each frame allocates cells that are never freed.
-   a68g reclaims them with a frame stack.
+2. **Indirect calls.** A procedure parameter, a `PROC` variable, or a routine
+   called from somewhere its captured environment is not already in effect still
+   goes through the operand stack, `a68rt_call`, a Lean array of arguments and
+   the dispatcher, with a full save and restore of the environment. `ctl_hof` is
+   that case, at 183 times its C twin.
+3. **Frame cells are never reclaimed.** Three million boxed procedure calls
+   reach 232 MB resident, because each frame allocates cells that are never
+   freed. a68g reclaims them with a frame stack. Direct calls push no frame, so
+   they sidestep this, but every other call does not.
 
 One thing that was tried and abandoned: making the hot accessors return their
 value directly instead of an `IO` result, to save the result object. Converting

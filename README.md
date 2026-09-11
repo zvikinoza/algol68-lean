@@ -38,16 +38,21 @@ Timed against its C twin on the same machine, best of three:
 
 | benchmark | vs hand-written C |
 |---|---:|
-| `intloop`, integer arithmetic in a loop | **1.9x** |
+| `intloop`, integer arithmetic in a loop | **1.5x** |
 | the same, before this work | 350x |
-| a68g interpreted, the same | 30x |
-| `arraysum`, 40 million row element accesses | 58x |
+| `ctl_fib`, 18 million recursive calls | **2.5x** |
+| the same, a68g interpreted | 141x |
+| `calls`, five million procedure calls | **2.0x** |
+| `ctl_hof`, a procedure passed as a parameter | 183x |
+| `arraysum`, 40 million row element accesses | 33x |
 
 Values of primitive mode are computed in native C types, locals that cannot
-escape become C variables rather than run-time cells, and the assigning
-operators are updates rather than references. A loop over scalars compiles to a
-C loop with no calls into the runtime at all. Array code has not got there: every
-element access is still one call. See
+escape become C variables rather than run-time cells, the assigning operators are
+updates rather than references, and a routine whose parameters and result are
+primitive is a plain C function called directly. A loop over scalars compiles to
+a C loop with no calls into the runtime, and naive Fibonacci to the recursive C
+one would write by hand. Two shapes have not got there: an indirect call through
+a procedure parameter, and row access, where every element is still one call. See
 [benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for the analysis and for what
 is still slow.
 
