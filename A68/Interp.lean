@@ -498,17 +498,169 @@ def fileIdOf (f : Value) : M Nat := do
 inductive Frame where
   | z | d | plus | minus | point | e | a
   | ins (s : String)          -- literal / alignment insertion inside a pattern
+  | radix (r : Nat)           -- the radix frame `r` that makes a mould a bits pattern
   deriving Repr, Inhabited, BEq
 
 inductive Pic where
   | ins (s : String)
-  | pattern (frames : List Frame)              -- numeric or string pattern
+  | pattern (frames : List Frame)              -- numeric, bits or string pattern
   | general (args : List Int)
   | bool_ (flip flop : Option String)
   | choice (alts : List String)
   | include (items : List CoreFmt) (env : Env)
   | col (n : Nat)
+  | cpat (flags : String) (width after : Option Int)   -- a68g C-style pattern, `%-8.2f`
+  | hgen (args : List Int)                            -- a68g `h` pattern
   deriving Inhabited
+
+/-- a68g `convert_radix`: the digits of `v` in base `radix`, most significant first, padded
+    to `width` digits (as many as it takes when `width` is 0); `none` if `v` does not fit. -/
+def convertRadix (v radix width : Nat) : Option String := Id.run do
+  let digit (k : Nat) : Char := "0123456789abcdef".toList[k]!
+  let mut z := v
+  let mut s : List Char := []
+  if width == 0 then
+    repeat
+      s := digit (z % radix) :: s
+      z := z / radix
+      if z == 0 then break
+    return some (String.ofList s)
+  for _ in [0:width] do
+    s := digit (z % radix) :: s
+    z := z / radix
+  return if z == 0 then some (String.ofList s) else none
+
+/-- The exponent C `strtol` reads after the `e` of a `float` string (0 when there is none). -/
+def exponentOf (s : String) : Int :=
+  match s.splitOn "e" with
+  | _ :: rest :: _ =>
+    let cs := rest.toList.dropWhile (· == ' ')
+    let (neg, cs) := match cs with
+      | '-' :: t => (true, t) | '+' :: t => (false, t) | t => (false, t)
+    let n : Int := (cs.takeWhile Char.isDigit).foldl (fun acc c => acc * 10 + (c.toNat - 48 : Nat)) 0
+    if neg then -n else n
+  | _ => 0
+
+/-- What a68g's `strtol` accepts when it converts the characters a C-style pattern read:
+    blanks, a sign and digits, with nothing after them. -/
+def parseIntText (s : String) : Option Int :=
+  let cs := s.toList.dropWhile (fun c => c == ' ' || c == '\t' || c == '\n')
+  let (neg, cs) := match cs with | '-' :: t => (true, t) | '+' :: t => (false, t) | t => (false, t)
+  if cs.isEmpty || !cs.all Char.isDigit then none
+  else
+    let n : Int := cs.foldl (fun acc c => acc * 10 + (c.toNat - 48 : Nat)) 0
+    some (if neg then -n else n)
+
+/-- The same for a REAL: blanks, a sign, digits with an optional point and exponent. -/
+def parseRealText (s : String) : Option Float :=
+  let cs := s.toList.dropWhile (fun c => c == ' ' || c == '\t' || c == '\n')
+  let (neg, cs) := match cs with | '-' :: t => (true, t) | '+' :: t => (false, t) | t => (false, t)
+  let intPart := cs.takeWhile Char.isDigit
+  let rest := cs.drop intPart.length
+  let (fracPart, rest) := match rest with
+    | '.' :: t => (t.takeWhile Char.isDigit, t.drop (t.takeWhile Char.isDigit).length)
+    | t => ([], t)
+  let expOk := match rest with
+    | [] => true
+    | c :: t =>
+      (c == 'e' || c == 'E') &&
+        (match t with | '+' :: u | '-' :: u => !u.isEmpty && u.all Char.isDigit | u => !u.isEmpty && u.all Char.isDigit)
+  if (intPart.isEmpty && fracPart.isEmpty) || !expOk then none
+  else
+    let x := Numfmt.parseFloat (String.ofList cs)
+    some (if neg then -x else x)
+
+/-- The value of the digits a bits pattern or C-style pattern read, in base `radix`; a digit
+    outside the radix, or a value too wide for the mode, is an error (a68g `bits_to_int`). -/
+def radixValue (s : String) (radix : Nat) (long : Int) : M Nat := do
+  let mut v := 0
+  -- `strtoul` passes over leading white space
+  for c in s.toList.dropWhile (fun c => c == ' ' || c == '\t' || c == '\n') do
+    let d := if c.isDigit then c.toNat - 48
+      else if c ≥ 'a' && c ≤ 'f' then c.toNat - 87
+      else if c ≥ 'A' && c ≤ 'F' then c.toNat - 55 else 99
+    if d ≥ radix then rtErr s!"error in {Mode.toString (.bits long)} denotation"
+    v := v * radix + d
+  if v > bitsMask long then rtErr s!"{Mode.toString (.bits long)} value out of range"
+  return v
+
+/-- The string an a68g C-style pattern `%[-][+][w][.a]letter` makes of a value, with the width
+    it is aligned to (`write_c_pattern`). -/
+def cPatternText (flags : String) (w a : Option Int) (mr : Mode) (v : Value) (ll : Nat) : M (Int × String) := do
+  let letter := flags.back
+  let signed (width : Int) : Int := if flags.contains '+' then width else -width
+  match letter, mr, v with
+  | 'd', .int _, .int i | 'i', .int _, .int i =>
+    let width := w.getD 0
+    return (width, Numfmt.whole i (signed width))
+  | 'f', .int long, _ | 'e', .int long, _ | 'g', .int long, _
+  | 'f', .real long, _ | 'e', .real long, _ | 'g', .real long, _ =>
+    let rw : Int := Numfmt.realWidthOf long ll
+    let ew : Int := Numfmt.expWidthOf long
+    let floatS (width after expo : Int) : M String := match v with
+      | .int i => pure (Numfmt.floatInt i width after expo)
+      | .real x => do let _ ← checkReal x; pure (Numfmt.floatReal x width after expo)
+      | _ => rtErr "internal: C-style pattern"
+    let fixedS (width after : Int) : M String := match mr, v with
+      | .int n, .int i => pure (if n ≤ 0 then Numfmt.fixedInt i width after else Numfmt.fixedLongInt i width after)
+      | _, .real x => do let _ ← checkReal x; pure (Numfmt.fixedReal x width after)
+      | _, _ => rtErr "internal: C-style pattern"
+    let digits := w.getD 0
+    let after := a.getD (rw - 1)
+    let mut res : Int × String := (0, "")
+    let mut useFixed := letter == 'f'
+    if letter != 'f' then
+      let expo := ew + 1
+      let width := if digits == 0 && after > 0 then after + expo + 4
+        else if digits > 0 then digits else rw + ew + 4
+      let s ← floatS (signed width) after expo
+      res := (width, s)
+      if letter == 'g' then
+        let ev := exponentOf s
+        useFixed := ev > -4 && ev ≤ after
+    if useFixed then
+      let width := if digits == 0 then 0 else digits + after + 2
+      res := (width, ← fixedS (signed width) after)
+    return res
+  | 'b', .bits n, .bits b | 'o', .bits n, .bits b | 'x', .bits n, .bits b =>
+    let (radix, nibble) : Nat × Nat := match letter with | 'b' => (2, 1) | 'o' => (8, 3) | _ => (16, 4)
+    let dflt := (bitsWidthOf n + nibble - 1) / nibble
+    let width : Nat := match w with
+      | some k => if k > 0 then k.toNat else dflt
+      | none => dflt
+    match convertRadix b radix width with
+    | some s => return (width, s)
+    | none => rtErr s!"error transputting {Mode.toString mr} value"
+  | 's', .char, .char c => return (w.getD 1, String.singleton (Char.ofNat c))
+  | 's', .row 1 _ .char, _ => let s ← strOf v; return (w.getD s.length, s)
+  | _, _, _ => rtErr s!"cannot transput {Mode.toString mr} value with a C-style pattern"
+
+/-- Write a value with a C-style pattern: blanks the conversion put in front are dropped, and
+    the rest is aligned right, or left when the pattern says `-`. -/
+def writeCPattern (fid : Nat) (flags : String) (w a : Option Int) (mr : Mode) (v : Value) : M Unit := do
+  let (width, str) ← cPatternText flags w a mr v (← llDigits)
+  if flags.back != 's' && Numfmt.hasError str then rtErr s!"error transputting {Mode.toString mr} value"
+  if width == 0 then fileOut fid str
+  else
+    let s := String.ofList (str.toList.dropWhile (· == ' '))
+    let blanks := width - s.length
+    if blanks < 0 then rtErr s!"error transputting {Mode.toString mr} value"
+    let pad := String.ofList (List.replicate blanks.toNat ' ')
+    fileOut fid (if flags.contains '-' then s ++ pad else pad ++ s)
+
+/-- The `real` arguments of an `h` pattern: width, after, exponent and exponent multiple
+    (a68g `write_number_generic` and `genie_value_to_string`). -/
+def hArguments (long : Int) (args : List Int) (ll : Nat) : M (Int × Int × Int × Int) := do
+  let rw : Int := Numfmt.realWidthOf long ll
+  let ew : Int := Numfmt.expWidthOf long
+  let de := ew + 1
+  match args with
+  | [] => return (rw + ew + 4, rw - 1, de, 3)
+  | [a] => return (a + de + 4, a, de, 3)
+  | [a, m] => return (a + de + 4, a, de, m)
+  | [w, a, m] => return (w, a, de, m)
+  | [w, a, e, m] => return (w, a, e, m)
+  | _ => rtErr "INT arguments required for a general pattern"
 
 /-- Normalise the mode tag of a united value. -/
 def resolveUnion (v : Value) : M Value := do
@@ -1565,6 +1717,23 @@ partial def readInto (fid : Nat) (m : Mode) (r : Value) : M Unit := do
       let (_, _, es) ← expectRow (← readRef r)
       for i in [0:es.size] do
         readInto fid (.ref em) (← refElem r i)
+    | .compl n =>
+      match r with
+      | .ref c path =>
+        match (← readRef r) with
+        | .struct _ => pure ()
+        | _ => writeRef r (mkCompl 0.0 0.0 |> fun _ => .struct #[.undef, .undef])
+        readInto fid (.ref (.real n)) (.ref c (path ++ [.field 0]))
+        readInto fid (.ref (.real n)) (.ref c (path ++ [.field 1]))
+      | _ => rtErr "internal: COMPL read"
+    | .union _ =>
+      -- a68g reads a value of the mode the united value currently has
+      match (← readRef r) with
+      | .union um uv =>
+        let tmp ← alloc uv
+        readInto fid (.ref um) (.ref tmp [])
+        writeRef r (.union um (← readCell tmp))
+      | _ => rtErr s!"attempt to use an uninitialised {modeName t} value"
     | _ => rtErr s!"cannot read a value of mode {modeName t}"
   | .proc [.ref .file] .void =>
     match r with
@@ -1590,6 +1759,23 @@ partial def readFormatted (fid : Nat) (st : FmtState) (m : Mode) (r : Value) : M
       | _ => rtErr "internal: struct read"
     return st
   | .row 1 _ .char => readScalarFormatted fid st m r
+  | .compl n =>
+    match r with
+    | .ref c path =>
+      match (← readRef r) with
+      | .struct _ => pure ()
+      | _ => writeRef r (.struct #[.undef, .undef])
+      let st ← readFormatted fid st (.ref (.real n)) (.ref c (path ++ [.field 0]))
+      readFormatted fid st (.ref (.real n)) (.ref c (path ++ [.field 1]))
+    | _ => rtErr "internal: COMPL read"
+  | .union _ =>
+    match (← readRef r) with
+    | .union um uv =>
+      let tmp ← alloc uv
+      let st ← readFormatted fid st (.ref um) (.ref tmp [])
+      writeRef r (.union um (← readCell tmp))
+      return st
+    | _ => rtErr s!"attempt to use an uninitialised {modeName tm} value"
   | .row 1 _ em =>
     let mut st := st
     let (_, _, es) ← expectRow (← readRef r)
@@ -1627,9 +1813,86 @@ partial def readScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (r : Valu
     | .ref t => resolveM t
     | t => pure t
   match pat with
-  | .general _ => readInto fid m r
+  | .general _ | .hgen _ => readInto fid m r
+  | .cpat flags w _ =>
+    -- a68g `read_c_pattern`: without a width the value is read as `get` reads it, with one
+    -- exactly that many characters are taken and converted
+    let letter := flags.back
+    let width := w.getD 0
+    let readN (k : Int) : M String := do
+      let mut s := ""
+      for _ in [0:k.toNat] do
+        match (← readChar fid) with
+        | some c => s := s.push (Char.ofNat c)
+        | none => logicalEnd fid
+      return s
+    match tm, letter with
+    | .char, 'c' =>
+      if width == 0 then readInto fid m r
+      else
+        let s ← readN width
+        let s := if width > 1 && !flags.contains '-' then String.ofList (s.toList.drop (width.toNat - 1)) else s
+        writeRef r (.char (s.toList.headD ' ').toNat)
+    | .row 1 _ .char, 's' =>
+      if width == 0 then readInto fid m r else writeRef r (Value.ofString (← readN width))
+    | .int n, 'd' | .int n, 'i' =>
+      if width == 0 then readInto fid m r
+      else
+        let s ← readN (if flags.contains '+' then width + 1 else width)
+        match parseIntText s with
+        | some k =>
+          if k.natAbs > (Numfmt.maxIntOf n (← llDigits)).natAbs then valueError fid s!"cannot read {modeName tm} from \"{s}\""
+          writeRef r (.int k)
+        | none => valueError fid s!"cannot read {modeName tm} from \"{s}\""
+    | .real _, 'f' | .real _, 'e' | .real _, 'g' =>
+      if width == 0 then readInto fid m r
+      else
+        let s ← readN (if flags.contains '+' then width + 1 else width)
+        match parseRealText s with
+        | some x => writeRef r (.real x)
+        | none => valueError fid s!"cannot read {modeName tm} from \"{s}\""
+    | .bits n, 'b' | .bits n, 'o' | .bits n, 'x' =>
+      let radix := match letter with | 'b' => 2 | 'o' => 8 | _ => 16
+      let digits ← if width == 0 then do
+          skipSpaces fid
+          let mut s := ""
+          repeat
+            match (← peekChar fid) with
+            | some c =>
+              let ch := Char.ofNat c
+              if ch.isDigit || (ch ≥ 'a' && ch ≤ 'f') || (ch ≥ 'A' && ch ≤ 'F') then
+                let _ ← readChar fid
+                s := s.push ch
+              else break
+            | none => break
+          pure s
+        else readN width
+      writeRef r (.bits (← radixValue digits radix n))
+    | _, _ => rtErr s!"cannot transput {modeName tm} value with a C-style pattern"
   | .pattern frames =>
-    if frames.any (· == .a) then
+    if let some rdx := frames.findSome? (fun f => match f with | .radix k => some k | _ => none) then
+      -- a bits pattern: digits of the radix, a `z` frame also taking a blank for a zero
+      match tm with
+      | .bits n =>
+        if rdx < 2 || rdx > 16 then rtErr s!"invalid radix {rdx}"
+        let mut s := ""
+        for f in frames do
+          match f with
+          | .ins t => readInsertion fid t
+          | .z | .d =>
+            match (← readChar fid) with
+            | some c =>
+              let ch := Char.ofNat c
+              if f == .z && ch == ' ' then s := s.push '0'
+              else if ch.isDigit || (ch ≥ 'a' && ch ≤ 'f') || (ch ≥ 'A' && ch ≤ 'F') then s := s.push ch
+              else
+                valueError fid s!"cannot read {modeName tm} from \"{s.push ch}\""
+                s := s.push '0'
+            | none => logicalEnd fid
+          | _ => pure ()
+        writeRef r (.bits (← radixValue s rdx n))
+      | _ => rtErr s!"cannot transput {modeName tm} value with a bits pattern"
+    else if frames.any (· == .a) then
       -- string pattern: read exactly as many characters as there are `a` frames
       let mut s := ""
       for f in frames do
@@ -2123,12 +2386,38 @@ partial def walkFormat (env : Env) (items : List CoreFmt) (b0 : FmtBuild) : M Fm
         | some e => do pure (← expectInt (← eval env e)).toNat
         | none => pure n
       b := { pics := b.flush ++ [.col k] }
+    | .rep n dyn .radix =>
+      let k ← match dyn with
+        | some e => do pure (← expectInt (← evalFmtExpr env e)).toNat
+        | none => pure n
+      b := b.addFrame (.radix k)
+    | .radix => rtErr "radix frame without a radix"
     | .col => b := { pics := b.flush ++ [.col 1] }
     | .rep n dyn inner =>
       let k ← match dyn with
         | some e => do pure (← expectInt (← evalFmtExpr env e)).toNat
         | none => pure n
       b ← walkFormat env (List.replicate k inner) b
+    | .group (.hmark :: rest) =>
+      let args ← match rest with
+        | [.general as] => as.mapM fun a => do expectInt (← evalFmtExpr env a)
+        | _ => pure []
+      b := b.addPic (.hgen args)
+    | .group (.cpat flags :: rest) =>
+      let mut w : Option Int := none
+      let mut a : Option Int := none
+      for it in rest do
+        match it with
+        | .rep n dyn marker =>
+          let k : Int ← match dyn with
+            | some e => do pure (max 0 (← expectInt (← evalFmtExpr env e)))
+            | none => pure n
+          match marker with
+          | .cwidth => w := some k
+          | _ => a := some k
+        | _ => pure ()
+      b := b.addPic (.cpat flags w a)
+    | .hmark | .cpat _ | .cwidth | .cafter => pure ()
     | .group inner =>
       -- a collection is a picture boundary: frames inside it never merge with frames outside
       b := { pics := b.flush }
@@ -2290,6 +2579,10 @@ partial def writeFormatted (fid : Nat) (st : FmtState) (m : Mode) (v : Value) : 
   match mr, v with
   | _, .union m' v' => writeFormatted fid st m' v'
   | .row 1 _ .char, .row _ _ _ => writeScalarFormatted fid st m v
+  | .compl n, .struct #[re, im] =>
+    -- a68g writes a COMPL as two REAL values, each with a pattern of its own
+    let st ← writeFormatted fid st (.real n) re
+    writeFormatted fid st (.real n) im
   | .row _ _ em, .row _ _ es =>
     let mut st := st
     for e in es do
@@ -2336,6 +2629,15 @@ partial def writeScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (v : Val
       | _, _, _ => rtErr s!"cannot transput {modeName m} value with a general pattern with arguments"
       return st'
     | .pattern frames =>
+      if let some rdx := frames.findSome? (fun f => match f with | .radix k => some k | _ => none) then
+        match mr, v with
+        | .bits _, .bits b =>
+          if rdx < 2 || rdx > 16 then rtErr s!"invalid radix {rdx}"
+          match convertRadix b rdx (countZD frames) with
+          | some s => writeMould fid frames s.toList false
+          | none => rtErr s!"error transputting {modeName m} value"
+        | _, _ => rtErr s!"cannot transput {modeName m} value with a bits pattern"
+        return st'
       let isString := frames.any (· == .a)
       let isReal := frames.any fun f => f == .point || f == .e
       if isString then
@@ -2365,6 +2667,23 @@ partial def writeScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (v : Val
       | .int k =>
         if k ≥ 1 && k ≤ alts.length then fileOut fid alts[(k - 1).toNat]!
       | _ => rtErr s!"cannot transput {modeName m} value with a choice pattern"
+      return st'
+    | .cpat flags w a => writeCPattern fid flags w a mr v; return st'
+    | .hgen args =>
+      match mr, v with
+      | .int n, .int i =>
+        let (w, a, e, mult) ← hArguments n args (← llDigits)
+        fileOut fid (Numfmt.floatInt i w a e mult)
+      | .real n, .real x =>
+        let _ ← checkReal x
+        let (w, a, e, mult) ← hArguments n args (← llDigits)
+        fileOut fid (Numfmt.floatReal x w a e mult)
+      -- without arguments `h` writes other values as `g` does
+      | .bool, .bool b => if args.isEmpty then fileOut fid (if b then "T" else "F") else rtErr s!"cannot transput {modeName m} value with a general pattern"
+      | .char, .char c => if args.isEmpty then fileOutByte fid c.toUInt8 else rtErr s!"cannot transput {modeName m} value with a general pattern"
+      | .bits n, .bits b => if args.isEmpty then fileOut fid (Numfmt.printBits b (bitsWidthOf n)) else rtErr s!"cannot transput {modeName m} value with a general pattern"
+      | .row 1 _ .char, .row _ _ _ => if args.isEmpty then fileOut fid (← strOf v) else rtErr s!"cannot transput {modeName m} value with a general pattern"
+      | _, _ => rtErr s!"cannot transput {modeName m} value with a general pattern"
       return st'
     | .ins _ => rtErr "internal: insertion as pattern"
     | .col _ => rtErr "internal: column alignment as pattern"

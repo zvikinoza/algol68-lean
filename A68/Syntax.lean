@@ -31,6 +31,11 @@ inductive FormatItem where
   | include (f : Expr)                               -- f(format)  (a68g: user format inclusion)
   | sep                                              -- picture separator (",")
   | col                                              -- k: alignment to a column (with replicator)
+  | radix                                            -- r: radix frame of a bits pattern (with replicator)
+  | hpat (args : List Expr)                          -- h, h(a), h(a,m), h(w,a,m), h(w,a,e,m)
+  -- a68g C-style pattern %[-][+][w][.a]letter; `flags` holds the '-' and '+' given and ends
+  -- with the letter; width and after are replicators (static, or dynamic with an expression)
+  | cpat (flags : String) (width after : Option (Nat × Option Expr))
   deriving Repr, Inhabited
 
 /-- Mode syntax (declarers) as written in source. Bounds appear only in actual declarers. -/

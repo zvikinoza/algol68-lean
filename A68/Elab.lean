@@ -809,6 +809,17 @@ partial def elabFormatItem (it : FormatItem) : Elab CoreFmt := do
   | .include f => return .include (← (·.1) <$> elabUnit f (.meek .format))
   | .sep => return .sep
   | .col => return .col
+  | .radix => return .radix
+  | .hpat args =>
+    let cs ← args.mapM fun a => (·.1) <$> elabUnit a (.meek (.int 0))
+    return .group [.hmark, .general cs]
+  | .cpat flags w a =>
+    let repl (r : Option (Nat × Option Expr)) (marker : CoreFmt) : Elab (List CoreFmt) := do
+      match r with
+      | none => return []
+      | some (n, none) => return [.rep n none marker]
+      | some (n, some e) => return [.rep n (some ((← elabUnit e (.meek (.int 0))).1)) marker]
+    return .group ([.cpat flags] ++ (← repl w .cwidth) ++ (← repl a .cafter))
 
 partial def elabRoutine (params : List (ModeSyn × String)) (ret : ModeSyn) (body : Expr) : Elab (Core × Mode) := do
   pushScope

@@ -839,6 +839,10 @@ partial def scanFmtLiteral (cs : Array Char) (start : Nat) : String × Nat := Id
       s := s.push cs[j]!; j := j + 1
   return (s, j)
 
+/-- The index of the first character at or after `i` that is not a space. -/
+partial def fmtSkipSpaces (cs : Array Char) (i : Nat) : Nat :=
+  if i < cs.size && (cs[i]! == ' ' || cs[i]! == '\n' || cs[i]! == '\t') then fmtSkipSpaces cs (i + 1) else i
+
 /-- Parse a balanced `( ... )` starting at index `i` (which must be '('); returns inner text and index after ')'. -/
 partial def balanced (cs : Array Char) (i : Nat) : String × Nat := Id.run do
   let mut depth := 0
@@ -921,8 +925,8 @@ partial def parseFormatItems (cs : Array Char) (start : Nat) (p : Pos) : P (List
       let (item, k) ← parseOneFormatItem cs j p
       items := items ++ [.rep n none item]
       i := k
-    else if c == 'n' && i + 1 < cs.size && cs[i+1]! == '(' then
-      let (inner, j) := balanced cs (i + 1)
+    else if c == 'n' && fmtSkipSpaces cs (i + 1) < cs.size && cs[fmtSkipSpaces cs (i + 1)]! == '(' then
+      let (inner, j) := balanced cs (fmtSkipSpaces cs (i + 1))
       let e ← parseUnitFromString inner
       let (item, k) ← parseOneFormatItem cs j p
       items := items ++ [.rep 0 (some e) item]
@@ -984,7 +988,44 @@ partial def parseOneFormatItem (cs : Array Char) (i : Nat) (p : Pos) : P (Format
   | '(' =>
     let (sub, j) ← parseFormatItems cs (i + 1) p
     return (.group sub, j)
+  | 'r' => return (.radix, i + 1)
+  | 'h' =>
+    if next == '(' then
+      let (inner, j) := balanced cs (i + 1)
+      let args ← (splitTop inner).mapM parseUnitFromString
+      return (.hpat args, j)
+    else return (.hpat [], i + 1)
+  | '%' =>
+    -- %[-][+][replicator][.replicator]letter
+    let mut j := i + 1
+    let mut flags := ""
+    if j < cs.size && cs[j]! == '-' then flags := flags.push '-'; j := j + 1
+    if j < cs.size && cs[j]! == '+' then flags := flags.push '+'; j := j + 1
+    let (w, j1) ← fmtReplicator cs j
+    j := j1
+    let mut a : Option (Nat × Option Expr) := none
+    if j < cs.size && cs[j]! == '.' then
+      let (a', j2) ← fmtReplicator cs (j + 1)
+      if a'.isNone then fail "bad C-style format pattern"
+      a := a'; j := j2
+    if j < cs.size && "boxcfegdis".toList.contains cs[j]! then
+      return (.cpat (flags.push cs[j]!) w a, j + 1)
+    else fail "bad C-style format pattern"
   | _ => fail s!"unsupported format item '{c}'"
+
+/-- An optional replicator at `i`: digits, or `n` followed by an enclosed clause. -/
+partial def fmtReplicator (cs : Array Char) (i : Nat) : P (Option (Nat × Option Expr) × Nat) := do
+  if i < cs.size && Lexer.isDigit cs[i]! then
+    let mut j := i
+    let mut n := 0
+    while j < cs.size && Lexer.isDigit cs[j]! do
+      n := n * 10 + (cs[j]!.toNat - '0'.toNat); j := j + 1
+    return (some (n, none), j)
+  else if i < cs.size && cs[i]! == 'n' && fmtSkipSpaces cs (i + 1) < cs.size
+      && cs[fmtSkipSpaces cs (i + 1)]! == '(' then
+    let (inner, j) := balanced cs (fmtSkipSpaces cs (i + 1))
+    return (some (0, some (← parseUnitFromString inner)), j)
+  else return (none, i)
 
 end
 
