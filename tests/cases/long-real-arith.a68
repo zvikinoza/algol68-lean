@@ -1,0 +1,18 @@
+# LONG REAL and LONG LONG REAL arithmetic, rounding and conversions, as a68g computes them #
+LONG REAL a = LONG 1.0 / LONG 3.0, b = LONG 355.0 / LONG 113.0;
+print((a, newline, b, newline, a + b, newline, a - b, newline, a * b, newline, b / a, newline));
+print((a < b, a <= b, a > b, a >= b, a = b, a /= b, newline));
+LONG LONG REAL c = LONG LONG 1.0 / LONG LONG 7.0;
+print((c, newline, c * c, newline, c ** 5, newline, LONG LONG 2.0 ** -3, newline));
+LONG REAL x := 1; FOR i TO 30 DO x *:= LONG 1.1 OD; print((x, newline));
+x /:= LONG 7; x -:= LONG 0.5; x +:= 2; print((x, newline));
+print((ENTIER LONG 2.5, ENTIER -LONG 2.5, ROUND LONG 2.5, ROUND -LONG 2.5, newline));
+print((SHORTEN (LONG 1.0 / LONG 3.0), newline, SHORTEN (LONG LONG 1.0 / LONG LONG 3.0), newline));
+print((LENG 1.1, newline, LENG LENG 1.1, newline, LENG (LONG 1.0 / LONG 3.0), newline));
+print((ABS -LONG 2.5, SIGN -LONG 2.5, SIGN LONG 0.0, newline));
+print((long max real, newline, long small real, newline, long min real, newline));
+print((long long max real, newline, long long small real, newline));
+print((long real width, long long real width, long exp width, long long exp width, newline));
+print((LONG 2.0 ** LONG 0.5, newline, LONG LONG 10.0 ** LONG LONG 0.3, newline));
+REAL r := 2147483647.0; LONG REAL w := r; INT k := 2147483647; LONG REAL v := k;
+print((w, newline, v, newline))

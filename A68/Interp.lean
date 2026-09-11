@@ -1936,8 +1936,14 @@ partial def readInto (fid : Nat) (m : Mode) (r : Value) : M Unit := do
         match r with
         | .ref c path => readInto fid (.ref fm) (.ref c (path ++ [.field i]))
         | _ => rtErr "internal: struct read"
-    | .real _ =>
+    | .real n =>
       let tok ← readNumber fid true
+      if n ≥ 1 then
+        -- `genie_string_to_value_internal`: `string_to_mp` at the length's precision
+        match (← liftMP (MP.stringToMp tok (← mpDigitsOf n))) with
+        | some z => writeRef r (.mp z)
+        | none => rtErr s!"cannot read {Mode.toString (.real n)} from \"{tok}\""
+        return
       let neg := tok.startsWith "-"
       let body := if neg || tok.startsWith "+" then String.ofList (tok.toList.drop 1) else tok
       let x := Numfmt.parseFloat body

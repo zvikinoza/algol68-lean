@@ -1,0 +1,13 @@
+# long and long long elementary functions, computed with a68g's algorithms #
+print((long pi, newline, long long pi, newline));
+print((long sqrt(LONG 2.0), newline, long long sqrt(LONG LONG 2.0), newline));
+print((long exp(LONG 1.0), newline, long ln(LONG 10.0), newline, long log(LONG 2.0), newline));
+print((long sin(LONG 1.0), newline, long cos(LONG 1.0), newline, long tan(LONG 1.0), newline));
+print((long arcsin(LONG 0.5), newline, long arccos(LONG 0.5), newline, long arctan(LONG 2.0), newline));
+print((long sinh(LONG 0.5), newline, long cosh(LONG 0.5), newline, long tanh(LONG 0.5), newline));
+print((long arcsinh(LONG 0.5), newline, long arccosh(LONG 1.5), newline, long arctanh(LONG 0.5), newline));
+print((long curt(LONG 10.0), newline, long arctan2(LONG 1.0, -LONG 1.0), newline));
+print((long long exp(LONG LONG 1.0), newline, long long ln(LONG LONG 3.0), newline));
+print((long long sin(long long pi / LONG LONG 6), newline, long long arctan(LONG LONG 1.0), newline));
+print((long exp(LONG 100.5), newline, long ln(LONG 1e300), newline, long sqrt(LONG 1e-30), newline));
+print((long sin(LONG 100.0), newline, long cos(-LONG 7.5), newline, long pi, newline))
