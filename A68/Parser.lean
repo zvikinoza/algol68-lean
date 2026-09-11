@@ -67,6 +67,11 @@ def baseModes : List (String × ModeSyn) :=
 def environModes : List (String × ModeSyn) :=
   [("ZAHL", .long 1 .int), ("DOUBLE", .long 1 .real), ("QUAD", .long 1 (.long 1 .real))]
 
+/-- Is a symbol token an operator symbol (made of a68g's monad and nomad characters, with
+    the `=`/`:` tails of assigning operators), rather than punctuation? -/
+def isOperatorSymbol (w : String) : Bool :=
+  w != "" && w != ":" && w != ":=" && w.toList.all fun (c : Char) => "%^&+-~!?></=*:".toList.contains c
+
 /-- The operator a defining occurrence names when a68g's scanner has glued the `=` of the
     declaration onto the operator symbol (`OP!=(INT c)CHAR: …` is `OP ! = …`). -/
 def splitDefiningOp (w : String) : Option String :=
@@ -105,9 +110,10 @@ def prescan (toks : Array Token) : Std.HashSet String × Std.HashMap String Nat 
     | some ("OP", d), .bold w, .sym "=" =>
       if depth == d then monops := monops.insert w
     | some ("OP", d), .sym w, .sym "=" =>
-      if depth == d then monops := monops.insert w
+      -- only an operator symbol can be defined, not the `)` of `(a) = b` in a routine text
+      if depth == d && isOperatorSymbol w then monops := monops.insert w
     | some ("OP", d), .sym w, _ =>
-      if depth == d && (prev == .bold "OP" || prev == .sym ",") then
+      if depth == d && isOperatorSymbol w && (prev == .bold "OP" || prev == .sym ",") then
         if let some w' := splitDefiningOp w then monops := monops.insert w'
     | some ("PRIO", d), .bold w, .sym "=" =>
       if depth == d then
