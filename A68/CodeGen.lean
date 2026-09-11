@@ -112,6 +112,20 @@ def assignOpExpr (op : String) (ty : CTy) (x y : String) : Option String :=
   | "|:=", .u64 => some s!"(({x}) | ({y}))"
   | _, _ => none
 
+/-- The C signature of a routine that is also compiled as a plain C function: parameters
+    arrive as C arguments instead of on the operand stack, and the result comes back as the
+    C return value instead of being boxed and pushed.  `rty` is `none` for VOID. -/
+structure NatSig where
+  ptys : Array CTy
+  rty  : Option CTy
+  deriving Inhabited, BEq
+
+/-- A routine a slot is known to hold, together with its plain C entry point. -/
+structure ProcInfo where
+  nidx : Nat
+  sig  : NatSig
+  deriving Inhabited
+
 /-- A frame as the generator sees it.  `vars` names the C variable a slot was promoted
     to, when it has one; `pushed` says whether a run-time frame was emitted for it at all.
     A frame every one of whose slots is a C variable needs no run-time frame, so the
@@ -120,6 +134,8 @@ def assignOpExpr (op : String) (ty : CTy) (x y : String) : Option String :=
 structure Frame where
   /-- per slot: C variable name, its type, and whether reads must test for undefined -/
   vars   : Array (Option (String × CTy × Bool)) := #[]
+  /-- per slot: the routine it certainly holds, once a call can see its declaration -/
+  procs  : Array (Option ProcInfo) := #[]
   pushed : Bool := true
   deriving Inhabited
 
@@ -161,6 +177,8 @@ structure St where
   depth  : Nat := 0                -- indentation
   tmp    : Nat := 0
   frames : List Frame := []   -- innermost first
+  nfns   : Array (String × Array String) := #[]   -- plain C entry points: signature, body
+  ret    : String := "return;"  -- how the function being emitted returns when a jump leaves it
   deriving Inhabited
 
 abbrev M := StateM St
@@ -260,12 +278,12 @@ partial def labelsOf : Core → List Nat
 def jumpCheck : M Unit := do
   let s ← get
   if s.labels.isEmpty then
-    emit "if (a68_jump()) return;"
+    emit s!"if (a68_jump()) {s.ret}"
   else
     emit "if (a68_jump()) { switch (a68_jump()-1) {"
     for l in s.labels do
       emit s!"  case {l}: goto L{l};"
-    emit "  default: return; } }"
+    emit s!"  default: {s.ret} } }"
 
 /-- `x +:= e` and its relatives, as a C expression for the new value.  These are the
     assigning operators: the left operand is a name, and the operator writes through it,
@@ -493,6 +511,52 @@ def SelChain.fieldsWord (c : SelChain) : Nat := Id.run do
 def SelChain.args (c : SelChain) : String :=
   s!"{c.depth}, {c.slot}, {c.spec}u, {c.i}, {c.j}, {c.fieldsWord}u"
 
+/-- The C form of a monadic operator on a native operand, when it has one.  Each form
+    reproduces the check its interpreted counterpart performs. -/
+def monopC (op : String) (t : CTy) (x : String) : Option String :=
+  match op, t with
+  | "-", .i64 => some s!"a68_neg_i({x})"
+  | "-", .f64 => some s!"(-({x}))"
+  | "+", _ => some x
+  | "ABS", .i64 => some s!"a68_abs_i({x})"
+  | "ABS", .f64 => some s!"a68_fabs({x})"
+  | "ABS", .u32 => some s!"((int64_t)({x}))"
+  | "ABS", .u8 => some s!"((int64_t)(({x}) != 0))"
+  | "REPR", .i64 => some s!"a68_repr({x})"
+  | "SIGN", .i64 => some s!"a68_sign_i({x})"
+  | "SIGN", .f64 => some s!"a68_sign_r({x})"
+  | "ODD", .i64 => some s!"(uint8_t)((({x}) % 2) != 0)"
+  | "NOT", .u8 => some s!"(uint8_t)(!({x}))"
+  | "ENTIER", .f64 => some s!"a68_entier({x})"
+  | "ROUND", .f64 => some s!"a68_round({x})"
+  | _, _ => none
+
+/-- The C form of a dyadic operator on native operands, when it has one. -/
+def dyopC (op : String) (opnd : CTy) (a b : String) : Option String :=
+  match op, opnd with
+  | "+", .i64 => some s!"a68_add_i({a}, {b})"
+  | "-", .i64 => some s!"a68_sub_i({a}, {b})"
+  | "*", .i64 => some s!"a68_mul_i({a}, {b})"
+  | "%", .i64 => some s!"a68_over_i({a}, {b})"
+  | "%*", .i64 => some s!"a68_mod_i({a}, {b})"
+  | "+", .f64 => some s!"a68_chk_r(({a}) + ({b}))"
+  | "-", .f64 => some s!"a68_chk_r(({a}) - ({b}))"
+  | "*", .f64 => some s!"a68_chk_r(({a}) * ({b}))"
+  | "/", .f64 => some s!"a68_div_r({a}, {b})"
+  | "AND", .u8 => some s!"(uint8_t)(({a}) && ({b}))"
+  | "OR", .u8 => some s!"(uint8_t)(({a}) || ({b}))"
+  | "XOR", .u8 => some s!"(uint8_t)((({a}) != 0) != (({b}) != 0))"
+  | "AND", .u64 => some s!"(({a}) & ({b}))"
+  | "OR", .u64 => some s!"(({a}) | ({b}))"
+  | "XOR", .u64 => some s!"(({a}) ^ ({b}))"
+  | "=", _ => some s!"(uint8_t)(({a}) == ({b}))"
+  | "/=", _ => some s!"(uint8_t)(({a}) != ({b}))"
+  | "<", _ => some s!"(uint8_t)(({a}) < ({b}))"
+  | "<=", _ => some s!"(uint8_t)(({a}) <= ({b}))"
+  | ">", _ => some s!"(uint8_t)(({a}) > ({b}))"
+  | ">=", _ => some s!"(uint8_t)(({a}) >= ({b}))"
+  | _, _ => none
+
 mutual
 /-- `a[i]` and `a[i, j]` where `a` is a row held directly in a cell: one call that returns
     a native value, instead of a reference built on the operand stack and then dereferenced. -/
@@ -581,22 +645,7 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     let r ← monopResult op mm
     if r != m then none else
     let x ← scalarExpr env mm e
-    match op, (← CTy.ofMode mm) with
-    | "-", .i64 => some s!"a68_neg_i({x})"
-    | "-", .f64 => some s!"(-({x}))"
-    | "+", _ => some x
-    | "ABS", .i64 => some s!"a68_abs_i({x})"
-    | "ABS", .f64 => some s!"a68_fabs({x})"
-    | "ABS", .u32 => some s!"((int64_t)({x}))"
-    | "ABS", .u8 => some s!"((int64_t)(({x}) != 0))"
-    | "REPR", .i64 => some s!"a68_repr({x})"
-    | "SIGN", .i64 => some s!"a68_sign_i({x})"
-    | "SIGN", .f64 => some s!"a68_sign_r({x})"
-    | "ODD", .i64 => some s!"(uint8_t)((({x}) % 2) != 0)"
-    | "NOT", .u8 => some s!"(uint8_t)(!({x}))"
-    | "ENTIER", .f64 => some s!"a68_entier({x})"
-    | "ROUND", .f64 => some s!"a68_round({x})"
-    | _, _ => none
+    monopC op (← CTy.ofMode mm) x
   | .dyop op m1 m2 l r => do
     if m1 != m2 then none else
     let opnd ← CTy.ofMode m1
@@ -604,29 +653,7 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     if res != m then none else
     let a ← scalarExpr env m1 l
     let b ← scalarExpr env m2 r
-    match op, opnd with
-    | "+", .i64 => some s!"a68_add_i({a}, {b})"
-    | "-", .i64 => some s!"a68_sub_i({a}, {b})"
-    | "*", .i64 => some s!"a68_mul_i({a}, {b})"
-    | "%", .i64 => some s!"a68_over_i({a}, {b})"
-    | "%*", .i64 => some s!"a68_mod_i({a}, {b})"
-    | "+", .f64 => some s!"a68_chk_r(({a}) + ({b}))"
-    | "-", .f64 => some s!"a68_chk_r(({a}) - ({b}))"
-    | "*", .f64 => some s!"a68_chk_r(({a}) * ({b}))"
-    | "/", .f64 => some s!"a68_div_r({a}, {b})"
-    | "AND", .u8 => some s!"(uint8_t)(({a}) && ({b}))"
-    | "OR", .u8 => some s!"(uint8_t)(({a}) || ({b}))"
-    | "XOR", .u8 => some s!"(uint8_t)((({a}) != 0) != (({b}) != 0))"
-    | "AND", .u64 => some s!"(({a}) & ({b}))"
-    | "OR", .u64 => some s!"(({a}) | ({b}))"
-    | "XOR", .u64 => some s!"(({a}) ^ ({b}))"
-    | "=", _ => some s!"(uint8_t)(({a}) == ({b}))"
-    | "/=", _ => some s!"(uint8_t)(({a}) != ({b}))"
-    | "<", _ => some s!"(uint8_t)(({a}) < ({b}))"
-    | "<=", _ => some s!"(uint8_t)(({a}) <= ({b}))"
-    | ">", _ => some s!"(uint8_t)(({a}) > ({b}))"
-    | ">=", _ => some s!"(uint8_t)(({a}) >= ({b}))"
-    | _, _ => none
+    dyopC op opnd a b
   | _ => none
 
 end
@@ -757,10 +784,188 @@ def env : M (List Frame) := do return (← get).frames
 def rtd (d : Nat) : M Nat := do return rtDepthOf (← env) d
 def lvar (d s : Nat) : M (Option (String × CTy × Bool)) := do return varOf (← env) d s
 
+/-- Can this routine also be a plain C function?  Its frame must be exactly its parameters,
+    each of primitive mode and never named, its result primitive or VOID, and nothing
+    inside may be compiled into a further C function that would reach the frame through
+    the run-time environment, which a plain C function does not have. -/
+def natSigOf (m : Mode) (nparams frameSize : Nat) (body : Core) : Option NatSig := do
+  if frameSize != nparams then none else
+  match m with
+  | .proc ps r =>
+    if ps.length != nparams then none else
+    let ptys ← ps.mapM CTy.ofMode
+    let rty : Option CTy ← (match r with
+      | .void => some none
+      | _ => (CTy.ofMode r).map some)
+    if hasOtherFn body then none else
+    if (List.range nparams).any (fun i => slotEscapes (fun _ => false) 0 i body) then none else
+    some { ptys := ptys.toArray, rty := rty }
+  | _ => none
+
+/-- The routine a call certainly goes to, when it has a plain C entry point that can be
+    called right here: the callee is a slot known to hold that routine, and the frame the
+    slot lives in is the innermost run-time frame, so the environment the routine captured
+    is the one in effect and the call needs no environment switch. -/
+def staticNat (env : List Frame) (f : Core) : Option ProcInfo := do
+  match strip f with
+  | .loadCell d s =>
+    let fr ← env[d]?
+    let pi ← (fr.procs[s]?).join
+    if (varOf env d s).isSome || rtDepthOf env d != 0 then none else some pi
+  | _ => none
+
+/-- Does the native spine of `c` contain such a call? -/
+partial def hasNatCall (env : List Frame) (c : Core) : Bool :=
+  match c with
+  | .at _ e | .monop _ _ e | .widen _ _ e => hasNatCall env e
+  | .dyop _ _ _ l r => hasNatCall env l || hasNatCall env r
+  | .call f _ => (staticNat env f).isSome
+  | _ => false
+
+/-- Can `c` be computed as a native value of mode `m`, calls included? -/
+partial def natOk (env : List Frame) (m : Mode) (c : Core) : Bool :=
+  match c with
+  | .at _ e => natOk env m e
+  | .call f args =>
+    match staticNat env f with
+    | some pi =>
+      CTy.ofMode m == pi.sig.rty && pi.sig.rty.isSome && args.length == pi.sig.ptys.size
+        && (List.range args.length).all fun i => natOk env (pi.sig.ptys[i]!).toMode args[i]!
+    | none => false
+  | .monop op mm e =>
+    monopResult op mm == some m && (match CTy.ofMode mm with
+      | some t => (monopC op t "x").isSome && natOk env mm e
+      | none => false)
+  | .dyop op m1 m2 l r =>
+    m1 == m2 && dyopResult op m1 == some m && (match CTy.ofMode m1 with
+      | some t => (dyopC op t "a" "b").isSome && natOk env m1 l && natOk env m2 r
+      | none => false)
+  | .widen (.int 0) (.real 0) e => m == .real 0 && natOk env (.int 0) e
+  | _ => (scalarExpr env m c).isSome
+
+/-- The mode a node yields, counting the calls whose callee is known. -/
+def resultModeE (env : List Frame) (c : Core) : Option Mode :=
+  match strip c with
+  | .call f _ => do let pi ← staticNat env f; let t ← pi.sig.rty; some t.toMode
+  | _ => resultMode c
+
+/-- May this operand be left to be evaluated after a call to its right?  Only when doing so
+    is unobservable: a literal, or a C variable that needs no undefined test, since a callee
+    cannot reach a C variable of this function and reading one can neither fail nor act. -/
+def delayable (env : List Frame) (c : Core) : Bool :=
+  match strip c with
+  | .lit _ => true
+  | .loadCell d s | .deref (.refCell d s) =>
+    match varOf env d s with
+    | some (_, _, u) => !u
+    | none => false
+  | _ => false
+
+/-- Reserve the index of a plain C entry point. -/
+def reserveNative : M Nat := do
+  let s ← get
+  set { s with nfns := s.nfns.push ("", #[]) }
+  return s.nfns.size
+
 mutual
+
+/-- Put a native expression in a fresh C variable, so that it is evaluated here. -/
+partial def hoistT (t : CTy) (e : String) : M String := do
+  let k ← fresh
+  emit s!"{t.name} t{k} = {e};"
+  return s!"t{k}"
+
+/-- The arguments of a direct call, evaluated left to right: an argument is hoisted into a
+    C variable whenever a later argument makes a call, unless delaying it is unobservable. -/
+partial def natArgs (pi : ProcInfo) (args : List Core) : M (Array String) := do
+  let ev ← env
+  let mut as : Array String := #[]
+  for i in [0:args.length] do
+    let a := args[i]!
+    let pty := pi.sig.ptys[i]!
+    let x ← anf pty.toMode a
+    let later := (args.drop (i + 1)).any (hasNatCall ev)
+    let x ← if later && !delayable ev a then hoistT pty x else pure x
+    as := as.push x
+  return as
+
+/-- `c`, which `natOk` accepts, as a native expression, emitting its calls as statements in
+    exactly the order the evaluator performs them.  A subtree without calls is rendered by
+    `scalarExpr` and evaluated where it is used; the left operand of an operator whose right
+    operand makes a call is hoisted first, so nothing is reordered. -/
+partial def anf (m : Mode) (c : Core) : M String := do
+  let ev ← env
+  if !hasNatCall ev c then return (scalarExpr ev m c).getD "0"
+  match c with
+  | .at _ e => anf m e
+  | .call f args =>
+    let pi := (staticNat ev f).get!
+    let as ← natArgs pi args
+    let k ← fresh
+    let rty := pi.sig.rty.get!
+    emit s!"{rty.name} t{k} = a68_nf{pi.nidx}({", ".intercalate as.toList});"
+    jumpCheck
+    return s!"t{k}"
+  | .monop op mm e =>
+    let x ← anf mm e
+    return (monopC op (CTy.ofMode mm).get! x).getD "0"
+  | .dyop op m1 _ l r =>
+    let t := (CTy.ofMode m1).get!
+    let a ← anf m1 l
+    let a ← if hasNatCall ev r && !delayable ev l then hoistT t a else pure a
+    let b ← anf m1 r
+    return (dyopC op t a b).getD "0"
+  | .widen _ _ e =>
+    let x ← anf (.int 0) e
+    return s!"((double)({x}))"
+  | _ => return (scalarExpr ev m c).getD "0"
+
+/-- Emit the plain C entry point `a68_nf{k}` of a routine.  Its parameters are C variables,
+    no run-time frame is pushed, and the frames outside it are those of its declaration,
+    so its depths translate exactly as they would in the boxed entry point. -/
+partial def genNative (k : Nat) (sg : NatSig) (body : Core) (outer : List Frame) : M Unit := do
+  let s ← get
+  let savedCur := s.cur
+  let savedLabels := s.labels
+  let savedDepth := s.depth
+  let savedFrames := s.frames
+  let savedRet := s.ret
+  let params := (List.range sg.ptys.size).map fun i => s!"{(sg.ptys[i]!).name} a{k}_{i}"
+  let plist := if params.isEmpty then "void" else ", ".intercalate params
+  let rtyName := match sg.rty with | some t => t.name | none => "void"
+  let pf : Frame := {
+    vars := (List.range sg.ptys.size).toArray.map fun i => some (s!"a{k}_{i}", sg.ptys[i]!, false),
+    pushed := false }
+  let ret := match sg.rty with | some _ => "return 0;" | none => "return;"
+  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := pf :: outer, ret := ret }
+  match sg.rty with
+  | some t =>
+    emit s!"{t.name} rv{k} = 0;"
+    genInto t s!"rv{k}" body
+    emit s!"return rv{k};"
+  | none =>
+    genVoid body
+    emit "return;"
+  let st ← get
+  set { st with cur := savedCur, labels := savedLabels, depth := savedDepth, frames := savedFrames,
+                ret := savedRet, nfns := st.nfns.set! k (s!"static {rtyName} a68_nf{k}({plist})", st.cur) }
 
 /-- Emit code leaving the value of `c` on the operand stack. -/
 partial def gen (c : Core) : M Unit := do
+  -- an expression that calls a routine with a plain C entry point is computed natively,
+  -- its calls made as C calls, and boxed once
+  let ev0 ← env
+  if hasNatCall ev0 c then
+    match resultModeE ev0 c with
+    | some m0 =>
+      match CTy.ofMode m0 with
+      | some ty0 =>
+        if natOk ev0 m0 c then
+          let e ← anf m0 c
+          emit s!"a68_v({ty0.pushFn}({e}, W));"
+          return
+      | none => pure ()
+    | none => pure ()
   -- a value of primitive mode is computed in a native C type and boxed once, instead of
   -- pushing and popping a heap-allocated value for every intermediate result
   match scalarExprAny (← env) c with
@@ -802,7 +1007,12 @@ partial def genInto (ty : CTy) (v : String) (c : Core) : M Unit := do
 partial def genFallbackInto (ty : CTy) (v : String) (c : Core) : M Unit := do
   match scalarExpr (← env) ty.toMode c with
   | some e => emit s!"{v} = {e};"
-  | none => gen c; emit s!"{v} = {ty.popFn}();"
+  | none =>
+    let ev ← env
+    if hasNatCall ev c && natOk ev ty.toMode c then
+      let e ← anf ty.toMode c
+      emit s!"{v} = {e};"
+    else do gen c; emit s!"{v} = {ty.popFn}();"
 
 /-- Emit `c` in statement position.  Its value is discarded, so none of the push, nip and
     pop traffic that keeps a value on the operand stack has to be emitted at all. -/
@@ -836,6 +1046,17 @@ partial def genVoid (c : Core) : M Unit := do
   | .loop slot f b t w body => genLoopAt slot f b t w body false
   | .goto l => genNode (.goto l)
   | .stop => emit "a68_v(a68rt_stop(W));"
+  | .call f args =>
+    let ev ← env
+    match staticNat ev f with
+    | some pi =>
+      if args.length == pi.sig.ptys.size &&
+          (List.range args.length).all (fun i => natOk ev (pi.sig.ptys[i]!).toMode args[i]!) then
+        let as ← natArgs pi args
+        emit s!"(void) a68_nf{pi.nidx}({", ".intercalate as.toList});"
+        jumpCheck
+      else do gen c; emit "a68_v(a68rt_pop(W));"
+    | none => do gen c; emit "a68_v(a68rt_pop(W));"
   | _ => gen c; emit "a68_v(a68rt_pop(W));"
 
 /-- `x +:= e` in statement position: the variable or cell is updated in place, with
@@ -908,7 +1129,12 @@ partial def storeScalar (dst src : Core) : M Bool := do
       let setFlag := if u then s!" {v}_i = 1;" else ""
       match scalarExpr (← env) ty.toMode src with
       | some e => emit s!"{v} = {e};{setFlag}"
-      | none => gen src; emit s!"{v} = {ty.popFn}();{setFlag}"
+      | none =>
+        let ev ← env
+        if hasNatCall ev src && natOk ev ty.toMode src then
+          let e ← anf ty.toMode src
+          emit s!"{v} = {e};{setFlag}"
+        else do gen src; emit s!"{v} = {ty.popFn}();{setFlag}"
       return true
     | none =>
       match scalarExprAny (← env) src with
@@ -916,7 +1142,19 @@ partial def storeScalar (dst src : Core) : M Bool := do
         match CTy.ofMode m with
         | some ty => emit s!"{ty.setFn}({← rtd dd}, {ss}, {e});"; return true
         | none => return false
-      | none => return false
+      | none =>
+        let ev ← env
+        match resultModeE ev src with
+        | some m =>
+          match CTy.ofMode m with
+          | some ty =>
+            if hasNatCall ev src && natOk ev m src then
+              let e ← anf m src
+              emit s!"{ty.setFn}({← rtd dd}, {ss}, {e});"
+              return true
+            else return false
+          | none => return false
+        | none => return false
   | .slice base idx true =>
     -- `a[i] := <scalar>` writes the element in place
     match strip base with
@@ -1061,7 +1299,7 @@ partial def genNode (c : Core) : M Unit := do
   | .goto l =>
     let s ← get
     if s.labels.contains l then emit s!"goto L{l};"
-    else emit s!"a68_v(a68rt_raise_jump({l}, W)); return;"
+    else emit s!"a68_v(a68rt_raise_jump({l}, W)); {(← get).ret}"
   | .skip m => emit s!"a68_v(a68rt_push_skip({← putMode m}, W));"
   | .andThen l r =>
     gen l
@@ -1118,6 +1356,50 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
       | _ => pure ()
     return a
   let fr := planFrame n size modes stmts wantValue
+  -- Routines declared here that can also be plain C functions.  A routine's body sees those
+  -- declared before it or in the same run of consecutive routine declarations, since no
+  -- call can happen between two of them; the units of the block see a routine once its
+  -- declaration has been passed.
+  let mut procsAll : Array (Option ProcInfo) := Array.replicate size none
+  let mut nats : Array (Nat × NatSig × Core × Nat) := #[]
+  let mut runNo : Nat := 0
+  let mut inRun := false
+  for stx in stmts do
+    match stx with
+    | .decl sl dm init =>
+      match strip init, dm with
+      | .routine np fsz body, .proc _ _ =>
+        if !inRun then runNo := runNo + 1
+        inRun := true
+        match natSigOf dm np fsz body with
+        | some sg =>
+          if sl < size && fr.pushed && (fr.vars[sl]?.join).isNone then
+            let k ← reserveNative
+            procsAll := procsAll.set! sl (some { nidx := k, sig := sg })
+            nats := nats.push (sl, sg, body, runNo)
+        | none => pure ()
+      | _, _ => inRun := false
+    | _ => inRun := false
+  let procsFinal := procsAll
+  let natsFinal := nats
+  let afterDecl : Nat → M Unit := fun i => do
+    if i == 0 then return
+    match stmts[i - 1]? with
+    | some (.decl sl _ _) =>
+      match natsFinal.find? (fun (s2, _, _, _) => s2 == sl) with
+      | some (_, sg, body, r) =>
+        let pi := (procsFinal[sl]!).get!
+        let vis := (Array.range size).map fun s3 =>
+          if natsFinal.any (fun (s4, _, _, r4) => s4 == s3 && r4 ≤ r) then procsFinal[s3]! else none
+        let outer : List Frame := match (← get).frames with
+          | f :: rest => { f with procs := vis } :: rest
+          | [] => []
+        genNative pi.nidx sg body outer
+        modify fun st => match st.frames with
+          | f :: rest => { st with frames := { f with procs := f.procs.set! sl (some pi) } :: rest }
+          | [] => st
+      | none => pure ()
+    | _ => pure ()
   let vp := voidPositions stmts wantValue
   -- with labels the block keeps its value on the operand stack, because a jump can land
   -- anywhere and EXIT leaves with whatever the last unit produced
@@ -1132,10 +1414,11 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
         emit (s!"{ty.name} {v} = 0;" ++ (if u then s!" uint8_t {v}_i = 0;" else ""))
       | _ => pure ()
     if fr.pushed then emit s!"a68_v(a68rt_enter({size}, W));"
-    modify fun st => { st with frames := fr :: st.frames }
+    modify fun st => { st with frames := { fr with procs := Array.replicate size none } :: st.frames }
     if onStack then emit "a68_v(a68rt_push_void(W));"
     let mut produced := false
     for i in [0:stmts.size] do
+      afterDecl i
       match stmts[i]! with
       | .decl slot _ init =>
         match fr.vars[slot]? with
@@ -1170,6 +1453,7 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
         emit s!"L{id}: a68_jump_clear(); a68_v(a68rt_env_truncate(e{n}+{if fr.pushed then 1 else 0}, W)); a68_v(a68rt_stack_truncate(s{n}, W));"
         if onStack then emit "a68_v(a68rt_push_void(W));"
       | .exit => emit s!"goto B{n};"
+    afterDecl stmts.size
     if wantValue && !onStack && !produced && dest.isNone then emit "a68_v(a68rt_push_void(W));"
     modify fun st => { st with frames := st.frames.tail }
     emit s!"B{n}: {if fr.pushed then "a68_v(a68rt_leave(W));" else ";"}"
@@ -1272,7 +1556,7 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   let savedLabels := s.labels
   let savedDepth := s.depth
   let savedFrames := s.frames
-  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [] }
+  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;" }
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
   modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, pushed := true }] }
   gen body
@@ -1280,7 +1564,7 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   let st ← get
   let lines := st.cur
   let f : Fn := { name := s!"a68_fn{idx}", body := lines }
-  set { st with cur := savedCur, labels := savedLabels, depth := savedDepth, fns := st.fns.set! idx f, frames := savedFrames }
+  set { st with cur := savedCur, labels := savedLabels, depth := savedDepth, fns := st.fns.set! idx f, frames := savedFrames, ret := s.ret }
   return idx
 
 /-- Format items: the dynamic parts become holes evaluated by compiled code. -/
@@ -1305,12 +1589,12 @@ partial def genHole (c : Core) : M Core := do
   let savedLabels := s.labels
   let savedDepth := s.depth
   let savedFrames := s.frames
-  modify fun st => { st with cur := #[], labels := [], depth := 1, frames := [] }
+  modify fun st => { st with cur := #[], labels := [], depth := 1, frames := [], ret := "return;" }
   gen c
   let st ← get
   let lines := st.cur
   let f : Fn := { name := s!"a68_hole{idx}", body := lines }
-  set { st with cur := savedCur, labels := savedLabels, depth := savedDepth, holes := st.holes.set! idx f, frames := savedFrames }
+  set { st with cur := savedCur, labels := savedLabels, depth := savedDepth, holes := st.holes.set! idx f, frames := savedFrames, ret := s.ret }
   return .hole 0 idx
 
 end
@@ -1632,6 +1916,8 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : 
   for chunk in (st.w.render.splitOn "\n") do
     out := out ++ "  " ++ cstring (chunk ++ "\n") ++ "\n"
   out := out ++ ";\n\n"
+  for (sg, _) in st.nfns do
+    if sg != "" then out := out ++ sg ++ ";\n"
   for f in st.fns do
     out := out ++ s!"static void {f.name}(void);\n"
   for h in st.holes do
@@ -1641,6 +1927,8 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : 
     out := out ++ "static void " ++ f.name ++ "(void) {\n" ++ "\n".intercalate f.body.toList ++ "\n}\n\n"
   for h in st.holes do
     out := out ++ "static void " ++ h.name ++ "(void) {\n" ++ "\n".intercalate h.body.toList ++ "\n}\n\n"
+  for (sg, body) in st.nfns do
+    if sg != "" then out := out ++ sg ++ " {\n" ++ "\n".intercalate body.toList ++ "\n}\n\n"
   -- dispatchers called from the runtime
   out := out ++ "lean_object* a68_dispatch_proc(size_t fn, lean_object* env, lean_object* args, lean_object* w) {\n"
   out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n"
