@@ -1,0 +1,7 @@
+# `abend` ends the program with a runtime error carrying the given text, after the output #
+# written so far.                                                                          #
+BEGIN
+  print(("before", newline));
+  abend("stopping here");
+  print(("not reached", newline))
+END

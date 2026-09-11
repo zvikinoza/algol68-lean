@@ -1,0 +1,14 @@
+# Standard files, channels, formats and semaphores as members of unions, including a union #
+# nested in another.  `stand in` is a name of a file, dereferenced when it is united.       #
+BEGIN
+  MODE A = UNION (INT, REAL);
+  MODE B = UNION (FILE, BOOL, CHANNEL, FORMAT);
+  MODE X = UNION (A, B, SEMA);
+  [] X v = (1, 2.5, stand in, TRUE, stand out channel, $ddd$, LEVEL 1, stand out);
+  FOR i TO UPB v DO
+    print((v[i] | (INT): "int", (REAL): "real", (FILE): "file", (BOOL): "bool",
+                  (CHANNEL): "channel", (FORMAT): "format", (SEMA): "sema" | "other"));
+    print(IF i < UPB v THEN ", " ELSE "" FI)
+  OD;
+  print(newline)
+END

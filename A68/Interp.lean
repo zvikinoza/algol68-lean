@@ -278,6 +278,8 @@ partial def updatePath (v : Value) (path : List Sel) (nv : Value) : M Value := d
 
 def readRef : Value → M Value
   | .ref c path => do readPath (← readCell c) path
+  -- `stand in` and the other standard files are names of files, represented by the file
+  | .file id => return .file id
   | .nil => rtErr "attempt to dereference NIL"
   | .undef => rtErr "attempt to use an uninitialised REF value"
   | _ => rtErr "internal: dereferencing a non-REF"
@@ -2542,6 +2544,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     return .row #[1] #[w] ((str.toList.map fun c => Value.char c.toNat) ++ List.replicate (w - str.length) (Value.char 0)).toArray
   | "evaluate", [code, .fmt env items] => evaluateCall (← strOf code) env items
   | "evaluate", [code] => evaluateCall (← strOf code) [] []
+  | "abend", [msg] => rtErr (← strOf msg)
   | "system", [cmd] =>
     let c ← strOf cmd
     flushOut

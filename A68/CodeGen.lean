@@ -2592,7 +2592,8 @@ static inline uint32_t a68_repr(int64_t x) {
 "
 
 /-- Emit the whole program. -/
-def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : String := Id.run do
+def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
+    (echoes : List String := []) : String := Id.run do
   let (_, st) := (do
       let idx ← genFunction 0 0 core
       pure idx : M Nat).run { modeTab := modes }
@@ -2646,6 +2647,10 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : 
   out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   -- main
   out := out ++ "int main(int argc, char** argv) {\n"
+  -- `PR echo` texts are printed when the program is read, before anything it prints
+  for e in echoes do
+    out := out ++ "  fputs(" ++ cstring (e ++ "\n") ++ ", stdout);\n"
+  if !echoes.isEmpty then out := out ++ "  fflush(stdout);\n"
   out := out ++ "  argv = lean_setup_args(argc, argv);\n  lean_initialize_runtime_module();\n"
   out := out ++ "  lean_object* ir = initialize_algol68_A68_Runtime(1);\n"
   out := out ++ "  if (lean_io_result_is_error(ir)) { a68_fail(ir); }\n  lean_dec_ref(ir);\n"

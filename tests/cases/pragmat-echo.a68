@@ -1,0 +1,9 @@
+PR echo "echoed before the program runs" PR
+# `PR echo` pragmats are printed when the program is read, before anything it prints, #
+# in the order they appear, by the compiled program as well as the evaluator.          #
+BEGIN
+  PR echo "a second echo, with a trailing space " PR
+  print(("the program itself", newline));
+  PR echo "a third, after a unit" PR
+  print((42, newline))
+END

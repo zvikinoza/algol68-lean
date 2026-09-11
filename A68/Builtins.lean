@@ -113,7 +113,7 @@ def procs : List (String × Mode) :=
    ("makeconv", proc [REFFILE] void), ("maketerm", proc [REFFILE, STRING] void),
    -- a68g extensions (prelude.c): evaluation, processes, the file system, time, regular expressions
    ("evaluate", proc [STRING] STRING), ("sleep", proc [number] INT),
-   ("getenv", proc [STRING] STRING), ("fork", proc [] INT),
+   ("getenv", proc [STRING] STRING), ("abend", proc [STRING] void), ("fork", proc [] INT),
    ("execve", proc [STRING, RSTRING, RSTRING] INT), ("exec", proc [STRING, RSTRING, RSTRING] INT),
    ("execvechild", proc [STRING, RSTRING, RSTRING] INT), ("execsub", proc [STRING, RSTRING, RSTRING] INT),
    ("execvechildpipe", proc [STRING, RSTRING, RSTRING] PIPE), ("execsubpipeline", proc [STRING, RSTRING, RSTRING] PIPE),

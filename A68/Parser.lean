@@ -1165,7 +1165,15 @@ def echoesOf (toks : Array Token) : List String := Id.run do
         | '"' :: rest => out := out ++ [String.ofList (rest.takeWhile (· != '"'))]
         | _ => pure ()
     | _ => pure ()
-  return out
+  -- a68g ends one echo's line when it prints the next, and that strips its trailing
+  -- blanks; the last echo's line is ended by the program's own output, which does not
+  let n := out.length
+  let mut res : List String := []
+  let mut i := 0
+  for e in out do
+    res := res ++ [if i + 1 < n then String.ofList (e.toList.reverse.dropWhile (· == ' ')).reverse else e]
+    i := i + 1
+  return res
 
 /-- Is a `PR regression PR` (or `quiet regression`) pragmat present? -/
 def isRegression (toks : Array Token) : Bool :=
