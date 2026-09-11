@@ -135,11 +135,16 @@ reported separately by the test scripts.
   than about 15 significant digits differ.
 * **`LONG INT` printed through `fixed`/`float`** uses the double conversion
   above for `INT` but exact conversion for `LONG INT`, as a68g does.
-* **Unsupported a68g extensions**: refinements, `evaluate`, `DOUBLE`, C-style
-  `%` formats, partial parametrisation (`f (x, )`), semaphores and `PAR`,
-  `sound`, curses, plotutils, GSL, MPFR, R mathlib, sockets, `system`,
-  `execve`, environment and date/time enquiries (`local time`, `getenv`,
-  `file is directory`).
+* **Unsupported a68g extensions**: `evaluate`, C-style `%` formats, `UP` and
+  `DOWN` on semaphores, `sound`, curses, plotutils, GSL, MPFR, R mathlib,
+  sockets, `system`, `execve`, environment and date/time enquiries
+  (`local time`, `getenv`, `file is directory`).  Refinements, partial
+  parametrisation (`f (x, )`), `DO … UNTIL … OD`, `NEW`, the environ modes
+  `ZAHL`, `DOUBLE` and `QUAD`, and `LEVEL` are supported.
+* **`PAR` clauses** run their units one after another, left to right.  a68g
+  runs them on threads, and its output then depends on scheduling: six runs of
+  Rosetta Code's concurrent-computing program give three different orders, so
+  no implementation can reproduce a given run.
 * **Output already written when formatted transput fails.** When a `printf`
   picture cannot accept the value it is given, a68g discards the characters it
   had produced for that item and this implementation keeps them. Both fail on
@@ -151,11 +156,6 @@ reported separately by the test scripts.
   is right: a display has no a priori mode, so it cannot be the operand of a
   union coercion. This can only affect programs a68g refuses outright, so it
   cannot change the output of a program a68g accepts.
-* **A declaration after a labelled unit** is accepted here and rejected by
-  a68g with "declaration cannot follow a labeled unit". a68g is right: the
-  Revised Report allows labels only in a serial clause's units after its last
-  declaration. As with the display coerced to a union, this can only affect
-  programs a68g refuses, so it cannot change the output of one it accepts.
 * **`COMPL` division** has no reference behaviour to match: a68g 3.13.3 stops
   with a memory access violation on `z / w` and `z /:= w` for complex `z` and
   `w`, whatever their values. a68lean divides, and reports a zero divisor.
