@@ -361,6 +361,13 @@ partial def strip : Core → Core
   | .at _ e => strip e
   | c => c
 
+/-- A clause that chooses among units, which `genInto` computes into a C variable branch by
+    branch instead of boxing each branch's value. -/
+def isChoice (c : Core) : Bool :=
+  match strip c with
+  | .cond .. | .caseInt .. | .block .. | .seq .. => true
+  | _ => false
+
 /-- Which statements of a block are generated in statement position, where the value is
     thrown away.  Without labels only the last unit supplies the block's value, so every
     earlier unit is a statement; with labels any unit can be the value the block exits
@@ -1705,6 +1712,17 @@ partial def genInto (ty : CTy) (v : String) (c : Core) : M Unit := do
       emit ("if (!" ++ v ++ ") {")
       indent (genInto ty v r)
       emit "}"
+  | .caseInt sel alts out =>
+    genCaseHead sel alts.length
+    let mut k := 1
+    for a in alts do
+      emit ("case " ++ toString k ++ ": {")
+      indent (genInto ty v a)
+      emit "} break;"
+      k := k + 1
+    emit "default: {"
+    indent (genInto ty v out)
+    emit "} }"
   | c' => genFallbackInto ty v c'
 
 partial def genFallbackInto (ty : CTy) (v : String) (c : Core) : M Unit := do
@@ -1750,6 +1768,17 @@ partial def genVoid (c : Core) : M Unit := do
   | .caseConf sel alts out =>
     if (unionRowSel (← env) sel).isSome then genConformity sel alts out false
     else do gen c; emit "a68_v(a68rt_pop(W));"
+  | .caseInt sel alts out =>
+    genCaseHead sel alts.length
+    let mut k := 1
+    for a in alts do
+      emit ("case " ++ toString k ++ ": {")
+      indent (genVoid a)
+      emit "} break;"
+      k := k + 1
+    emit "default: {"
+    indent (genVoid out)
+    emit "} }"
   | .goto l => genNode (.goto l)
   | .stop => emit "a68_v(a68rt_stop(W));"
   | .call f args =>
@@ -1873,6 +1902,13 @@ partial def storeScalar (dst src : Core) : M Bool := do
         if hasNatCall ev src && natOk ev ty.toMode src then
           let e ← anf ty.toMode src
           emit s!"{v} = {e};{setFlag}"
+        else if isChoice src then do
+          -- into a temporary first: until the clause has its value, its units still read the
+          -- variable's old value
+          let k ← fresh
+          emit s!"{ty.name} w{k} = 0;"
+          genInto ty s!"w{k}" src
+          emit s!"{v} = w{k};{setFlag}"
         else do gen src; emit s!"{v} = {ty.popFn}();{setFlag}"
       return true
     | none =>
@@ -2045,8 +2081,7 @@ partial def genNode (c : Core) : M Unit := do
     indent (gen e)
     emit "}"
   | .caseInt sel alts out =>
-    gen sel
-    emit ("switch (a68_case(" ++ toString alts.length ++ ")) {")
+    genCaseHead sel alts.length
     let mut k := 1
     for a in alts do
       emit ("case " ++ toString k ++ ": {")
@@ -2300,6 +2335,14 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
     emit "a68_v(a68rt_nip(W));"
   emit "}"
 
+/-- The head of the `switch` of an integer case clause.  A selector with a native value is
+    switched on directly, and a value outside `1..n` falls to `default`, which is the
+    alternative the runtime's case index would have chosen. -/
+partial def genCaseHead (sel : Core) (n : Nat) : M Unit := do
+  match scalarExpr (← env) (.int 0) sel with
+  | some se => emit ("switch (" ++ se ++ ") {")
+  | none => do gen sel; emit ("switch (a68_case(" ++ toString n ++ ")) {")
+
 /-- A conformity clause on an element of a row of unions kept as C arrays: a `switch` on the
     element's tag.  The element is subscripted and checked against the bounds first, since
     the evaluator dereferences it before it looks at any alternative.  Tag zero, an element
@@ -2370,8 +2413,7 @@ partial def genUnionStore (rv : RowVar) (o : String) (src : Core) : M Unit := do
     indent (genUnionStore rv o e)
     emit "}"
   | .caseInt sel alts out =>
-    gen sel
-    emit ("switch (a68_case(" ++ toString alts.length ++ ")) {")
+    genCaseHead sel alts.length
     let mut i := 1
     for a in alts do
       emit ("case " ++ toString i ++ ": {")

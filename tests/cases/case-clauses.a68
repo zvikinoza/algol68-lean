@@ -1,0 +1,29 @@
+# Integer case clauses in value position, assigned to variables, and as statements. #
+BEGIN
+  INT s := 1;
+  FOR i FROM -2 TO 14 DO
+    s := CASE i MOD 5 IN s + i, s * 2, (s > 50 | s - 50 | s + 7) OUT s - 1 ESAC;
+    CASE i IN print(("one", s)), print(("two", s)) OUT SKIP ESAC;
+    CASE i - 10 IN s +:= 100, (s -:= 3; print(s)) ESAC
+  OD;
+  print((s, newline));
+  BOOL b := FALSE;
+  b := TRUE ANDTH b;
+  print((b, newline));
+  BOOL c := TRUE;
+  c := (c | FALSE | TRUE) OREL c;
+  print((c, newline));
+  INT t := 3;
+  t := CASE t IN 10, 20, t * t + CASE t - 2 IN t, 0 ESAC OUT -1 ESAC;
+  REAL r := 1.5;
+  r := CASE t MOD 3 + 1 IN r * 2, r / 2, r + t OUT 0.0 ESAC;
+  print((t, r, newline));
+  INT q := 0;
+  FOR i TO 30 DO
+    q := CASE i MOD 4 + 1 IN (INT z = q + i; z * 2) MOD 97, q + 1, (q > 10 | q - 10 | q) OUT 999 ESAC
+  OD;
+  print((q, newline));
+  INT u;
+  INT w := CASE u IN 1, 2 OUT 3 ESAC;
+  print(w)
+END
