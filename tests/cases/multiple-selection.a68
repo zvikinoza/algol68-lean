@@ -1,0 +1,20 @@
+# Multiple selection: the field of every element of a row, through a name and as a value. #
+BEGIN
+  MODE P = STRUCT (INT x, REAL y, STRING s);
+  [1:4] P ps;
+  FOR i TO 4 DO ps[i] := (i, i / 2, "p" + whole(i, 0)) OD;
+  [] INT xs = x OF ps;
+  print((xs, newline));
+  print(((y OF ps)[3], (s OF ps)[4], UPB (s OF ps), newline));
+  (x OF ps)[2] := 20;
+  x OF ps := (7, 8, 9, 10);
+  print((x OF ps, newline));
+  REF [] STRING names = s OF ps;
+  names[1] := "first";
+  print((s OF ps[1], names[1], newline));
+  [] P qs = ps;
+  print((x OF qs, y OF qs[2], newline));
+  [1:2, 1:2] P grid;
+  FOR i TO 2 DO FOR j TO 2 DO grid[i, j] := (10 * i + j, 0.5, "g") OD OD;
+  print(((x OF grid)[2, 1], (x OF grid)[1, 2], newline))
+END
