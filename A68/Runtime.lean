@@ -250,6 +250,11 @@ def pushBigInt (i : UInt32) : IO Unit := go do
   push (.int (if s.startsWith "-" then -((String.ofList (s.toList.drop 1)).toNat! : Int)
               else (s.toNat! : Int)))
 
+/-- A BITS denotation wider than 64 bits, from its decimal digits. -/
+@[export a68rt_push_bigbits]
+def pushBigBits (i : UInt32) : IO Unit := go do
+  push (.bits (← str i).toNat!)
+
 @[export a68rt_push_real]
 def pushReal (v : Float) : IO Unit := go (push (.real v))
 

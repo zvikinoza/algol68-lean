@@ -905,7 +905,7 @@ def roundReal (x : Float) : Int :=
 
 def realMod (a b : Float) : Float := a - b * Float.floor (a / b)
 
-def bitsWidthOf (long : Int) : Nat := if long ≤ 0 then 32 else 64
+def bitsWidthOf (long : Int) : Nat := Numfmt.bitsWidthOfLen long
 def bitsMask (long : Int) : Nat := 2 ^ (bitsWidthOf long) - 1
 
 -- ## Output of values (unformatted transput)
@@ -1585,6 +1585,15 @@ partial def widenValue (src dst : Mode) (v : Value) : M Value := do
       return .struct #[.mp (MP.lenMp re MP.longDigits ll), .mp (MP.lenMp im MP.longDigits ll)]
     return v
   | .compl _, .compl _, _ => return v
+  | .bits 0, .bits d, .bits b =>
+    if d ≤ 0 then return v
+    -- a68g widens a BITS to LONG BITS with `genie_lengthen_int_to_mp`, reading the 32 bits as
+    -- an INT.  A value with its top bit set comes out as that INT plus 2^32, kept to as many
+    -- radix-10^7 digits as the INT's magnitude has: `LENG NOT BIN 0` is 4967295.
+    if b < 2147483648 then return v
+    let k : Int := (b : Int) - 4294967296
+    let digs : Nat := if k.natAbs < 10000000 then 1 else 2
+    return .bits (b % 10 ^ (7 * digs))
   | .bits _, .bits _, _ => return v
   -- a BYTES value is its row of characters, NUL padded to `bytes width`
   | .bytes _, .row _ _ .char, _ => return v
@@ -2240,8 +2249,11 @@ partial def readNumber (fid : Nat) (real : Bool) : M String := do
         s := s.push (Char.ofNat (← readChar fid).get!)
     if (← peekIs fun c => c == 101 || c == 69) then
       s := s.push (Char.ofNat (← readChar fid).get!)
+      -- a68g writes an exponent as `e -51`, and reads it back so
+      while (← peekIs (· == 32)) do let _ ← readChar fid
       if (← peekIs fun c => c == 43 || c == 45) then
         s := s.push (Char.ofNat (← readChar fid).get!)
+      while (← peekIs (· == 32)) do let _ ← readChar fid
       while (← peekIs isDigit) do
         s := s.push (Char.ofNat (← readChar fid).get!)
   if s.isEmpty || s == "+" || s == "-" then valueError fid "invalid numeral in input"

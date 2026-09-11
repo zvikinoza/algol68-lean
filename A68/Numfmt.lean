@@ -308,6 +308,16 @@ def bitsWidth : Nat := 32
 def defaultLLDigits : Nat := 12
 def llDigitsOfPrecision (n : Nat) : Nat := 2 + (n + 6) / 7
 
+/-- a68g's `MP_BITS_WIDTH (k)`, the bits of a multi-precision BITS of `k` digits:
+    `ceil (k * LOG_MP_RADIX * CONST_LOG2_10) - 1`, computed in doubles as it is there. -/
+def mpBitsWidth (k : Nat) : Nat :=
+  (Float.ceil (Float.ofNat (k * 7) * 3.321928094887362)).toUInt64.toNat - 1
+
+/-- The width of BITS of a length: 32 bits, and for LONG and LONG LONG BITS the width of
+    a68g's multi-precision representation (162 and, at the default precision, 279). -/
+def bitsWidthOfLen (long : Int) (ll : Nat := 12) : Nat :=
+  if long ≤ 0 then 32 else if long == 1 then mpBitsWidth 7 else mpBitsWidth ll
+
 def intWidthOf (long : Int) (ll : Nat := defaultLLDigits) : Nat :=
   if long ≤ 0 then intWidth else if long == 1 then longIntWidth else ll * 7 + 1
 def realWidthOf (long : Int) (ll : Nat := defaultLLDigits) : Nat :=

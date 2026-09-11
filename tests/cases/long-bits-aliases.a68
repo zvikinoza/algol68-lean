@@ -1,0 +1,21 @@
+# LONG BITS widths, a68g's short names for LONG routines, and reading `e -51`. #
+BEGIN
+  print((long bits width, long long bits width, newline));
+  print((long max bits, newline));
+  print((long long max bits, newline));
+  LONG BITS lb := long max bits;
+  print((ABS (lb SHR 150), newline));
+  print((dpi, newline));
+  print((qpi, newline));
+  print((dsqrt (2), newline));
+  print((qexp (1), newline));
+  REAL y; LONG REAL ly; LONG LONG REAL lly;
+  STRING s := "+2.9e -51";
+  gets (s, y); print((y, newline));
+  gets (s, ly); print((ly, newline));
+  gets (s, lly); print((lly, newline));
+  STRING u := "-1.25e +3";
+  gets (u, lly); print((lly, newline));
+  []BITS vals = (NOT BIN 0, NOT BIN 9999999, NOT BIN 10000000, BIN 1 SHL 31, BIN 305419896);
+  FOR i TO UPB vals DO print((ABS vals[i], " ", ABS LENG vals[i], newline)) OD
+END

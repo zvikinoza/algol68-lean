@@ -788,7 +788,8 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
   | .lit (.real x) => if ty == .f64 then some (creal x) else none
   | .lit (.bool b) => if ty == .u8 then some (if b then "1" else "0") else none
   | .lit (.char ch) => if ty == .u32 then some s!"{ch}u" else none
-  | .lit (.bits b) => if ty == .u64 then some s!"{b}ull" else none
+  -- a LONG BITS value too wide for 64 bits is boxed from its digits instead
+  | .lit (.bits b) => if ty == .u64 && b < 2 ^ 64 then some s!"{b}ull" else none
   | .loadCell d s =>
     match varOf env d s with
     | some (v, vt, u) => if vt == ty then some (readVar (v, vt, u)) else none
@@ -2378,7 +2379,9 @@ partial def genLit (v : Value) : M Unit := do
   | .real x => emit s!"a68_v(a68rt_push_real({creal x}, W));"
   | .bool b => emit s!"a68_v(a68rt_push_bool({if b then 1 else 0}, W));"
   | .char c => emit s!"a68_v(a68rt_push_char({c}, W));"
-  | .bits b => emit s!"a68_v(a68rt_push_bits({b}ULL, W));"
+  | .bits b =>
+    if b < 2 ^ 64 then emit s!"a68_v(a68rt_push_bits({b}ULL, W));"
+    else emit s!"a68_v(a68rt_push_bigbits({← putStr (toString b)}, W));"
   | .void => emit "a68_v(a68rt_push_void(W));"
   | .nil => emit "a68_v(a68rt_push_nil(W));"
   | .undef => emit "a68_v(a68rt_push_undef(W));"
@@ -2882,6 +2885,7 @@ lean_object* a68rt_stack_depth(lean_object* w);
 lean_object* a68rt_stack_truncate(uint32_t d, lean_object* w);
 lean_object* a68rt_push_int(int64_t v, lean_object* w);
 lean_object* a68rt_push_bigint(uint32_t i, lean_object* w);
+lean_object* a68rt_push_bigbits(uint32_t i, lean_object* w);
 lean_object* a68rt_push_real(double v, lean_object* w);
 lean_object* a68rt_push_bool(uint8_t v, lean_object* w);
 lean_object* a68rt_push_char(uint32_t v, lean_object* w);

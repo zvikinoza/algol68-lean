@@ -514,7 +514,9 @@ def builtinMonadic (op : String) (e : Core) (m : Mode) : Elab (Option (Core × M
     return some (.monop op m e, m)
   | "ABS", .int _ | "ABS", .real _ => return some (.monop "ABS" m e, m)
   | "ABS", .compl n => return some (.monop "ABS" m e, .real n)
-  | "ABS", .char | "ABS", .bool | "ABS", .bits _ => return some (.monop "ABS" m e, .int 0)
+  | "ABS", .char | "ABS", .bool => return some (.monop "ABS" m e, .int 0)
+  -- ABS of a LONG BITS is a LONG INT
+  | "ABS", .bits n => return some (.monop "ABS" m e, .int n)
   | "SIGN", .int _ | "SIGN", .real _ => return some (.monop "SIGN" m e, .int 0)
   | "ODD", .int _ => return some (.monop "ODD" m e, .bool)
   | "ENTIER", .real n | "ROUND", .real n => return some (.monop op m e, .int n)
@@ -561,7 +563,10 @@ def constValue (name : String) (ll : Nat := Numfmt.defaultLLDigits) (fileName : 
   | "longintwidth" => .int 50 | "longrealwidth" => .int 42 | "longexpwidth" => .int 3
   | "longlongintwidth" => .int (Numfmt.intWidthOf 2 ll) | "longlongrealwidth" => .int (Numfmt.realWidthOf 2 ll)
   | "longlongexpwidth" => .int 3
-  | "bitswidth" => .int 32 | "longbitswidth" => .int 64 | "byteswidth" => .int 32 | "maxabschar" => .int 255
+  | "bitswidth" => .int 32 | "longbitswidth" => .int (Numfmt.bitsWidthOfLen 1 ll)
+  | "longlongbitswidth" => .int (Numfmt.bitsWidthOfLen 2 ll)
+  | "longmaxbits" => .bits (2 ^ Numfmt.bitsWidthOfLen 1 ll - 1)
+  | "longlongmaxbits" => .bits (2 ^ Numfmt.bitsWidthOfLen 2 ll - 1) | "byteswidth" => .int 32 | "maxabschar" => .int 255
   | "intlengths" => .int 3 | "intshorths" => .int 1 | "reallengths" => .int 3 | "realshorths" => .int 1
   | "bitslengths" => .int 3 | "byteslengths" => .int 2
   | "nullcharacter" | "nullchar" => .char 0 | "blank" => .char 32 | "flip" => .char 84 | "flop" => .char 70
@@ -876,7 +881,7 @@ partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
         | _ => return (.stop, .void)
     | some b => applyCtx ctx (← cellCore b) b.mode
     | none => err "tag \"stop\" has not been declared"
-  | .ident n _ =>
+  | .ident n p0 =>
     match (← lookup n) with
     | some b =>
       match b.kind with
@@ -885,7 +890,11 @@ partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
         | .strong t => return (.goto id, t)
         | _ => return (.goto id, .void)
       | _ => applyCtx ctx (← cellCore b) b.mode
-    | none => err s!"tag \"{n}\" has not been declared"
+    | none =>
+      -- `dpi`, `qsqrt` and a68g's other short names for LONG and LONG LONG routines
+      match Builtins.dqAlias n with
+      | some t => elabUnit (.ident t p0) ctx
+      | none => err s!"tag \"{n}\" has not been declared"
   | .routine params ret body _ =>
     let (c, m) ← elabRoutine params ret body
     applyCtx ctx c m
