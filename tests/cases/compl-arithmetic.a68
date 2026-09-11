@@ -1,0 +1,31 @@
+# COMPL arithmetic and functions, printed to the last figure a double carries. #
+BEGIN
+  PROC show = (STRING n, COMPL z) VOID:
+    print((n, float(re OF z, 26, 18, 3), " ", float(im OF z, 26, 18, 3), newline));
+  PROC showr = (STRING n, REAL x) VOID: print((n, float(x, 26, 18, 3), newline));
+  REAL a = 3, b = 4, c = 5;
+  COMPL s = complex sqrt(b * b - 4 * a * c);
+  COMPL r1 = (-b + s) / (2 * a), r2 = (-b - s) / (2 * a);
+  PROC ev = (COMPL x) COMPL: (a * x + b) * x + c;
+  show("y1 ", ev(r1)); show("y2 ", ev(r2));
+  []COMPL zs = (COMPL (2.5, -1.25), COMPL (-0.75, 3.5), COMPL (1.0E-3, 7.0), COMPL (-6.25, 0.1),
+                COMPL (0.3, 0.7), COMPL (-0.2, -0.9));
+  FOR i TO UPB zs DO
+    COMPL z = zs[i];
+    FOR j TO UPB zs DO
+      COMPL w = zs[j];
+      show("mul ", z * w); show("div ", z / w)
+    OD;
+    show("pow3 ", z ** 3); show("pow-2 ", z ** -2); show("pow7 ", z ** 7);
+    showr("abs ", ABS z); showr("arg ", ARG z);
+    show("sqrt ", complex sqrt(z)); show("exp ", complex exp(z)); show("ln ", complex ln(z));
+    show("sin ", complex sin(z)); show("cos ", complex cos(z)); show("tan ", complex tan(z));
+    show("asin ", complex arcsin(z)); show("acos ", complex arccos(z)); show("atan ", complex arctan(z));
+    show("sinh ", complex sinh(z)); show("cosh ", complex cosh(z)); show("tanh ", complex tanh(z));
+    show("asinh ", complex arcsinh(z)); show("acosh ", complex arccosh(z)); show("atanh ", complex arctanh(z));
+    COMPL t := z;
+    t *:= zs[(i MOD UPB zs) + 1]; show("*:= ", t);
+    t /:= zs[((i + 1) MOD UPB zs) + 1]; show("/:= ", t);
+    show("real* ", 1.7 * z); show("real/ ", 1.7 / z); show("/real ", z / 1.7)
+  OD
+END

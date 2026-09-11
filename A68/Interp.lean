@@ -351,6 +351,13 @@ def refSub (r : Value) (l u : Array Int) (offs : Array Nat) : M Value := do
     | _ => return .ref c (path ++ [.sub l u offs])
   | _ => rtErr "internal: refSub"
 
+-- ## COMPL arithmetic as a68g computes it (`csrc/sys.c`)
+
+@[extern "a68_compl_op"] opaque complOp (which part : UInt8) (rx ix ry iy : Float) : Float
+@[extern "a68_compl_pow"] opaque complPowC (part : UInt8) (rx ix : Float) (j : UInt64) : Float
+@[extern "a68_compl_abs"] opaque complAbs (x y : Float) : Float
+@[extern "a68_compl_fn"] opaque complFn (which part : UInt8) (re im : Float) : Float
+
 -- ## Operating-system services (`csrc/sys.c`)
 
 @[extern "a68_sys_fork"] opaque sysFork (u : Unit) : BaseIO UInt32
@@ -488,6 +495,17 @@ def checkReal (x : Float) : M Float := do
   if x.isNaN then rtErr "REAL value is not a number"
   if x.isInf then rtErr "infinite REAL value"
   return x
+
+/-- a68g's CHECK_COMPLEX: the real part is tested, then the imaginary part. -/
+def checkCompl (re im : Float) : M Value := do
+  for x in [re, im] do
+    if x.isNaN then rtErr "COMPL value is not a number"
+    if x.isInf then rtErr "infinite COMPL value"
+  return mkCompl re im
+
+/-- COMPL multiplication (0) and division (1), with a68g's check of the result. -/
+def complBin (which : UInt8) (ar ai br bi : Float) : M Value :=
+  checkCompl (complOp which 0 ar ai br bi) (complOp which 1 ar ai br bi)
 
 /-- a68g `a68g_x_up_n_real`: square-and-multiply in a fixed order. -/
 def powRealIntPos (x : Float) (nn : Nat) : M Float := do
@@ -1299,10 +1317,8 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
           match op with
           | "+:=" => pure (mkCompl (ar + br) (ai + bi))
           | "-:=" => pure (mkCompl (ar - br) (ai - bi))
-          | "*:=" => pure (mkCompl (ar * br - ai * bi) (ar * bi + ai * br))
-          | "/:=" =>
-            let den := br * br + bi * bi
-            pure (mkCompl ((ar * br + ai * bi) / den) ((ai * br - ar * bi) / den))
+          | "*:=" => complBin 0 ar ai br bi
+          | "/:=" => complBin 1 ar ai br bi
           | _ => rtErr s!"internal: assigning operator {op} on COMPL"
         | _, _ => rtErr "internal: COMPL expected"
       | .bits n => do
@@ -1388,34 +1404,23 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     match a with
     | .struct #[.real re, .real im] =>
       let y ← expectInt b
-      -- square-and-multiply on complex numbers
-      let mul := fun (p q : Float × Float) => (p.1 * q.1 - p.2 * q.2, p.1 * q.2 + p.2 * q.1)
-      let mut p : Float × Float := (1.0, 0.0)
-      let mut mm : Float × Float := (re, im)
-      let nn := y.natAbs
-      let mut bit : Nat := 1
-      if nn > 0 then
-        repeat
-          if nn &&& bit != 0 then p := mul p mm
-          bit := bit <<< 1
-          if bit ≤ nn then mm := mul mm mm
-          if !(bit ≤ nn) then break
+      -- a68g's square-and-multiply; a negative exponent then divides 1 by the power
+      let n : UInt64 := UInt64.ofNat y.natAbs
+      let z ← checkCompl (complPowC 0 re im n) (complPowC 1 re im n)
       if y < 0 then
-        let den := p.1 * p.1 + p.2 * p.2
-        p := (p.1 / den, -p.2 / den)
-      return mkCompl p.1 p.2
+        match z with
+        | .struct #[.real zr, .real zi] => complBin 1 1.0 0.0 zr zi
+        | _ => return z
+      else return z
     | _ => rtErr "internal: COMPL expected"
   | .compl _, .compl _ =>
     match a, b with
     | .struct #[.real ar, .real ai], .struct #[.real br, .real bi] =>
       match op with
-      | "+" => return mkCompl (ar + br) (ai + bi)
-      | "-" => return mkCompl (ar - br) (ai - bi)
-      | "*" => return mkCompl (ar * br - ai * bi) (ar * bi + ai * br)
-      | "/" =>
-        let den := br * br + bi * bi
-        if den == 0.0 then rtErr "COMPL division by zero"
-        return mkCompl ((ar * br + ai * bi) / den) ((ai * br - ar * bi) / den)
+      | "+" => checkCompl (ar + br) (ai + bi)
+      | "-" => checkCompl (ar - br) (ai - bi)
+      | "*" => complBin 0 ar ai br bi
+      | "/" => complBin 1 ar ai br bi
       | "=" => return .bool (ar == br && ai == bi)
       | "/=" => return .bool (!(ar == br && ai == bi))
       | _ => rtErr s!"internal: COMPL operator {op}"
@@ -1601,7 +1606,7 @@ partial def monadic (op : String) (m : Mode) (v : Value) : M Value := do
   | "ABS", .int _ => do let x ← expectInt v; return .int x.natAbs
   | "ABS", .real _ => do let x ← expectReal v; return .real (Float.abs x)
   | "ABS", .compl _ => match v with
-    | .struct #[.real r, .real i] => return .real (Float.sqrt (r * r + i * i))
+    | .struct #[.real r, .real i] => return .real (complAbs r i)
     | _ => rtErr "internal"
   | "ABS", .char => do let c ← expectChar v; return .int c
   | "ABS", .bool => do let b ← expectBool v; return .int (if b then 1 else 0)
@@ -1643,7 +1648,9 @@ partial def monadic (op : String) (m : Mode) (v : Value) : M Value := do
   | "IM", .compl _ => match v with | .struct #[_, .real i] => return .real i | _ => rtErr "internal"
   | "CONJ", .compl _ => match v with | .struct #[.real r, .real i] => return mkCompl r (-i) | _ => rtErr "internal"
   | "ARG", .compl _ => match v with
-    | .struct #[.real r, .real i] => return .real (Float.atan2 i r)
+    | .struct #[.real r, .real i] => do
+      if r == 0.0 && i == 0.0 then rtErr "invalid COMPL argument"
+      return .real (Float.atan2 i r)
     | _ => rtErr "internal"
   | "LWB", .row _ _ _ => do let (l, _, _) ← expectRow v; return .int l[0]!
   | "UPB", .row _ _ _ => do let (_, u, _) ← expectRow v; return .int u[0]!
@@ -2491,22 +2498,23 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let t ← IO.monoMsNow
     return .real (Float.ofNat t / 1000.0)
   | "complexsqrt", [z] | "csqrt", [z] | "complexexp", [z] | "cexp", [z] | "complexln", [z] | "cln", [z]
-  | "complexsin", [z] | "csin", [z] | "complexcos", [z] | "ccos", [z] | "complexarctan", [z] =>
+  | "complexsin", [z] | "csin", [z] | "complexcos", [z] | "ccos", [z] | "complextan", [z] | "ctan", [z]
+  | "complexarcsin", [z] | "casin", [z] | "complexarccos", [z] | "cacos", [z]
+  | "complexarctan", [z] | "catan", [z] | "complexsinh", [z] | "csinh", [z]
+  | "complexcosh", [z] | "ccosh", [z] | "complextanh", [z] | "ctanh", [z]
+  | "complexarcsinh", [z] | "casinh", [z] | "complexarccosh", [z] | "cacosh", [z]
+  | "complexarctanh", [z] | "catanh", [z] =>
     match z with
     | .struct #[.real re, .real im] =>
-      match name with
-      | "complexsqrt" | "csqrt" =>
-        let r := Float.sqrt (re * re + im * im)
-        let a := Float.sqrt ((r + re) / 2)
-        let b := Float.sqrt ((r - re) / 2)
-        return mkCompl a (if im < 0 then -b else b)
-      | "complexexp" | "cexp" =>
-        let e := Float.exp re
-        return mkCompl (e * Float.cos im) (e * Float.sin im)
-      | "complexln" | "cln" => return mkCompl (Float.log (Float.sqrt (re * re + im * im))) (Float.atan2 im re)
-      | "complexsin" | "csin" => return mkCompl (Float.sin re * Float.cosh im) (Float.cos re * Float.sinh im)
-      | "complexcos" | "ccos" => return mkCompl (Float.cos re * Float.cosh im) (-(Float.sin re * Float.sinh im))
-      | _ => rtErr s!"unsupported complex function {name}"
+      -- a68g calls the C library's function (single.c, C_C_FUNCTION)
+      let k : UInt8 := match name with
+        | "complexsqrt" | "csqrt" => 0 | "complexexp" | "cexp" => 1 | "complexln" | "cln" => 2
+        | "complexsin" | "csin" => 3 | "complexcos" | "ccos" => 4 | "complextan" | "ctan" => 5
+        | "complexarcsin" | "casin" => 6 | "complexarccos" | "cacos" => 7
+        | "complexarctan" | "catan" => 8 | "complexsinh" | "csinh" => 9
+        | "complexcosh" | "ccosh" => 10 | "complextanh" | "ctanh" => 11
+        | "complexarcsinh" | "casinh" => 12 | "complexarccosh" | "cacosh" => 13 | _ => 14
+      checkCompl (complFn k 0 re im) (complFn k 1 re im)
     | _ => rtErr "COMPL expected"
   | "arctan2", [y, x] | "atan2", [y, x] | "longarctan2", [y, x] => do
     let a ← expectReal y
