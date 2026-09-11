@@ -1,0 +1,17 @@
+# whole, fixed, float and formatted transput of LONG values, digit for digit #
+LONG REAL x = LONG 123.456789012345678901234567890;
+print((fixed(x, 0, 30), newline, fixed(x, -40, 20), newline, float(x, 50, 30, 4), newline, whole(x, 0), newline));
+printf(($g, l, g(0, 10), l, g(30, 5, 3), l$, x, x, x));
+printf(($-3d.10dl$, x));
+printf(($+d.5de+2dl$, LONG LONG 1.0 / LONG LONG 3.0));
+LONG LONG REAL y = long long pi * LONG LONG 1e40;
+print((fixed(y, 0, 5), newline, float(y, 75, 60, 4), newline));
+LONG INT i = 12345678901234567890123456789;
+printf(($g(0), l, 30z-d, l, g(40, 3), l$, i, -i, i));
+print((fixed(LONG 1.0 / LONG 7.0, 0, 60), newline, fixed(LONG LONG 1.0 / LONG LONG 7.0, 0, 90), newline));
+print((float(LONG 2.0 / LONG 3.0, 0, 20, 3), newline, fixed(-LONG 0.0005, 8, 3), newline));
+FILE f; STRING s := "3.14159265358979323846264338327950288 -12345678901234567890 2.5e-100";
+associate(f, s);
+LONG REAL ra; LONG INT rb; LONG LONG REAL rc;
+get(f, (ra, rb, rc));
+print((ra, newline, rb, newline, rc, newline))

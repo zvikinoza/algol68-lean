@@ -30,6 +30,12 @@ def consts : List (String × Mode) :=
   [("maxint", INT), ("minint", INT), ("maxreal", REAL), ("minreal", REAL), ("smallreal", REAL), ("pi", REAL),
    ("longmaxint", LINT), ("longlongmaxint", int 2), ("longmaxreal", LREAL), ("longsmallreal", LREAL),
    ("longlongmaxreal", real 2), ("longlongsmallreal", real 2), ("longpi", LREAL), ("longlongpi", real 2),
+   ("longminreal", LREAL), ("longlongminreal", real 2),
+   ("longinfinity", LREAL), ("longinf", LREAL), ("longplusinfinity", LREAL), ("longplusinf", LREAL),
+   ("longminusinfinity", LREAL), ("longminusinf", LREAL), ("longnan", LREAL),
+   ("longlonginfinity", real 2), ("longlonginf", real 2), ("longlongplusinfinity", real 2),
+   ("longlongplusinf", real 2), ("longlongminusinfinity", real 2), ("longlongminusinf", real 2),
+   ("longlongnan", real 2), ("longlongrandom", proc [] (real 2)),
    ("intwidth", INT), ("realwidth", INT), ("expwidth", INT),
    ("longintwidth", INT), ("longrealwidth", INT), ("longexpwidth", INT),
    ("longlongintwidth", INT), ("longlongrealwidth", INT), ("longlongexpwidth", INT),
@@ -49,8 +55,31 @@ def consts : List (String × Mode) :=
    ("clock", proc [] REAL), ("seconds", proc [] REAL), ("cputime", proc [] REAL),
    ("nil", ref void), ("programidf", STRING)]
 
+/-- The functions of one `LONG` / `LONG LONG REAL` argument that a68g's prelude has. -/
+def longRealFnNames : List String :=
+  ["sqrt", "curt", "cbrt", "exp", "ln", "log", "sin", "cos", "tan", "cot", "csc", "sec",
+   "arcsin", "arccos", "arctan", "arccot", "arccsc", "arcsec",
+   "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh",
+   "sindg", "cosdg", "tandg", "cotdg", "cscdg", "secdg",
+   "arcsindg", "arccosdg", "arctandg", "arccotdg", "arccscdg", "arcsecdg", "cas"]
+
+/-- The `LONG` / `LONG LONG COMPLEX` functions of the prelude (`long complex sqrt`, …). -/
+def longComplFnNames : List String :=
+  ["sqrt", "exp", "ln", "sin", "cos", "tan", "arcsin", "arccos", "arctan",
+   "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "atanh"]
+
+/-- `long sqrt`, `long long sqrt`, …, the two-argument `arctan2`s and the generators. -/
+def longProcs : List (String × Mode) :=
+  (longRealFnNames.map fun b => ("long" ++ b, realFn 1)) ++
+  (longRealFnNames.map fun b => ("longlong" ++ b, realFn 2)) ++
+  [("longarctan2", proc [LREAL, LREAL] LREAL), ("longlongarctan2", proc [real 2, real 2] (real 2)),
+   ("longarctan2dg", proc [LREAL, LREAL] LREAL), ("longlongarctan2dg", proc [real 2, real 2] (real 2)),
+   ("longnextrandom", proc [] LREAL), ("longlongnextrandom", proc [] (real 2))] ++
+  (longComplFnNames.map fun b => ("longcomplex" ++ b, proc [compl 1] (compl 1))) ++
+  (longComplFnNames.map fun b => ("longlongcomplex" ++ b, proc [compl 2] (compl 2)))
+
 /-- Procedures (name, mode). -/
-def procs : List (String × Mode) :=
+def procs : List (String × Mode) := longProcs ++
   [("print", proc [RSIMPLOUT] void), ("write", proc [RSIMPLOUT] void),
    ("printf", proc [RSIMPLOUT] void), ("writef", proc [RSIMPLOUT] void),
    ("put", proc [REFFILE, RSIMPLOUT] void), ("putf", proc [REFFILE, RSIMPLOUT] void),

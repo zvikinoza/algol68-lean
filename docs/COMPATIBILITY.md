@@ -16,10 +16,10 @@ re-implemented in Lean.
 * `INT` is 32-bit: `max int = 2147483647`; any result outside
   `[-max int, max int]` is the runtime error *INT value overflow*
   (so `-max int - 1` is an error, as in a68g).
-* `LONG INT` has 49 decimal digits and `LONG LONG INT` 84 (a68g's
-  multi-precision radix 10⁷ with 7 and 12 digit blocks); `PR precision N PR`
-  sets `LONG LONG` to `2 + ⌈N/7⌉` blocks. Arithmetic uses Lean's arbitrary
-  precision integers with range checks at these limits.
+* `LONG` and `LONG LONG` modes use a68g's own multi-precision arithmetic,
+  reproduced digit for digit in `A68.MP` (see below): `LONG INT` has 49 decimal
+  digits and `LONG LONG INT` 84 (radix 10⁷ with 7 and 12 digit blocks);
+  `PR precision N PR` sets `LONG LONG` to `2 + ⌈N/7⌉` blocks.
 * `REAL` is IEEE double. Every arithmetic operation and mathematical function
   checks its result: an infinity is *infinite REAL value*, a NaN is
   *REAL value is not a number*, and division by zero is an error.
@@ -33,6 +33,54 @@ re-implemented in Lean.
   of the standard operators (`LONG 1 + 1`, `1.5 + LONG 1`). User-defined
   operators receive only firm coercions (no widening), exactly as in a68g.
 * `SHORT` modes are identical to the base modes.
+
+## LONG and LONG LONG arithmetic
+
+This a68g build is "level 2" (clang, no 128-bit integer or floating types, no
+MPFR), so `LONG REAL`, `LONG LONG REAL`, `LONG INT`, `LONG LONG INT` and the
+`COMPLEX` modes built on them are all a68g's multi-precision numbers (`mp.c`):
+a status word, an exponent and digits in radix 10⁷, of which `LONG` modes have 7
+and `LONG LONG` modes 12 (`2 + ⌈p/7⌉` after `PR precision p PR`). `long real
+width` is 42, `long long real width` 70, `long max real` is `1e+999999`,
+`long small real` is `1e-42`, and exponents beyond ±142857 radix digits are the
+error *multiprecision value out of bounds*.
+
+`A68.MP`, `A68.MPMath` and `A68.MPFmt` re-implement a68g's routines step by
+step rather than computing correctly rounded results, because a68g's are not:
+
+* every operation works on a scratch number two digits longer, normalises, and
+  rounds back with the "Gaussian" rounding as `mp.c` writes it (a half-way digit
+  adds one to an odd digit and two to an even one);
+* guard digits beyond the precision an operation is asked to use are left in
+  place, and later operations read them (e.g. `sqrt_mp` rounds with the guard
+  digits of an earlier `rec_mp`);
+* digits are C doubles; the only inexact double arithmetic, the quotient-digit
+  estimates of `div_mp` and `div_mp_digit` (which clang compiled to `fmadd`), is
+  reproduced exactly with integer arithmetic;
+* the elementary functions follow `mp-math.c` and `mp-pi.c`: Newton iterations
+  seeded with the C library's `sqrt`, `cbrt`, `log`, `atan`, Taylor series with
+  a68g's stopping rule, argument reduction by halving (`exp`) and thirds (`sin`),
+  and a68g's caches, which make results depend on history: π and its derived
+  constants are kept at the precision of the request that needed most digits and
+  truncated for later requests, ln 10⁷ and ln 10 are kept and rounded on each use;
+* formatting of long values (`print`, `whole`, `fixed`, `float`, general
+  patterns) is done with multi-precision arithmetic at the value's own precision,
+  as `transput-formatting.c` does, so digits are rounded where a68g rounds them;
+* `LONG INT` values are exact integers here: their sums, differences and
+  products are exact in a68g too and checked against the same range, while
+  `OVER`, `MOD` and `**` go through a68g's real division and power;
+* conversions: `LENG` and the widening of a `REAL` use `real_to_mp` (21
+  significant digits from a floating-point loop), an `INT` widens exactly,
+  `SHORTEN` of a `LONG INT` wraps as `mp_to_int`'s 32-bit weights do
+  (`SHORTEN LONG 100000000000000` is `276447232`), and a REAL denotation that is
+  widened — in a strong position, or as the operand of a standard operator —
+  is read again at the longer precision (`LONG 1.0 + 1.1` is exactly 2.1, while
+  `-1.1` widened is not, being a formula);
+* `LONG INT ** LONG INT` has no operator of its own in a68g, so both operands
+  widen to `LONG REAL`.
+
+Differential testing of about 12,000 random `LONG`/`LONG LONG` operations,
+functions, conversions and formatting calls agrees with a68g on every output.
 
 ## Printing numbers
 
@@ -174,11 +222,14 @@ reported separately by the test scripts.
 
 ## Known differences
 
-* **`LONG REAL` / `LONG LONG REAL`** are IEEE doubles here but 42/70-digit
-  multi-precision numbers in a68g. Programs that print such values with more
-  than about 15 significant digits differ.
-* **`LONG INT` printed through `fixed`/`float`** uses the double conversion
-  above for `INT` but exact conversion for `LONG INT`, as a68g does.
+* **`LONG INT` division by zero** gives an infinite `LONG INT` in a68g, which
+  a68g then cannot print (it loops); here it is a run-time error. Likewise
+  `ENTIER` of an infinite `LONG REAL` hangs a68g and is an error here.
+* **Long values in numeric patterns** (`$-d.3d$` and the like) are formatted
+  from their exact decimal value; a68g lengthens them to `LONG LONG` precision
+  first, which agrees except where rounding at 84 digits would carry.
+* **`long erf`, `long gamma`** and the `pi`-scaled functions (`long sinpi`, …) are
+  not provided. The `LONG COMPLEX` functions are, following `mp-complex.c`.
 * **Unsupported a68g extensions**: `UP` and `DOWN` on semaphores, `sound`, curses,
   plotutils, GSL, MPFR, R mathlib, sockets, `http content`, and the `PIPE` mode
   indicant (the values `execve child pipe` yields can be used, but `PIPE` cannot be

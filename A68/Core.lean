@@ -1,4 +1,5 @@
 import A68.Mode
+import A68.MP
 
 /-!
 # A68.Core — runtime values and the elaborated intermediate representation
@@ -28,6 +29,7 @@ inductive Value where
   | undef
   | int (v : Int)
   | real (v : Float)
+  | mp (x : MP.MP)                              -- LONG / LONG LONG REAL (a68g multi-precision)
   | bool (b : Bool)
   | char (c : Nat)                               -- a byte 0..255
   | bits (v : Nat)

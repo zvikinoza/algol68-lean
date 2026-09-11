@@ -177,6 +177,11 @@ def cellCore (b : Binding) : Elab Core := do
   match b.kind with
   | .var => return .refCell rel b.slot
   | .ident => return .loadCell rel b.slot
+  | .builtinConst (.builtin n) =>
+    -- a constant that is not a procedure but has no literal value: evaluate it by name
+    match b.mode with
+    | .proc _ _ => return .lit (.builtin n)
+    | _ => return .call (.lit (.builtin n)) []
   | .builtinConst v => return .lit v
   | .builtinProc n => return .lit (.builtin n)
   | .label id => return .goto id
@@ -404,6 +409,22 @@ def isStringMode (tb : Mode.Table) (m : Mode) : Bool :=
 def widenTo (c : Core) (src dst : Mode) : Core :=
   if src == dst then c else .widen src dst c
 
+/-- The text and length of a REAL denotation, possibly in parentheses. -/
+partial def denotText? : Expr → Option (String × Int)
+  | .realLit t long _ => some (t, long)
+  | .block (.mk [.unit e]) _ => denotText? e
+  | _ => none
+
+/-- a68g's `widen_denotation`: a REAL denotation `e` (core `c`, mode `m`) that is about to be
+    widened to `target` is converted from its text at the longer length instead. -/
+def promoteDenot (e : Expr) (c : Core) (m target : Mode) : Core × Mode :=
+  let atLength (t : String) (long n : Int) : Core × Mode :=
+    if n > long then (.monop "DENOT" (.real n) (.lit (Value.ofString t)), .real n) else (c, m)
+  match denotText? e, target with
+  | some (t, long), .real n => atLength t long n
+  | some (t, long), .compl n => atLength t long n
+  | _, _ => (c, m)
+
 /-- Resolve a builtin dyadic operator on meek-coerced operand modes. -/
 def builtinDyadic (op : String) (l : Core) (ml : Mode) (r : Core) (mr : Mode) : Elab (Option (Core × Mode)) := do
   let tb ← tbl
@@ -441,9 +462,11 @@ def builtinDyadic (op : String) (l : Core) (ml : Mode) (r : Core) (mr : Mode) : 
       | _ => return none
     | "**" =>
       match ml, mr with
-      | .int a, .int _ => return some (.dyop "**" (.int a) (.int 0) l r, .int a)
-      | .real a, .int _ => return some (.dyop "**" (.real a) (.int 0) l r, .real a)
-      | .compl a, .int _ => return some (.dyop "**" (.compl a) (.int 0) l r, .compl a)
+      -- the exponent of `M ** INT` is a plain INT; a longer integral exponent makes a68g
+      -- widen both operands (`LONG 2 ** LONG 3` is a LONG REAL)
+      | .int a, .int 0 => return some (.dyop "**" (.int a) (.int 0) l r, .int a)
+      | .real a, .int 0 => return some (.dyop "**" (.real a) (.int 0) l r, .real a)
+      | .compl a, .int 0 => return some (.dyop "**" (.compl a) (.int 0) l r, .compl a)
       | _, _ =>
         let j' := match j with | .int n => .real n | m => m
         return some (.dyop "**" j' j' (widenTo l ml j') (widenTo r mr j'), j')
@@ -530,12 +553,10 @@ def constValue (name : String) (ll : Nat := Numfmt.defaultLLDigits) (fileName : 
   | "minreal" => .real 2.2250738585072014e-308
   | "smallreal" => .real 2.220446049250313e-16
   | "pi" => .real 3.141592653589793
-  | "longpi" | "longlongpi" => .real 3.141592653589793
+  -- `long pi`, `long max real` and the other LONG REAL constants are computed at run time
+  -- by the builtin of that name (see `Interp.mpConst`): π comes from a68g's cache
   | "longmaxint" => .int Numfmt.longMaxInt
   | "longlongmaxint" => .int (Numfmt.maxIntOf 2 ll)
-  | "longmaxreal" | "longlongmaxreal" => .real 1.7976931348623157e308
-  | "longsmallreal" => .real 1e-42
-  | "longlongsmallreal" => .real 1e-70
   | "intwidth" => .int 10 | "realwidth" => .int 15 | "expwidth" => .int 3
   | "longintwidth" => .int 50 | "longrealwidth" => .int 42 | "longexpwidth" => .int 3
   | "longlongintwidth" => .int (Numfmt.intWidthOf 2 ll) | "longlongrealwidth" => .int (Numfmt.realWidthOf 2 ll)
@@ -868,6 +889,21 @@ partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
   | .routine params ret body _ =>
     let (c, m) ← elabRoutine params ret body
     applyCtx ctx c m
+  | .realLit t long _ =>
+    -- a68g's `widen_denotation`: a REAL denotation widened to a longer REAL (or to the
+    -- COMPL built on it) is converted from its text at the longer precision
+    let promoted : Option Int ← match ctx with
+      | .strong target =>
+        match (← resolve target) with
+        | .real n => pure (if n > long then some n else none)
+        | .compl n => pure (if n > long then some n else none)
+        | _ => pure none
+      | _ => pure none
+    match promoted with
+    | some n => applyCtx ctx (.monop "DENOT" (.real n) (.lit (Value.ofString t))) (.real n)
+    | none =>
+      let (c, m) ← elabPrimary e
+      applyCtx ctx c m
   | _ =>
     let (c, m) ← elabPrimary e
     applyCtx ctx c m
@@ -877,7 +913,11 @@ partial def elabPrimary (e : Expr) : Elab (Core × Mode) := do
   match e with
   -- a68g: SHORT modes are the base modes, so `SHORT SHORT 5` is an INT (as `Mode.ofSyn`)
   | .intLit v long _ => return (.lit (.int v), .int (max long 0))
-  | .realLit t long _ => return (.lit (.real (Numfmt.parseFloat t)), .real (max long 0))
+  | .realLit t long _ =>
+    -- a LONG denotation keeps its text: a68g converts it with `string_to_mp` at the
+    -- precision of its length, which a double cannot carry
+    if long ≥ 1 then return (.monop "DENOT" (.real long) (.lit (Value.ofString t)), .real long)
+    else return (.lit (.real (Numfmt.parseFloat t)), .real 0)
   | .bitsLit r d long _ => return (.lit (.bits (bitsValue r d)), .bits (max long 0))
   | .strLit s _ =>
     if s.length == 1 then return (.lit (.char s.front.toNat), .char)
@@ -1158,6 +1198,7 @@ partial def elabDyadic (op : String) (l r : Expr) : Elab (Core × Mode) := do
         match numJoin mR rmR with
         | some j =>
           if j == mR || (mR == .real 0 && rmR == .int 0) || widenable rmR mR then
+            let (rc', rmR) := promoteDenot r rc' rmR mR
             let rc'' := widenTo rc' rmR mR
             -- INT %:= / %*:= need INT; REAL /:= etc fine
             return (.dyop cop (.ref mR) mR lc' rc'', lm')
@@ -1166,6 +1207,14 @@ partial def elabDyadic (op : String) (l r : Expr) : Elab (Core × Mode) := do
     | _ => err s!"operator {op} requires a REF left operand, found {lm}"
   let (lc', lm') ← meekCoerce lc lm
   let (rc', rm') ← meekCoerce rc rm
+  -- denotation operands the standard operator will widen are promoted, as in a68g
+  let (lc', lm', rc', rm') ← do
+    match numJoin (← resolve lm') (← resolve rm') with
+    | some j =>
+      let (lc2, lm2) := promoteDenot l lc' lm' j
+      let (rc2, rm2) := promoteDenot r rc' rm' j
+      pure (lc2, lm2, rc2, rm2)
+    | none => pure (lc', lm', rc', rm')
   match (← builtinDyadic op lc' lm' rc' rm') with
   | some res => return res
   | none => err s!"dyadic operator {lm} \"{op}\" {rm} has not been declared"

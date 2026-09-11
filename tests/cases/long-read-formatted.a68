@@ -1,0 +1,11 @@
+# reading LONG values with get and with formatted patterns, then computing with them #
+FILE f; STRING s := "3.1415926535897932384626433832795028841971 +12345678901234567890123456 .000000000000000000000000000125";
+associate(f, s);
+LONG REAL a; LONG INT b; LONG LONG REAL c;
+get(f, (a, b, c));
+print((a, newline, b, newline, c, newline, a * a, newline, c / LONG LONG 3, newline));
+FILE g; STRING t := "12.3456789012345678901234567890  -0.5000000000000000000000000001";
+associate(g, t);
+LONG REAL x, y;
+getf(g, ($2d.28d, 2x, -d.28d$, x, y));
+print((x, newline, y, newline, x + y, newline, fixed(x - y, 0, 30), newline))

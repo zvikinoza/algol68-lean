@@ -71,6 +71,38 @@ That is, every arithmetic step of the formatter is exact and comparisons
 decide the order of the represented values. Two length invariants of the
 string builders are also proved (`errorChars_length`, `leadingSpaces_length`).
 
+### The multi-precision kernel (`A68/Verified/MP.lean`)
+
+`LONG` and `LONG LONG` arithmetic (`A68.MP`) is a step-by-step re-implementation of
+a68g's `mp.c`, rounding quirks included, so its specification is a68g's behaviour
+and it is checked by differential testing. What is proved is that the steps a68g
+relies on to be *exact* are exact. With `digVal a n` the integer that positions
+`0 … n` of a digit array denote in radix `R = 10⁷`:
+
+```lean
+theorem carryAt_digVal    : digVal (carryAt a j) n = digVal a n          -- 1 ≤ j ≤ n, j < a.size
+theorem normFrom_digVal   : digVal (normFrom a k j) n = digVal a n       -- j ≤ n, j < a.size
+theorem normDigits_digVal : digVal (normDigits w k digs) digs = digVal w digs
+theorem dblOfInt_exact    : n.natAbs < 2 ^ 53 → dblOfInt n = n
+theorem fma_exact         : (a * b + c).natAbs < 2 ^ 53 → fma a b c = a * b + c
+theorem dv_linear         : dv (fun i => f i + s * g i) n = dv f n + s * dv g n
+theorem alignedSum_digit  : -- scratch digit i of add_mp / sub_mp = x digit + s · y digit, aligned
+theorem alignedSum_equal_exponents :
+    digVal (alignedSum x y e e digs s).1 (digs + 2) = R * (dv x digs + s * dv y digs)
+theorem toDecParts_mant, mantOf_succ, R_eq : R = 10 ^ logR
+```
+
+That is: `norm_mp`'s carry propagation never changes the number being normalised;
+a68g's double arithmetic on scratch digits (which stay below 2⁵³) is exact, so it
+can be modelled with integers, and the only inexact double computation — the
+quotient-digit estimate of the division routines, which clang fused into `fmadd` —
+is modelled by `dblOfInt`/`fma`/`truncDiv`, which round exactly as IEEE does;
+the scratch number that addition and subtraction normalise and round is the exact
+sum of the aligned operands; and decimal output starts from a mantissa that is the
+digit value itself, with one radix digit equal to seven decimal digits. The rounding
+that follows (`round_internal_mp`) is deliberately not "proved correct": it is
+a68g's, including its unusual half-way rule, and is tested instead.
+
 ### Totality
 
 Apart from the parser (`partial def`, backtracking recursive descent), the

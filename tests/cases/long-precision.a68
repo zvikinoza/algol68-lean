@@ -1,0 +1,6 @@
+PR precision 100 PR
+# PR precision sets the digits of LONG LONG modes #
+LONG LONG REAL x = LONG LONG 1.0 / LONG LONG 3.0;
+print((x, newline, long long pi, newline, long long real width, newline, long long max int, newline));
+print((long long sqrt(LONG LONG 2.0), newline, long long exp(LONG LONG 0.5), newline));
+print((fixed(x, 0, 100), newline))
