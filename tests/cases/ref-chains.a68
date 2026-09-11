@@ -1,0 +1,42 @@
+# Linked structures: walking REF chains, NIL tests, and moving along links. #
+BEGIN
+  MODE NODE = STRUCT (INT val, REF NODE next);
+  REF NODE head := NIL;
+  FOR i TO 12 DO head := HEAP NODE := (i * i MOD 17, head) OD;
+  INT total := 0, count := 0;
+  REF NODE p := head;
+  WHILE p ISNT REF NODE (NIL) DO
+    total +:= val OF p; count +:= 1;
+    p := next OF p
+  OD;
+  print((total, count, p IS REF NODE (NIL), newline));
+  MODE TREE = STRUCT (INT key, REF TREE left, right);
+  REF TREE root := NIL;
+  PROC insert = (INT k) VOID:
+    IF root IS REF TREE (NIL) THEN root := HEAP TREE := (k, NIL, NIL)
+    ELSE
+      REF TREE t := root;
+      BOOL done := FALSE;
+      WHILE NOT done DO
+        IF k < key OF t THEN
+          IF left OF t IS REF TREE (NIL) THEN left OF t := HEAP TREE := (k, NIL, NIL); done := TRUE
+          ELSE t := left OF t FI
+        ELSE
+          IF right OF t IS REF TREE (NIL) THEN right OF t := HEAP TREE := (k, NIL, NIL); done := TRUE
+          ELSE t := right OF t FI
+        FI
+      OD
+    FI;
+  FOR i TO 20 DO insert((i * 7) MOD 23) OD;
+  REF TREE t := root;
+  INT depth := 0;
+  WHILE t ISNT REF TREE (NIL) DO depth +:= 1; t := left OF t OD;
+  print((depth, newline));
+  t := root;
+  depth := 0;
+  WHILE t ISNT NIL DO depth +:= 1; t := right OF t OD;
+  print((depth, newline));
+  REF NODE q;
+  print(("before", newline));
+  IF q IS REF NODE (NIL) THEN print("nil") FI
+END

@@ -625,6 +625,13 @@ def SelChain.fieldsWord (c : SelChain) : Nat := Id.run do
 def SelChain.args (c : SelChain) : String :=
   s!"{c.depth}, {c.slot}, {c.spec}u, {c.i}, {c.j}, {c.fieldsWord}u"
 
+/-- `NIL`, possibly still inside the frameless block a cast leaves. -/
+partial def isNilLit (c : Core) : Bool :=
+  match strip c with
+  | .lit .nil => true
+  | .block 0 stmts _ _ => stmts.size == 1 && (match stmts[0]! with | .unit e => isNilLit e | _ => false)
+  | _ => false
+
 /-- The C form of a monadic operator on a native operand, when it has one.  Each form
     reproduces the check its interpreted counterpart performs. -/
 def monopC (op : String) (t : CTy) (x : String) : Option String :=
@@ -801,6 +808,16 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | none => do
       let ch ← fieldChain env (.select f e true)
       some s!"{ty.selFn}({ch.args})"
+  | .identRel l r isnt => do
+    -- `p IS NIL` and `p ISNT NIL` on a variable held in a cell
+    if ty != .u8 then none else
+    let cellRead (x : Core) : Option (Nat × Nat) := match strip x with
+      | .loadCell d s => some (d, s)
+      | .deref e => match strip e with | .refCell d s => some (d, s) | _ => none
+      | _ => none
+    let (d, s) ← if isNilLit r then cellRead l else if isNilLit l then cellRead r else none
+    if (varOf env d s).isSome || (rowOf env d s).isSome || (strOf env d s).isSome then none else
+    some s!"((uint8_t)({if isnt then "!" else ""}a68_isnil({rtDepthOf env d}, {s})))"
   | .andThen l r => do
     -- `&&` and `||` look at their right operand only when the evaluator would
     if ty != .u8 then none else
@@ -898,7 +915,7 @@ def resultMode : Core → Option Mode
     match resultMode t with
     | some m => some m
     | none => resultMode e
-  | .andThen _ _ | .orElse _ _ => some .bool
+  | .andThen _ _ | .orElse _ _ | .identRel _ _ _ => some .bool
   | _ => none
 
 /-- A native expression for a node whose mode is not supplied by the caller. -/
@@ -2156,7 +2173,17 @@ partial def storeScalar (dst src : Core) : M Bool := do
               return true
             else return false
           | none => return false
-        | none => return false
+        | none =>
+          -- `p := next OF p` into a variable holding a REF: one call reads the field and
+          -- writes the cell.  A REF is never a row, so no bounds check is skipped.
+          match (ev[dd]?).bind (fun fr => (fr.modes[ss]?).join), strip src with
+          | some m, .deref sel =>
+            match Mode.resolve (← get).modeTab m, fieldChain ev sel with
+            | .ref _, some ch =>
+              emit s!"a68_v(a68rt_sel_store({← rtd dd}, {ss}, {ch.args}, W));"
+              return true
+            | _, _ => return false
+          | _, _ => return false
   | .slice base idx true =>
     -- `a[i] := <scalar>` writes the element in place
     match strip base with
@@ -3015,6 +3042,9 @@ lean_object* a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, i
    runtime.  Anything that does not fit the shape falls back to the general machinery. */
 lean_object* a68rt_sel_push(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 lean_object* a68rt_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_cell_isnil(uint32_t d, uint32_t s, lean_object* w);
+lean_object* a68rt_sel_store(uint32_t dd, uint32_t ds, uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+#define a68_isnil(d,s)  a68_u8(a68rt_cell_isnil(d, s, W))
 lean_object* a68rt_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 lean_object* a68rt_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 lean_object* a68rt_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);

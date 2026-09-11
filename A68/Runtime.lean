@@ -658,6 +658,25 @@ def selPush (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Unit
   | .undef => die "attempt to use an uninitialised value"
   | v => push v
 
+/-- `p IS NIL` on the value a cell holds: 1 for NIL, 0 for a name.  Reading the cell reports
+    an uninitialised value, as the evaluator's read of the variable does. -/
+@[export a68rt_cell_isnil]
+def cellIsNil (depth slot : UInt32) : IO UInt8 := do
+  let c ← cellOf depth slot
+  match (← run (Interp.readCell c) .undef) with
+  | .nil => return 1
+  | .undef => die "attempt to use an uninitialised value"
+  | _ => return 0
+
+/-- `x := f OF … OF y` into a variable holding a REF: the selection is read and the cell
+    written in one step, with the test for an uninitialised value the assignment makes. -/
+@[export a68rt_sel_store]
+def selStore (dd ds depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Unit := go do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .undef => die "attempt to use an uninitialised value"
+  | v => run (Interp.writeCell (← cellOf dd ds) v) ()
+
 @[export a68rt_sel_int]
 def selInt (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Int64 := do
   let c ← cellOf depth slot
