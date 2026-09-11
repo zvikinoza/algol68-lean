@@ -967,9 +967,7 @@ def conform (m : UInt32) (bind : UInt8) : IO UInt8 :=
     let s ← (← state).stack.get
     let v := s.back!
     let mm ← mode m
-    let (vm, inner) := match v with
-      | .union um x => (um, x)
-      | x => (Mode.void, x)
+    let (vm, inner) := A68.Interp.unionContent v
     let tb := (← getRt).modes
     let ok := match Mode.resolve tb mm with
       | .union ms => ms.any fun cm => Mode.eqv tb cm vm

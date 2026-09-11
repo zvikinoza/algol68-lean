@@ -835,6 +835,9 @@ partial def scanFmtLiteral (cs : Array Char) (start : Nat) : String × Nat := Id
         s := s.push '"'; j := j + 2
       else
         return (s, j + 1)
+    else if cs[j]! == '\\' && j + 1 < cs.size && cs[j+1]! == '\n' then
+      -- a backslash at the end of a line continues the string on the next
+      j := j + 2
     else
       s := s.push cs[j]!; j := j + 1
   return (s, j)
@@ -891,7 +894,8 @@ partial def splitTop (s : String) : List String := Id.run do
 
 partial def unquote (s : String) : String :=
   let cs := s.toList
-  let cs := (cs.dropWhile (· == ' ')).reverse.dropWhile (· == ' ') |>.reverse
+  let blank (c : Char) : Bool := c == ' ' || c == '\n' || c == '\t' || c == '\r'
+  let cs := (cs.dropWhile blank).reverse.dropWhile blank |>.reverse
   match cs with
   | '"' :: rest => if rest.getLast? == some '"' then String.ofList rest.dropLast else String.ofList cs
   | _ => String.ofList cs

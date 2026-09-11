@@ -441,18 +441,20 @@ def fileOut (fid : Nat) (s : String) : M Unit := do
         let _ ← sysWriteFd f0.fd.toNat.toUInt32 (strBytes s)
         (← read).files.modify fun fs => fs.set! fid { f0 with writing := true }
         return
-      -- an associated file whose string was reassigned starts from the string's current value
-      let f ← if f0.loaded then pure f0 else do
-        match f0.assoc with
-        | some r =>
-          let str ← strOf (← readRef r)
-          pure { f0 with buf := str.foldl (fun acc c => acc.push c.toNat.toUInt8) ByteArray.empty, pos := 0, loaded := true }
-        | none => pure { f0 with loaded := true }
-      let f' := { f with buf := s.foldl (fun acc c => acc.push c.toNat.toUInt8) f.buf, writing := true, dirty := true }
-      (← read).files.modify fun fs => fs.set! fid f'
-      match f'.assoc with
-      | some r => writeRef r (Value.ofString (String.ofList (f'.buf.toList.map fun b => Char.ofNat b.toNat)))
-      | none => pure ()
+      match f0.assoc with
+      | some r =>
+        -- a68g empties the string when an associated file turns to writing
+        -- (`open_physical_file`), and each write appends to what the string then holds
+        if !f0.writing then
+          writeRef r (Value.ofString "")
+          (← read).files.modify fun fs => fs.set! fid { f0 with writing := true, reading := false }
+        match (← appendInPlace r (Value.ofString s)) with
+        | some _ => pure ()
+        | none => writeRef r (Value.ofString ((← strOf (← readRef r)) ++ s))
+      | none =>
+        let f' := { f0 with buf := s.foldl (fun acc c => acc.push c.toNat.toUInt8) f0.buf,
+                            writing := true, dirty := true, loaded := true }
+        (← read).files.modify fun fs => fs.set! fid f'
 
 -- ## Numbers
 
@@ -833,6 +835,14 @@ def fromCompiled (act : IO Value) : ReaderT Rt (ExceptT Ctrl IO) Value := do
     throw (.jump (j.toNat - 1))
   return v
 
+/-- The mode and value inside a united value.  A value united to a union that is itself a
+    member of another union is looked through, since a68g flattens unions: a `BASIC`
+    holding an `INT`, united to `UNION (VOID, BASIC)`, conforms to `INT` and to `BASIC`. -/
+def unionContent : Value → Mode × Value
+  | .union _ (.union m x) => unionContent (.union m x)
+  | .union m x => (m, x)
+  | x => (.void, x)
+
 -- ## Evaluation
 
 mutual
@@ -935,9 +945,7 @@ partial def eval (env : Env) (c : Core) : M Value := do
     if i ≥ 1 && i ≤ alts.length then eval env (alts[(i - 1).toNat]!) else eval env out
   | .caseConf sel alts out =>
     let v ← eval env sel
-    let (vm, inner) := match v with
-      | .union m x => (m, x)
-      | x => (.void, x)
+    let (vm, inner) := unionContent v
     let tb := (← read).modes
     for (m, slot, body) in alts do
       let ok ← match Mode.resolve tb m with
@@ -1573,7 +1581,10 @@ partial def monadic (op : String) (m : Mode) (v : Value) : M Value := do
     | _ => rtErr "internal"
   | "ABS", .char => do let c ← expectChar v; return .int c
   | "ABS", .bool => do let b ← expectBool v; return .int (if b then 1 else 0)
-  | "ABS", .bits _ => do let b ← expectBits v; return .int b
+  | "ABS", .bits n => do
+    let b ← expectBits v
+    -- a68g reads the 32 bits of a BITS as a C int: ABS NOT BIN 3 is -4
+    return .int (if n ≤ 0 && b ≥ 2147483648 then (b : Int) - 4294967296 else b)
   | "SIGN", .int _ => do let x ← expectInt v; return .int (if x > 0 then 1 else if x < 0 then -1 else 0)
   | "SIGN", .real _ => do let x ← expectReal v; return .int (if x > 0 then 1 else if x < 0 then -1 else 0)
   | "ODD", .int _ => do let x ← expectInt v; return .bool (x % 2 != 0)
@@ -1716,7 +1727,8 @@ partial def refreshAssoc (fid : Nat) : M Unit := do
   | some r =>
     let str ← strOf (← readRef r)
     let bytes := str.foldl (fun acc c => acc.push c.toNat.toUInt8) ByteArray.empty
-    if bytes != f.buf then setFile fid { f with buf := bytes, pos := 0, loaded := true }
+    -- a68g reads the string's current value at the position reached so far
+    if bytes != f.buf then setFile fid { f with buf := bytes, loaded := true }
   | none => pure ()
 
 /-- Signal logical file end: call the mender if any (TRUE = continue), else runtime error. -/
@@ -2138,11 +2150,6 @@ partial def flushFile (fid : Nat) : M Unit := do
   if f.onDisk && f.dirty && f.writing then
     IO.FS.writeBinFile f.name f.buf
     setFile fid { f with dirty := false }
-  match f.assoc with
-  | some r => if f.writing then
-      let s := String.ofList (f.buf.toList.map fun b => Char.ofNat b.toNat)
-      writeRef r (Value.ofString s)
-  | none => pure ()
 
 partial def mathFn (name : String) (x : Float) : M Float := do
   let r ← match name with
