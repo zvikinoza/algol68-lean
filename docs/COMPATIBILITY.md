@@ -184,8 +184,8 @@ reported separately by the test scripts.
 * **Long values in numeric patterns** (`$-d.3d$` and the like) are formatted
   from their exact decimal value; a68g lengthens them to `LONG LONG` precision
   first, which agrees except where rounding at 84 digits would carry.
-* **The `LONG` complex functions** (`long complex sqrt` and friends), `long erf`,
-  `long gamma` and the `pi`-scaled functions (`long sinpi`, …) are not provided.
+* **`long erf`, `long gamma`** and the `pi`-scaled functions (`long sinpi`, …) are
+  not provided. The `LONG COMPLEX` functions are, following `mp-complex.c`.
 * **Unsupported a68g extensions**: refinements, `evaluate`, `DOUBLE`, C-style
   `%` formats, partial parametrisation (`f (x, )`), semaphores and `PAR`,
   `sound`, curses, plotutils, GSL, MPFR, R mathlib, sockets, `system`,
