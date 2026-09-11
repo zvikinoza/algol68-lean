@@ -136,6 +136,14 @@ operation, `LONG INT`/`LONG LONG INT` have 49 and 84 decimal digits (or the
 and NaNs, `REAL ** INT` is square-and-multiply in a68g's order, and
 `REAL ** REAL` is `exp (y · ln x)`.
 
+`LONG` and `LONG LONG` reals (and complex numbers) are `Value.mp` numbers of
+`A68.MP`, a digit-for-digit re-implementation of a68g's multi-precision library:
+`A68.MP` has the arithmetic and conversions, `A68.MPMath` the elementary
+functions with a68g's caches of π and logarithms, and `A68.MPFmt` the formatting
+of long values. A `LONG` real denotation is elaborated as a `DENOT` operator on
+its text, converted at run time at the precision of its length, so no double
+ever stands in for it.
+
 Transput lives in the same module: unformatted `print`/`put`, the formatted
 `printf`/`putf` picture machine (frames, moulds, sign shifting, zero
 suppression, replicated collections, embedded formats, column alignment),

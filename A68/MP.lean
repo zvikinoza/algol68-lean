@@ -180,25 +180,27 @@ def truncDiv (x y : Int) : Int :=
 
 -- ## Normalisation and rounding
 
-/-- `norm_mp (w, k, digs)`: bring digits `digs` down to `k` into `[0, R)`, carrying into
-    the digit before.  The carries are those of a68g's double computation, which is exact
-    for scratch values below 2⁵³. -/
-def normDigits (w : Array Int) (k digs : Nat) : Array Int := Id.run do
-  let mut a := grow w (digs + 1)
-  let mut j := digs
-  while j ≥ k && j ≥ 1 do
-    let z := a[j]!
-    if z ≥ R then
-      let carry := z / R
-      a := a.set! j (z - carry * R)
-      a := a.set! (j - 1) (a[j - 1]! + carry)
-    else if z < 0 then
-      let carry := 1 + (-z - 1) / R
-      a := a.set! j (z + carry * R)
-      a := a.set! (j - 1) (a[j - 1]! - carry)
-    if j == 0 then break
-    j := j - 1
-  return a
+/-- One carry of `norm_mp` at position `j ≥ 1`: move whole multiples of `R` out of
+    digit `j` into digit `j - 1`.  The carries are those of a68g's double computation,
+    which is exact for scratch values below 2⁵³. -/
+def carryAt (a : Array Int) (j : Nat) : Array Int :=
+  let z := a.getD j 0
+  if z ≥ R then
+    let c := z / R
+    (a.setIfInBounds j (z - c * R)).setIfInBounds (j - 1) (a.getD (j - 1) 0 + c)
+  else if z < 0 then
+    let c := 1 + (-z - 1) / R
+    (a.setIfInBounds j (z + c * R)).setIfInBounds (j - 1) (a.getD (j - 1) 0 - c)
+  else a
+
+/-- `norm_mp`'s loop: carries at `j, j - 1, …, k` (and never below position 1). -/
+def normFrom (a : Array Int) (k : Nat) : Nat → Array Int
+  | 0 => a
+  | j + 1 => if j + 1 < k then a else normFrom (carryAt a (j + 1)) k j
+
+/-- `norm_mp (w, k, digs)` on a scratch array. -/
+def normDigits (w : Array Int) (k digs : Nat) : Array Int :=
+  normFrom (grow w (digs + 1)) k digs
 
 /-- `round_internal_mp (z, w, digs)` for a finite scratch number `w` (digits `wd`,
     exponent `wex`) with at least `digs + 2` digits. -/
@@ -274,25 +276,23 @@ def lengthenMp (z : MP) (digsZ : Nat) (x : MP) (digsX : Nat) : MPE MP :=
 
 -- ## Addition and subtraction
 
+/-- Digit `j` of a `digs`-digit number, zero outside `1 … digs`. -/
+def digitOr0 (a : Array Int) (digs : Nat) (j : Int) : Int :=
+  if j ≤ 0 || j > digs then 0 else a.getD j.toNat 0
+
 /-- The aligned digit sums of two positive numbers into a scratch of `digs + 2` digits
     (`add_mp` and `sub_mp` differ only in the sign `s` of the second operand). -/
-def alignedSum (x y : Array Int) (xex yex : Int) (digs : Nat) (s : Int) : Array Int × Int := Id.run do
+def alignedSum (x y : Array Int) (xex yex : Int) (digs : Nat) (s : Int) : Array Int × Int :=
+  -- the three loops of add_mp / sub_mp (equal exponents, x larger, y larger) fill scratch
+  -- digit `i ∈ [2, digs + 2]` with digit `i - 1` of the operand with the larger exponent
+  -- and the correspondingly shifted digit of the other; digits past `digs` are zero
   let digsH := digs + 2
-  let mut w := Array.replicate (digsH + 1) (0 : Int)
-  let xd (j : Int) : Int := if j ≤ 0 || j > digs then 0 else x.getD j.toNat 0
-  let yd (j : Int) : Int := if j ≤ 0 || j > digs then 0 else y.getD j.toNat 0
-  if xex == yex then
-    for j in [1:digs+1] do w := w.set! (j + 1) (xd j + s * yd j)
-    w := w.set! digsH 0
-    return (w, 1 + xex)
-  else if xex > yex then
-    let shl := xex - yex
-    for j in [1:digsH] do w := w.set! (j + 1) (xd j + s * yd (j - shl))
-    return (w, 1 + xex)
-  else
-    let shl := yex - xex
-    for j in [1:digsH] do w := w.set! (j + 1) (xd (j - shl) + s * yd j)
-    return (w, 1 + yex)
+  let shlX : Int := if yex > xex then yex - xex else 0
+  let shlY : Int := if xex > yex then xex - yex else 0
+  let w := Array.ofFn (n := digsH + 1) fun i =>
+    if i.val < 2 then 0
+    else digitOr0 x digs ((i.val : Int) - 1 - shlX) + s * digitOr0 y digs ((i.val : Int) - 1 - shlY)
+  (w, 1 + max xex yex)
 
 mutual
 
@@ -939,11 +939,15 @@ def mpToReal (z : MP) (digs : Nat) : MPE Float := do
   if sum.isInf then throw "infinite REAL value"
   return if z.dig 1 ≥ 0 then sum else -sum
 
+/-- `|d₁| d₂ … dₖ` read as an integer in radix `R`. -/
+def mantOf (z : MP) : Nat → Int
+  | 0 => 0
+  | k + 1 => mantOf z k * R + (if k + 1 == 1 then ((z.dig 1).natAbs : Int) else z.dig (k + 1))
+
 /-- The exact rational value `mant · 10^exp` of the first `digs` digits (for printing and
     for the proofs): `Σ dₖ R^(e-k+1)` with `R = 10⁷`. -/
-def toDecParts (z : MP) (digs : Nat) : Int × Int := Id.run do
-  let mut m : Int := 0
-  for k in [1:digs+1] do m := m * R + (if k == 1 then ((z.dig 1).natAbs : Int) else z.dig k)
-  return (if z.dig 1 < 0 then -m else m, (z.ex - digs + 1) * logR)
+def toDecParts (z : MP) (digs : Nat) : Int × Int :=
+  let m := mantOf z digs
+  (if z.dig 1 < 0 then -m else m, (z.ex - digs + 1) * logR)
 
 end A68.MP

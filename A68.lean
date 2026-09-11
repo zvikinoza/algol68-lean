@@ -15,6 +15,7 @@ import A68.CodeGen
 import A68.Verified.StackMachine
 import A68.Verified.Opt
 import A68.Verified.Numfmt
+import A68.Verified.MP
 
 /-!
 # a68lean — an Algol 68 compiler written in Lean 4
