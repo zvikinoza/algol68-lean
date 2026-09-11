@@ -156,5 +156,8 @@ reported separately by the test scripts.
   Revised Report allows labels only in a serial clause's units after its last
   declaration. As with the display coerced to a union, this can only affect
   programs a68g refuses, so it cannot change the output of one it accepts.
+* **`COMPL` division** has no reference behaviour to match: a68g 3.13.3 stops
+  with a memory access violation on `z / w` and `z /:= w` for complex `z` and
+  `w`, whatever their values. a68lean divides, and reports a zero divisor.
 * **Runtime error messages** are not byte-identical; only standard output
   and the non-zero exit status are.

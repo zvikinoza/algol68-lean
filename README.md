@@ -15,17 +15,19 @@ machine-checked theorems (see [docs/VERIFICATION.md](docs/VERIFICATION.md)).
 
 | Test suite | Programs | Byte-identical to a68g |
 |---|---|---|
-| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic) | 729 | 651 |
-| Algol 68 Genie bundled test set (a68g-runnable) | 31 | 17 |
-| In-repo regression cases | 7 | 7 |
-| Random programs (grammar-based fuzzing, seeds 1–1000) | 1,000 | 1,000 |
+| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic) | 744 | 645 |
+| Algol 68 Genie bundled test set (a68g-runnable, deterministic) | 29 | 16 |
+| In-repo regression cases, evaluator and C back end | 13 | 13 |
+| Random programs through the evaluator (seeds 1–1000) | 1,000 | 1,000 |
+| Golden corpus sample through the C back end, `-O2` | 60 | 52 |
 
-The corpus failures fall into three groups (see [docs/TESTING.md](docs/TESTING.md)):
-programs that use `random` without seeding it (a68g seeds from the clock, so the
-reference output is not reproducible by any implementation), programs whose
-output depends on a68g's multi-precision `LONG REAL` arithmetic (not
-implemented: `LONG REAL` is IEEE double here), and a small remainder of
-unsupported a68g extensions or genuine gaps listed in the testing document.
+In that compiled sample, every program the C back end gets wrong also fails under
+the evaluator. The corpus failures are mostly a68g extensions that are not implemented
+(library procedures such as `system` and `evaluate`, some format items, some
+syntax), output that depends on a68g's multi-precision `LONG REAL` arithmetic
+(`LONG REAL` is an IEEE double here), and programs too slow for the evaluator's
+time limit, most of which pass when compiled. See
+[docs/TESTING.md](docs/TESTING.md).
 
 ## Speed of the compiled program
 
