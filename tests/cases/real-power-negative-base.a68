@@ -1,0 +1,7 @@
+# A negative base to a REAL power is an error. #
+BEGIN
+  REAL b := 2.0;
+  print((b ** 0.5, newline));
+  b := -2.0;
+  print((b ** 0.5, newline))
+END

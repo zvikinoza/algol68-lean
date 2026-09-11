@@ -1,0 +1,10 @@
+# A subscript out of bounds on a row kept as a C array stops the program as the  #
+# evaluator does: output so far is kept, and the exit status is non-zero.        #
+BEGIN
+  [3] INT a;
+  FOR i TO 3 DO a[i] := i OD;
+  print((a[1] + a[2] + a[3], newline));
+  INT k := 4;
+  a[k] := 7;
+  print(("not reached", newline))
+END

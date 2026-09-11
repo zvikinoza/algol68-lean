@@ -91,6 +91,7 @@ inductive Expr where
   | loop (var : Option String) (from_ by_ to_ : Option Expr) (while_ : Option Serial)
          (body : Serial) (pos : Pos)
   | format (items : List FormatItem) (pos : Pos)
+  | vacant (pos : Pos)                                 -- omitted argument of a partial call `f (x, )`
   deriving Repr, Inhabited
 
 inductive Decl where
@@ -123,6 +124,6 @@ def Expr.pos : Expr → Pos
   | .assign _ _ p | .identity _ _ _ p | .call _ _ p | .slice _ _ p | .select _ _ p
   | .cast _ _ p | .gen _ _ p | .routine _ _ _ p | .goto _ p | .block _ p
   | .collateral _ p | .cond _ _ p | .caseInt _ _ _ p | .caseConf _ _ _ p
-  | .loop _ _ _ _ _ _ p | .format _ p => p
+  | .loop _ _ _ _ _ _ p | .format _ p | .vacant p => p
 
 end A68

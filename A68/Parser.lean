@@ -47,19 +47,35 @@ def stdPrios : List (String × Nat) :=
 
 def stdMonops : List String :=
   ["ABS","SIGN","ODD","ENTIER","ROUND","REPR","BIN","NOT","LENG","SHORTEN","RE","IM","CONJ",
-   "ARG","UPB","LWB","ELEMS"]
+   "ARG","UPB","LWB","ELEMS","LEVEL","UP","DOWN"]
 
 def keywords : List String :=
   ["BEGIN","END","IF","THEN","ELIF","ELSE","FI","CASE","IN","OUSE","OUT","ESAC","FOR","FROM",
    "BY","TO","WHILE","DO","OD","PROC","OP","PRIO","MODE","REF","STRUCT","UNION","FLEX","HEAP",
    "LOC","LONG","SHORT","INT","REAL","BOOL","CHAR","STRING","BITS","BYTES","VOID","COMPL",
    "FORMAT","FILE","CHANNEL","SEMA","SKIP","NIL","EMPTY","TRUE","FALSE","GOTO","GO","IS","ISNT","COMPLEX",
-   "AT","OF","EXIT","PAR","CO","COMMENT","PR","PRAGMAT"]
+   "AT","OF","EXIT","PAR","CO","COMMENT","PR","PRAGMAT","NEW","UNTIL"]
 
 def baseModes : List (String × ModeSyn) :=
   [("INT",.int),("REAL",.real),("BOOL",.bool),("CHAR",.char),("STRING",.string),("BITS",.bits),
    ("BYTES",.bytes),("VOID",.void),("COMPL",.compl),("COMPLEX",.compl),("FORMAT",.format),("FILE",.file),
    ("CHANNEL",.channel),("SEMA",.sema)]
+
+/-- Mode indicants declared by a68g's standard environ (`a68g-environ.h`):
+    `MODE ZAHL = LONG INT, DOUBLE = LONG REAL, QUAD = LONG LONG REAL`.  Unlike the base
+    modes they are not keywords, so a program may declare them itself. -/
+def environModes : List (String × ModeSyn) :=
+  [("ZAHL", .long 1 .int), ("DOUBLE", .long 1 .real), ("QUAD", .long 1 (.long 1 .real))]
+
+/-- Is a symbol token an operator symbol (made of a68g's monad and nomad characters, with
+    the `=`/`:` tails of assigning operators), rather than punctuation? -/
+def isOperatorSymbol (w : String) : Bool :=
+  w != "" && w != ":" && w != ":=" && w.toList.all fun (c : Char) => "%^&+-~!?></=*:".toList.contains c
+
+/-- The operator a defining occurrence names when a68g's scanner has glued the `=` of the
+    declaration onto the operator symbol (`OP!=(INT c)CHAR: …` is `OP ! = …`). -/
+def splitDefiningOp (w : String) : Option String :=
+  if w.length > 1 && w.endsWith "=" then some (String.ofList w.toList.dropLast) else none
 
 /-- Collect user `MODE`, `OP` and `PRIO` names before parsing. -/
 def prescan (toks : Array Token) : Std.HashSet String × Std.HashMap String Nat × Std.HashSet String := Id.run do
@@ -71,6 +87,7 @@ def prescan (toks : Array Token) : Std.HashSet String × Std.HashMap String Nat 
   let n := toks.size
   for k in [0:n] do
     let t := toks[k]!.tok
+    let prev := if k > 0 then toks[k-1]!.tok else .eof
     let nxt := if k+1 < n then toks[k+1]!.tok else .eof
     let nxt2 := if k+2 < n then toks[k+2]!.tok else .eof
     match t with
@@ -88,8 +105,16 @@ def prescan (toks : Array Token) : Std.HashSet String × Std.HashMap String Nat 
     | _ => pure ()
     match kind, t, nxt with
     | some ("MODE", d), .bold w, .sym "=" => if depth == d then modes := modes.insert w
+    -- every declared operator may be applied monadically: a68g identifies the operator by
+    -- its operands, so one bold word can be both a dyadic (with a PRIO) and a monadic one
     | some ("OP", d), .bold w, .sym "=" =>
-      if depth == d && !prios.contains w then monops := monops.insert w
+      if depth == d then monops := monops.insert w
+    | some ("OP", d), .sym w, .sym "=" =>
+      -- only an operator symbol can be defined, not the `)` of `(a) = b` in a routine text
+      if depth == d && isOperatorSymbol w then monops := monops.insert w
+    | some ("OP", d), .sym w, _ =>
+      if depth == d && isOperatorSymbol w && (prev == .bold "OP" || prev == .sym ",") then
+        if let some w' := splitDefiningOp w then monops := monops.insert w'
     | some ("PRIO", d), .bold w, .sym "=" =>
       if depth == d then
         match nxt2 with
@@ -150,16 +175,45 @@ def isModeIndicant (w : String) : P Bool := do
   let s ← get
   return s.modes.contains w || (!(keywords.contains w) && !(s.prios.contains w) && !(s.monops.contains w))
 
+/-- Is `w` one of the environ's mode indicants (`ZAHL`, `DOUBLE`, `QUAD`) in its standard
+    meaning, i.e. not declared by the program as a mode or an operator? -/
+def isEnvironMode (s : PState) (w : String) : Bool :=
+  (environModes.lookup w).isSome && !s.modes.contains w && !s.prios.contains w && !s.monops.contains w
+
+/-- Does a token start a declarer, not looking past it? -/
+def tokStartsDeclarer (s : PState) : Tok → Bool
+  | .bold w => (baseModes.map (·.1)).contains w
+      || ["LONG","SHORT","REF","FLEX","PROC","STRUCT","UNION"].contains w
+      || s.modes.contains w || isEnvironMode s w
+  | .sym "[" => true
+  | _ => false
+
+/-- At an opening parenthesis: is it the bounds bracket of a declarer, as in `(1:n)INT a`
+    or `REF ()REAL`?  a68g accepts parentheses for the brackets of a row declarer; they are
+    told apart from an enclosed clause by what follows the matching closing parenthesis. -/
+def parenBoundsAhead : P Bool := do
+  let s ← get
+  if s.toks[s.i]?.map (·.tok) != some (.sym "(") then return false
+  let mut depth : Nat := 0
+  let mut k := s.i
+  while k < s.toks.size do
+    match s.toks[k]!.tok with
+    | .sym "(" | .sym "[" => depth := depth + 1
+    | .sym ")" | .sym "]" =>
+      depth := depth - 1
+      if depth == 0 then
+        let nxt := (s.toks[k+1]?.map (·.tok)).getD .eof
+        return tokStartsDeclarer s nxt || nxt == .sym "("
+    | .sym ";" | .eof => return false
+    | _ => pure ()
+    k := k + 1
+  return false
+
 def isDeclarerStart : P Bool := do
-  match (← peek) with
-  | .bold w =>
-    if (baseModes.map (·.1)).contains w || ["LONG","SHORT","REF","FLEX","PROC","STRUCT","UNION"].contains w then
-      return true
-    else
-      let s ← get
-      return s.modes.contains w
-  | .sym "[" => return true
-  | _ => return false
+  let s ← get
+  let t ← peek
+  if tokStartsDeclarer s t then return true
+  if t == .sym "(" then parenBoundsAhead else return false
 
 def isDyadicOp : P (Option (String × Nat)) := do
   let s ← get
@@ -176,6 +230,8 @@ def isMonadicOp : P (Option String) := do
   | .sym "+" => return some "+"
   | .sym "!" => return some "!"
   | .sym "~" => return some "NOT"
+  -- a monadic operator declared by the program (`OP +> = (…)…`, `OP -=: = (REF …)…`)
+  | .sym w => return if s.monops.contains w then some w else none
   | _ => return none
 
 -- ## Grammar
@@ -198,6 +254,13 @@ partial def parseDeclarer : P ModeSyn := do
     adv
     let bs ← parseBounds
     expectSym "]"
+    return .row bs false (← parseDeclarer)
+  | .sym "(" =>
+    -- a68g: parentheses may bracket the bounds of a row declarer, `(1:n)INT`, `REF ()REAL`
+    if !(← parenBoundsAhead) then fail "expected declarer"
+    adv
+    let bs ← if (← isSym ")") then pure [Bound.mk none none] else parseBoundsUntil ")"
+    expectSym ")"
     return .row bs false (← parseDeclarer)
   | .bold "PROC" =>
     adv
@@ -248,8 +311,15 @@ partial def parseDeclarer : P ModeSyn := do
     match baseModes.lookup w with
     | some m => adv; return m
     | none =>
-      if (← isModeIndicant w) then adv; return .ind w
-      else fail s!"expected declarer, found {w}"
+      let s ← get
+      match environModes.lookup w with
+      | some m =>
+        if isEnvironMode s w then adv; return m
+        else if (← isModeIndicant w) then adv; return .ind w
+        else fail s!"expected declarer, found {w}"
+      | none =>
+        if (← isModeIndicant w) then adv; return .ind w
+        else fail s!"expected declarer, found {w}"
   | _ => fail "expected declarer"
 
 partial def acceptColon : P Bool := do
@@ -257,18 +327,21 @@ partial def acceptColon : P Bool := do
   if (← isSym ".") && (← peekAt 1) == .sym "." then adv; adv; return true
   return false
 
-partial def parseBounds : P (List Bound) := do
+partial def parseBounds : P (List Bound) := parseBoundsUntil "]"
+
+/-- Bounds of a row declarer up to the closing bracket `close` (not consumed). -/
+partial def parseBoundsUntil (close : String) : P (List Bound) := do
   let mut bs : List Bound := []
   repeat
-    if (← isSym "]") || (← isSym ",") then
+    if (← isSym close) || (← isSym ",") then
       bs := bs ++ [.mk none none]
     else if (← acceptColon) then
-      let u ← if (← isSym "]") || (← isSym ",") then pure none else some <$> parseUnit
+      let u ← if (← isSym close) || (← isSym ",") then pure none else some <$> parseUnit
       bs := bs ++ [.mk none u]
     else
       let e ← parseUnit
       if (← acceptColon) then
-        let u ← if (← isSym "]") || (← isSym ",") then pure none else some <$> parseUnit
+        let u ← if (← isSym close) || (← isSym ",") then pure none else some <$> parseUnit
         bs := bs ++ [.mk (some e) u]
       else
         bs := bs ++ [.mk none (some e)]
@@ -282,6 +355,7 @@ partial def parseSerial (stops : List Tok) : P Serial := do
   let mut items : List Stmt := []
   let isStop : P Bool := do return stops.contains (← peek)
   if (← isStop) then return .mk []
+  let mut labelSeen := false
   repeat
     -- label?
     match (← peek), (← peekAt 1) with
@@ -289,13 +363,18 @@ partial def parseSerial (stops : List Tok) : P Serial := do
       let p ← curPos
       adv; adv
       items := items ++ [.label l p]
+      labelSeen := true
       if (← isStop) then break
       continue
     | _, _ => pure ()
+    let stPos ← curPos
     let st ← parseStatement
+    -- a68g (`reduce_serial_clauses`): labels belong to the units after the last declaration
+    let isDeclStmt := match st with | .decl _ :: _ => true | _ => false
+    if isDeclStmt && labelSeen then
+      throw { msg := "declaration cannot follow a labeled unit", pos := stPos }
     items := items ++ st
     -- collateral declarations: `INT a = 1, STRING s := "x"`
-    let isDeclStmt := match st with | .decl _ :: _ => true | _ => false
     if isDeclStmt then
       while (← isSym ",") do
         adv
@@ -359,11 +438,17 @@ partial def parseStatement : P (List Stmt) := do
       else if (← isDeclarerStart) then some <$> parseDeclarer else pure none
     let mut ds : List Stmt := []
     repeat
-      let n ← match (← peek) with
-        | .bold n => adv; pure n
-        | .sym n => adv; pure n
-        | _ => fail "expected operator symbol"
-      if (← acceptSym "=") then
+      -- a68g's scanner glues the `=` of the declaration onto a symbol (`OP!=(INT c)…` scans
+      -- as `!=`); like a68g's `extract_operators`, split it off when no `=` follows
+      let glued ← match (← peek), (← peekAt 1) with
+        | .sym n, nxt => pure (if nxt != .sym "=" && nxt != .sym ":=" then splitDefiningOp n else none)
+        | _, _ => pure none
+      let n ← match glued, (← peek) with
+        | some n', _ => adv; pure n'
+        | none, .bold n => adv; pure n
+        | none, .sym n => adv; pure n
+        | _, _ => fail "expected operator symbol"
+      if glued.isSome || (← acceptSym "=") then
         let body ← parseUnit
         ds := ds ++ [.decl (.op n m body p)]
       else if (← acceptSym ":=") then
@@ -400,7 +485,7 @@ partial def parseStatement : P (List Stmt) := do
         ds := [.decl (.identity none items p)]
       return ds
     else parseDeclarationOrUnit p
-  | .bold "HEAP" | .bold "LOC" =>
+  | .bold "HEAP" | .bold "LOC" | .bold "NEW" =>
     parseDeclarationOrUnit p
   | _ =>
     if (← isDeclarerStart) then parseDeclarationOrUnit p
@@ -409,7 +494,8 @@ partial def parseStatement : P (List Stmt) := do
 /-- Something starting with a declarer: a declaration if an identifier follows the declarer. -/
 partial def parseDeclarationOrUnit (p : Pos) : P (List Stmt) := do
   let hdr ← attempt do
-    let heap ← acceptBold "HEAP"
+    -- a68g's `NEW` is a synonym of `HEAP`
+    let heap ← do pure ((← acceptBold "HEAP") || (← acceptBold "NEW"))
     let _ ← if heap then pure false else acceptBold "LOC"
     let m ← parseDeclarer
     if isIdentTok (← peek) && (← peekAt 1) != .bold "OF" then return (heap, m)
@@ -515,7 +601,7 @@ partial def parseOperand : P Expr := do
 partial def parseSecondary : P Expr := do
   let p ← curPos
   match (← peek) with
-  | .bold "HEAP" => adv; return .gen true (← parseDeclarer) p
+  | .bold "HEAP" | .bold "NEW" => adv; return .gen true (← parseDeclarer) p
   | .bold "LOC" => adv; return .gen false (← parseDeclarer) p
   | .ident f =>
     if (← peekAt 1) == .bold "OF" then
@@ -535,7 +621,9 @@ partial def parsePrimary : P Expr := do
       let mut args : List Expr := []
       if !(← isSym ")") then
         repeat
-          args := args ++ [← parseUnit]
+          -- partial parametrisation: an argument may be left out, `f (x, )`
+          if (← isSym ",") || (← isSym ")") then args := args ++ [.vacant (← curPos)]
+          else args := args ++ [← parseUnit]
           if !(← acceptSym ",") then break
       expectSym ")"
       e := .call e args p
@@ -804,7 +892,29 @@ partial def parseLoop : P Expr := do
     by_ := some (.intLit 1 0 p2 |> fun e => .monadic "-" e p2)
   if (← acceptBold "WHILE") then while_ := some (← parseSerial [.bold "DO"])
   expectBold "DO"
-  let body ← parseSerial [.bold "OD"]
+  let body ← parseSerial [.bold "OD", .bold "UNTIL"]
+  if (← isBold "UNTIL") then
+    -- a68g extension `DO s UNTIL u OD`: after the body in every iteration the loop stops
+    -- when `u` holds; `u` sees the declarations of the body (genie-enclosed.c).  This is
+    -- `WHILE [w; IF w' THEN] s; NOT u [ELSE FALSE FI] DO SKIP OD`, the until part being an
+    -- enquiry clause of its own.
+    let pu ← curPos
+    adv
+    if (match body.items.getLast? with | some (.decl _) => true | _ => false) then
+      fail "a serial clause before UNTIL must end with a unit"
+    let u ← parseSerial [.bold "OD"]
+    expectBold "OD"
+    let notU : Expr := .cond [(u, .mk [.unit (.boolLit false pu)])] (some (.mk [.unit (.boolLit true pu)])) pu
+    let cont : Serial := .mk (body.items ++ [.unit notU])
+    let whileC : Serial := match while_ with
+      | none => cont
+      | some w =>
+        match w.items.reverse with
+        | .unit wl :: restRev =>
+          .mk (restRev.reverse ++
+            [.unit (.cond [(.mk [.unit wl], cont)] (some (.mk [.unit (.boolLit false pu)])) pu)])
+        | _ => .mk (w.items ++ [.unit (.cond [(.mk [], cont)] none pu)])   -- rejected later: no value
+    return .loop var from_ by_ to_ (some whileC) (.mk []) p
   expectBold "OD"
   return .loop var from_ by_ to_ while_ body p
 
@@ -1078,6 +1188,9 @@ def precisionOf (toks : Array Token) : Option Nat := Id.run do
 /-- Parse source text into a `Serial`. -/
 def parse (src : String) : Except PError Serial :=
   let toks := (lex src).filter fun t => match t.tok with | .pragmat _ => false | _ => true
+  match applyRefinements toks with
+  | .error (msg, pos) => .error { msg := msg, pos := pos }
+  | .ok toks =>
   let (modes, prios, monops) := Parser.prescan toks
   match Parser.parseProgram { toks := toks, modes := modes, prios := prios, monops := monops } with
   | .ok (s, _) => .ok s

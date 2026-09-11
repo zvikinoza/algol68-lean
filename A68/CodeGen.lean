@@ -45,6 +45,10 @@ def CTy.name : CTy → String
   | .i64 => "int64_t" | .f64 => "double" | .u8 => "uint8_t"
   | .u32 => "uint32_t" | .u64 => "uint64_t"
 
+/-- The one-letter suffix naming a type's helpers in the emitted C. -/
+def CTy.sfx : CTy → String
+  | .i64 => "i" | .f64 => "r" | .u8 => "b" | .u32 => "c" | .u64 => "u"
+
 /-- How a scalar of this type is pushed onto the operand stack when it has to be boxed. -/
 def CTy.pushFn : CTy → String
   | .i64 => "a68rt_push_int" | .f64 => "a68rt_push_real" | .u8 => "a68rt_push_bool"
@@ -112,6 +116,18 @@ def assignOpExpr (op : String) (ty : CTy) (x y : String) : Option String :=
   | "|:=", .u64 => some s!"(({x}) | ({y}))"
   | _, _ => none
 
+/-- A row of primitive elements promoted to a C array: `{name}_p` holds the elements,
+    `{name}_d` a flag per element saying whether it has been given a value, and
+    `{name}_l0`, `{name}_u0` (and `_l1`, `_u1` for a second dimension) its bounds. -/
+structure RowVar where
+  name : String
+  ty   : CTy
+  dims : Nat
+  /-- for a row of structures, the type of each field, each kept in `{name}_p{k}` with its
+      flags in `{name}_d{k}`; empty for a row of primitive elements -/
+  fields : Array CTy := #[]
+  deriving Inhabited
+
 /-- The C signature of a routine that is also compiled as a plain C function: parameters
     arrive as C arguments instead of on the operand stack, and the result comes back as the
     C return value instead of being boxed and pushed.  `rty` is `none` for VOID. -/
@@ -136,6 +152,11 @@ structure Frame where
   vars   : Array (Option (String × CTy × Bool)) := #[]
   /-- per slot: the routine it certainly holds, once a call can see its declaration -/
   procs  : Array (Option ProcInfo) := #[]
+  /-- per slot: the C array a row was promoted to -/
+  rows   : Array (Option RowVar) := #[]
+  /-- per slot: its mode, where known; a procedure-valued slot's mode gives the C signature
+      of a plain entry point for whatever routine it holds -/
+  modes  : Array (Option Mode) := #[]
   pushed : Bool := true
   deriving Inhabited
 
@@ -155,6 +176,20 @@ def varOf (env : List Frame) (d s : Nat) : Option (String × CTy × Bool) := do
   let f ← env[d]?
   let v ← f.vars[s]?
   v
+
+def rowOf (env : List Frame) (d s : Nat) : Option RowVar := do
+  let f ← env[d]?
+  let r ← f.rows[s]?
+  r
+
+/-- The promoted row a node names through its variable, `a` in `LWB a`. -/
+def rowName (env : List Frame) (c : Core) : Option RowVar :=
+  match c with
+  | .at _ e => rowName env e
+  | .loadCell d s => rowOf env d s
+  | .deref (.refCell d s) => rowOf env d s
+  | .deref (.at _ e) => rowName env (.deref e)
+  | _ => none
 
 /-- The C expression reading a promoted variable, with the undefined test when one is
     needed.  The test is a perfectly predicted branch, and it keeps the run-time error
@@ -179,6 +214,9 @@ structure St where
   frames : List Frame := []   -- innermost first
   nfns   : Array (String × Array String) := #[]   -- plain C entry points: signature, body
   ret    : String := "return;"  -- how the function being emitted returns when a jump leaves it
+  procMode : Option Mode := none   -- the mode of the routine text about to be compiled, if declared
+  modeTab : Mode.Table := {}       -- the program's mode declarations, to see through declared names
+  nativeOfFn : Array (Nat × Nat) := #[]   -- boxed function index, plain entry point index
   deriving Inhabited
 
 abbrev M := StateM St
@@ -467,6 +505,9 @@ end
 /-- The result mode of an operator, given its operand modes: comparisons yield BOOL,
     the arithmetic operators yield their (already widened) operand mode. -/
 def dyopResult (op : String) (m1 : Mode) : Option Mode :=
+  -- REAL / REAL is REAL; an INT division has had its operands widened by the elaborator,
+  -- so only REAL operands are admitted here
+  if op == "/" then (match m1 with | .real n => some (.real n) | _ => none) else
   if ["=", "/=", "<", "<=", ">", ">=", "AND", "OR", "XOR"].contains op then
     if ["AND", "OR", "XOR"].contains op then some m1 else some .bool
   else if ["+", "-", "*", "%", "%*", "**"].contains op then some m1
@@ -557,7 +598,42 @@ def dyopC (op : String) (opnd : CTy) (a b : String) : Option String :=
   | ">=", _ => some s!"(uint8_t)(({a}) >= ({b}))"
   | _, _ => none
 
+/-- The REAL standard functions compiled to C, each as `a68_m_<name>`. -/
+def nativeMathFns : List String := ["acos", "arccos", "arccosh", "arcsin", "arcsinh", "arctan", "arctanh", "asin", "atan", "cbrt", "cos", "cosh", "curt", "exp", "exp2", "ln", "log", "log10", "log2", "sin", "sinh", "sqrt", "tan", "tanh"]
+
 mutual
+/-- `f OF a[i]` on a row of structures kept as one C array per field. -/
+partial def srowReadC (env : List Frame) (ty : CTy) (f : Nat) (e : Core) : Option String := do
+  let (base, idx) ← match strip e with
+    | .slice base idx true => some (base, idx)
+    | _ => none
+  let (d, sl) ← match strip base with
+    | .refCell d sl => some (d, sl)
+    | _ => none
+  let rv ← rowOf env d sl
+  if rv.fields.isEmpty || f ≥ rv.fields.size || rv.fields[f]! != ty || idx.length != rv.dims then none else
+  let is ← idx.mapM fun | .index x => scalarExpr env (.int 0) x | _ => none
+  let r := rv.name
+  if rv.dims == 1 then
+    some s!"a68_ar_{ty.sfx}({r}_p{f}, {r}_d{f}, {r}_l0, {r}_u0, {is[0]!})"
+  else
+    some s!"a68_ar2_{ty.sfx}({r}_p{f}, {r}_d{f}, {r}_l0, {r}_u0, {r}_l1, {r}_u1, {is[0]!}, {is[1]!})"
+
+/-- `a[i]` and `a[i, j]` on a row promoted to a C array: the element, with the bounds check
+    and the undefined test the evaluator performs. -/
+partial def rowReadC (env : List Frame) (ty : CTy) (base : Core) (idx : List CoreIdx) : Option String := do
+  let (d, sl) ← match strip base with
+    | .refCell d sl => some (d, sl)
+    | _ => none
+  let rv ← rowOf env d sl
+  if !rv.fields.isEmpty || rv.ty != ty || idx.length != rv.dims then none else
+  let is ← idx.mapM fun | .index e => scalarExpr env (.int 0) e | _ => none
+  let r := rv.name
+  if rv.dims == 1 then
+    some s!"a68_ar_{ty.sfx}({r}_p, {r}_d, {r}_l0, {r}_u0, {is[0]!})"
+  else
+    some s!"a68_ar2_{ty.sfx}({r}_p, {r}_d, {r}_l0, {r}_u0, {r}_l1, {r}_u1, {is[0]!}, {is[1]!})"
+
 /-- `a[i]` and `a[i, j]` where `a` is a row held directly in a cell: one call that returns
     a native value, instead of a reference built on the operand stack and then dereferenced. -/
 partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List CoreIdx) : Option String := do
@@ -565,7 +641,7 @@ partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List Core
     | .refCell d sl => some (d, sl)
     | .loadCell d sl => some (d, sl)
     | _ => none
-  if (varOf env d sl).isSome then none else
+  if (varOf env d sl).isSome || (rowOf env d sl).isSome then none else
   match idx with
   | [.index a] => do
     let ia ← scalarExpr env (.int 0) a
@@ -583,7 +659,7 @@ partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List Core
 partial def selChain (env : List Frame) : Core → Option SelChain
   | .at _ e => selChain env e
   | .refCell d s =>
-    if (varOf env d s).isSome then none
+    if (varOf env d s).isSome || (rowOf env d s).isSome then none
     else some { depth := rtDepthOf env d, slot := s }
   -- the cell holds a `REF`; the structure is what it designates
   | .loadCell d s | .deref (.refCell d s) =>
@@ -631,22 +707,50 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     match varOf env d s with
     | some (v, vt, u) => if vt == ty then some (readVar (v, vt, u)) else none
     | none => some s!"{ty.cellFn}({rtDepthOf env d}, {s})"
-  | .deref (.slice base idx true) => rowRead env ty base idx
+  | .deref (.slice base idx true) =>
+    match rowReadC env ty base idx with
+    | some s => some s
+    | none => rowRead env ty base idx
   | .slice base idx false => rowRead env ty base idx
-  | .deref (.select f e true) => do
-    let ch ← fieldChain env (.select f e true)
-    some s!"{ty.selFn}({ch.args})"
+  | .deref (.select f e true) =>
+    match srowReadC env ty f e with
+    | some s => some s
+    | none => do
+      let ch ← fieldChain env (.select f e true)
+      some s!"{ty.selFn}({ch.args})"
+  | .call (.lit (.builtin n)) [arg] =>
+    if ty == .f64 && nativeMathFns.contains n then do
+      let x ← scalarExpr env (.real 0) arg
+      some s!"a68_m_{n}({x})"
+    else none
   | .widen src dst e =>
     -- only the widenings that stay inside a native type
     match src, dst with
     | .int 0, .real 0 => do let x ← scalarExpr env (.int 0) e; some s!"((double)({x}))"
     | _, _ => none
   | .monop op mm e => do
+    if (op == "LWB" || op == "UPB") && ty == .i64 then
+      if let some rv := rowName env e then
+        return s!"{rv.name}_{if op == "LWB" then "l" else "u"}0"
     let r ← monopResult op mm
     if r != m then none else
     let x ← scalarExpr env mm e
     monopC op (← CTy.ofMode mm) x
   | .dyop op m1 m2 l r => do
+    -- exponentiation, as the evaluator computes it for each pair of operand modes
+    if op == "**" then
+      match m1, m2, ty with
+      | .int 0, .int 0, .i64 => return s!"a68_pow_i({← scalarExpr env (.int 0) l}, {← scalarExpr env (.int 0) r})"
+      | .real 0, .int 0, .f64 => return s!"a68_pow_ri({← scalarExpr env (.real 0) l}, {← scalarExpr env (.int 0) r})"
+      | .real 0, .real 0, .f64 => return s!"a68_pow_rr({← scalarExpr env (.real 0) l}, {← scalarExpr env (.real 0) r})"
+      | _, _, _ => none
+    if (op == "LWB" || op == "UPB") && ty == .i64 then
+      if let some rv := rowName env r then
+        match strip l with
+        | .lit (.int k) =>
+          if k == 1 || (k == 2 && rv.dims == 2) then
+            return s!"{rv.name}_{if op == "LWB" then "l" else "u"}{k - 1}"
+        | _ => pure ()
     if m1 != m2 then none else
     let opnd ← CTy.ofMode m1
     let res ← dyopResult op m1
@@ -667,8 +771,12 @@ def resultMode : Core → Option Mode
   | .lit (.char _) => some .char
   | .lit (.bits _) => some (.bits 0)
   | .loadCell _ _ => none
-  | .dyop op m1 _ _ _ => dyopResult op m1
-  | .monop op m _ => monopResult op m
+  | .dyop op m1 _ _ _ => if op == "LWB" || op == "UPB" then some (.int 0) else dyopResult op m1
+  | .call f [_] =>
+    match strip f with
+    | .lit (.builtin n) => if nativeMathFns.contains n then some (.real 0) else none
+    | _ => none
+  | .monop op m _ => if op == "LWB" || op == "UPB" then some (.int 0) else monopResult op m
   | .widen _ d _ => some d
   | _ => none
 
@@ -752,13 +860,234 @@ partial def seenByOtherFn (slot d : Nat) (c : Core) : Bool :=
   | .fmt items => items.any fun it => (fmtChildren it).any (seesSlot slot d)
   | _ => (childrenD c).any fun (k, ch) => seenByOtherFn slot (d + k) ch
 
+/-- The dimensions and element type of a slot that could be a C array: a fixed row of a
+    primitive mode, of one or two dimensions. -/
+def rowElemTy : Mode → Option (Nat × CTy)
+  | .ref (.row dims false e) | .row dims false e =>
+    if dims == 1 || dims == 2 then (CTy.ofMode e).map fun t => (dims, t) else none
+  | _ => none
+
+/-- The bounds of the slot's declaration, when it is declared by a row generator whose
+    elements start undefined, which is what a C array with cleared flags reproduces. -/
+def rowDecl (stmts : Array CoreStmt) (slot : Nat) : Option (List (Core × Core)) := Id.run do
+  for st in stmts do
+    match st with
+    | .decl sl _ init =>
+      if sl == slot then
+        match strip init with
+        | .newRow bs ei false =>
+          match strip ei with
+          | .lit .undef => return some bs
+          | _ => return none
+        | _ => return none
+    | _ => pure ()
+  return none
+
+/-- `a[i]` or `a[i, j]` on the row slot, with a plain subscript for every dimension. -/
+def rowElemIdx (d sl dims : Nat) (c : Core) : Option (List Core) :=
+  match strip c with
+  | .slice base idx true =>
+    match strip base with
+    | .refCell dd ss =>
+      if dd == d && ss == sl && idx.length == dims then
+        idx.mapM fun | .index e => some e | _ => none
+      else none
+    | _ => none
+  | _ => none
+
+def isRowNameOf (d sl : Nat) (c : Core) : Bool :=
+  match strip c with
+  -- the optimiser reads a variable with `loadCell` where it can; for a row variable both
+  -- forms yield the same row value
+  | .loadCell dd ss => dd == d && ss == sl
+  | .deref e => match strip e with | .refCell dd ss => dd == d && ss == sl | _ => false
+  | _ => false
+
+mutual
+/-- Does anything force the row slot to stay a run-time cell?  What a C array supports is a
+    subscript in every dimension, read anywhere, written or updated by an assigning
+    operator in statement position, and the bounds enquiries `LWB a`, `UPB a`, `k LWB a`
+    and `k UPB a`.  Anything else — the row as a value, a slice, a trim, a reference to an
+    element — keeps the cell. -/
+partial def rowEscapes (ok : String → Bool) (d sl dims : Nat) (c : Core) : Bool :=
+  match c with
+  | .at _ e => rowEscapes ok d sl dims e
+  | .refCell dd ss | .loadCell dd ss => dd == d && ss == sl
+  | .deref e =>
+    match rowElemIdx d sl dims e with
+    | some ixs => ixs.any (rowEscapes ok d sl dims)
+    | none => rowEscapes ok d sl dims e
+  | .monop op _ e =>
+    if (op == "LWB" || op == "UPB") && isRowNameOf d sl e then false
+    else rowEscapes ok d sl dims e
+  | .dyop op _ _ l r =>
+    if (op == "LWB" || op == "UPB") && isRowNameOf d sl r &&
+        (match strip l with | .lit (.int k) => k ≥ 1 && k ≤ (dims : Int) | _ => false) then false
+    else rowEscapes ok d sl dims l || rowEscapes ok d sl dims r
+  | .voiding e => rowEscapesV ok d sl dims e
+  | .block _ stmts _ _ => rowEscapesStmts ok (d + 1) sl dims stmts true
+  | .loop _ f b t w body =>
+    rowEscapes ok d sl dims f || rowEscapes ok d sl dims b
+      || (match t with | some e => rowEscapes ok d sl dims e | none => false)
+      || (match w with | some e => rowEscapes ok (d + 1) sl dims e | none => false)
+      || rowEscapesV ok (d + 1) sl dims body
+  | _ => (childrenD c).any fun (k, ch) => rowEscapes ok (d + k) sl dims ch
+
+partial def rowEscapesV (ok : String → Bool) (d sl dims : Nat) (c : Core) : Bool :=
+  match strip c with
+  | .voiding e => rowEscapesV ok d sl dims e
+  | .seq a b => rowEscapesV ok d sl dims a || rowEscapesV ok d sl dims b
+  | .assign dst src _ =>
+    match rowElemIdx d sl dims dst with
+    | some ixs => ixs.any (rowEscapes ok d sl dims) || rowEscapes ok d sl dims src
+    | none => rowEscapes ok d sl dims dst || rowEscapes ok d sl dims src
+  | .dyop op m1 m2 l r =>
+    match rowElemIdx d sl dims l with
+    | some ixs => !ok op || ixs.any (rowEscapes ok d sl dims) || rowEscapes ok d sl dims r
+    | none => rowEscapes ok d sl dims (.dyop op m1 m2 l r)
+  | .cond a b e => rowEscapes ok d sl dims a || rowEscapesV ok d sl dims b || rowEscapesV ok d sl dims e
+  | .block _ stmts _ _ => rowEscapesStmts ok (d + 1) sl dims stmts false
+  | c' => rowEscapes ok d sl dims c'
+
+partial def rowEscapesStmts (ok : String → Bool) (d sl dims : Nat) (stmts : Array CoreStmt)
+    (wantValue : Bool) : Bool := Id.run do
+  let vp := voidPositions stmts wantValue
+  for i in [0:stmts.size] do
+    let bad := match stmts[i]! with
+      | .decl _ _ init => rowEscapes ok d sl dims init
+      | .unit e => if vp[i]! == true then rowEscapesV ok d sl dims e else rowEscapes ok d sl dims e
+      | .label _ | .exit => false
+    if bad then return true
+  return false
+end
+
+/-- A fixed row of structures whose fields are all primitive, seen through declared mode
+    names: its dimensions and the type of each field. -/
+def rowStructTy (tab : Mode.Table) : Mode → Option (Nat × Array CTy)
+  | .ref (.row dims false e) | .row dims false e =>
+    if dims == 1 || dims == 2 then
+      match Mode.resolve tab e with
+      | .struct fs =>
+        match fs.mapM (fun (_, fm) => CTy.ofMode (Mode.resolve tab fm)) with
+        | some tys => if tys.isEmpty || tys.length > 16 then none else some (dims, tys.toArray)
+        | none => none
+      | _ => none
+    else none
+  | _ => none
+
+/-- The bounds and field count of a row-of-structures declaration whose every field starts
+    undefined. -/
+def rowStructDecl (stmts : Array CoreStmt) (slot : Nat) : Option (List (Core × Core) × Nat) := Id.run do
+  for st in stmts do
+    match st with
+    | .decl sl _ init =>
+      if sl == slot then
+        match strip init with
+        | .newRow bs ei false =>
+          match strip ei with
+          | .collateral es _ _ =>
+            return (if es.all (fun e => match strip e with | .lit .undef => true | _ => false)
+                    then some (bs, es.length) else none)
+          | _ => return none
+        | _ => return none
+    | _ => pure ()
+  return none
+
+/-- `f OF a[i]` or `f OF a[i, j]` on the row slot: the field and the subscripts. -/
+def srowFieldIdx (d sl dims nf : Nat) (c : Core) : Option (Nat × List Core) :=
+  match strip c with
+  | .select f e true => if f < nf then (rowElemIdx d sl dims e).map fun ixs => (f, ixs) else none
+  | _ => none
+
+/-- A field of an element of a promoted row of structures, as a destination. -/
+def srowFieldDst (env : List Frame) (c : Core) : Option (RowVar × Nat × List CoreIdx) :=
+  match strip c with
+  | .select f e true =>
+    match strip e with
+    | .slice base idx true =>
+      match strip base with
+      | .refCell d s =>
+        match rowOf env d s with
+        | some rv =>
+          if rv.fields.isEmpty || f ≥ rv.fields.size || idx.length != rv.dims then none
+          else some (rv, f, idx)
+        | none => none
+      | _ => none
+    | _ => none
+  | _ => none
+
+mutual
+/-- What a row of structures kept as C arrays supports: a field of a fully subscripted
+    element, read anywhere, written or updated by an assigning operator in statement
+    position; a whole element assigned from a structure display in statement position; and
+    the bounds enquiries.  Anything else keeps the cell. -/
+partial def srowEscapes (tys : Array CTy) (d sl dims : Nat) (c : Core) : Bool :=
+  match c with
+  | .at _ e => srowEscapes tys d sl dims e
+  | .refCell dd ss | .loadCell dd ss => dd == d && ss == sl
+  | .deref e =>
+    match srowFieldIdx d sl dims tys.size e with
+    | some (_, ixs) => ixs.any (srowEscapes tys d sl dims)
+    | none => srowEscapes tys d sl dims e
+  | .monop op _ e =>
+    if (op == "LWB" || op == "UPB") && isRowNameOf d sl e then false
+    else srowEscapes tys d sl dims e
+  | .dyop op _ _ l r =>
+    if (op == "LWB" || op == "UPB") && isRowNameOf d sl r &&
+        (match strip l with | .lit (.int k) => k ≥ 1 && k ≤ (dims : Int) | _ => false) then false
+    else srowEscapes tys d sl dims l || srowEscapes tys d sl dims r
+  | .voiding e => srowEscapesV tys d sl dims e
+  | .block _ stmts _ _ => srowEscapesStmts tys (d + 1) sl dims stmts true
+  | .loop _ f b t w body =>
+    srowEscapes tys d sl dims f || srowEscapes tys d sl dims b
+      || (match t with | some e => srowEscapes tys d sl dims e | none => false)
+      || (match w with | some e => srowEscapes tys (d + 1) sl dims e | none => false)
+      || srowEscapesV tys (d + 1) sl dims body
+  | _ => (childrenD c).any fun (k, ch) => srowEscapes tys (d + k) sl dims ch
+
+partial def srowEscapesV (tys : Array CTy) (d sl dims : Nat) (c : Core) : Bool :=
+  match strip c with
+  | .voiding e => srowEscapesV tys d sl dims e
+  | .seq a b => srowEscapesV tys d sl dims a || srowEscapesV tys d sl dims b
+  | .assign dst src _ =>
+    match srowFieldIdx d sl dims tys.size dst with
+    | some (_, ixs) => ixs.any (srowEscapes tys d sl dims) || srowEscapes tys d sl dims src
+    | none =>
+      match rowElemIdx d sl dims dst, strip src with
+      | some ixs, .collateral es _ _ =>
+        if es.length == tys.size then
+          ixs.any (srowEscapes tys d sl dims) || es.any (srowEscapes tys d sl dims)
+        else true
+      | _, _ => srowEscapes tys d sl dims dst || srowEscapes tys d sl dims src
+  | .dyop op m1 m2 l r =>
+    match srowFieldIdx d sl dims tys.size l with
+    | some (f, ixs) =>
+      !assignsNatively tys[f]! op || ixs.any (srowEscapes tys d sl dims) || srowEscapes tys d sl dims r
+    | none => srowEscapes tys d sl dims (.dyop op m1 m2 l r)
+  | .cond a b e =>
+    srowEscapes tys d sl dims a || srowEscapesV tys d sl dims b || srowEscapesV tys d sl dims e
+  | .block _ stmts _ _ => srowEscapesStmts tys (d + 1) sl dims stmts false
+  | c' => srowEscapes tys d sl dims c'
+
+partial def srowEscapesStmts (tys : Array CTy) (d sl dims : Nat) (stmts : Array CoreStmt)
+    (wantValue : Bool) : Bool := Id.run do
+  let vp := voidPositions stmts wantValue
+  for i in [0:stmts.size] do
+    let bad := match stmts[i]! with
+      | .decl _ _ init => srowEscapes tys d sl dims init
+      | .unit e => if vp[i]! == true then srowEscapesV tys d sl dims e else srowEscapes tys d sl dims e
+      | .label _ | .exit => false
+    if bad then return true
+  return false
+end
+
 /-- Which of a frame's slots can become C variables.  A slot qualifies when its declared
     mode is primitive and nothing inside the frame needs it to live in a cell.  If no
     routine text or format text occurs in the body — those compile to separate C functions
     that reach the frame through the run-time environment — and every slot qualifies, then
     no run-time frame is emitted for it at all. -/
 def planFrame (tag : Nat) (size : Nat) (slotModes : Array (Option Mode))
-    (stmts : Array CoreStmt) (wantValue : Bool) : Frame := Id.run do
+    (stmts : Array CoreStmt) (wantValue : Bool) (tab : Mode.Table := {}) : Frame := Id.run do
   -- A routine text or a format text is compiled into a C function of its own and reaches
   -- this frame through the run-time environment.  A slot it can see therefore needs its
   -- cell; a slot it cannot see is as free to become a C variable as in any other block.
@@ -769,16 +1098,38 @@ def planFrame (tag : Nat) (size : Nat) (slotModes : Array (Option Mode))
       | .decl _ _ c | .unit c => seenByOtherFn i 0 c
       | _ => false
   let mut vars : Array (Option (String × CTy × Bool)) := #[]
+  let mut rows : Array (Option RowVar) := #[]
   let mut all := true
   for i in [0:size] do
     match (slotModes[i]?.join).bind CTy.ofMode with
     | some t =>
+      rows := rows.push none
       if seenElsewhere i || slotEscapesStmts (assignsNatively t) 0 i stmts wantValue then
         vars := vars.push none; all := false
       else
         vars := vars.push (some (s!"p{tag}_{i}", t, !slotInitialised stmts i))
-    | none => vars := vars.push none; all := false
-  return { vars := vars, pushed := others || !all }
+    | none =>
+      vars := vars.push none
+      -- a fixed row of primitive elements, used only through subscripts and bounds
+      -- enquiries, can be a C array
+      match (slotModes[i]?.join).bind rowElemTy, rowDecl stmts i with
+      | some (dims, t), some bs =>
+        if bs.length != dims || seenElsewhere i
+            || rowEscapesStmts (assignsNatively t) 0 i dims stmts wantValue then
+          rows := rows.push none; all := false
+        else
+          rows := rows.push (some { name := s!"r{tag}_{i}", ty := t, dims := dims })
+      | _, _ =>
+        -- a fixed row of structures of primitive fields can be one C array per field
+        match (slotModes[i]?.join).bind (rowStructTy tab), rowStructDecl stmts i with
+        | some (dims, tys), some (bs, nf) =>
+          if bs.length != dims || nf != tys.size || seenElsewhere i
+              || srowEscapesStmts tys 0 i dims stmts wantValue then
+            rows := rows.push none; all := false
+          else
+            rows := rows.push (some { name := s!"r{tag}_{i}", ty := tys[0]!, dims := dims, fields := tys })
+        | _, _ => rows := rows.push none; all := false
+  return { vars := vars, rows := rows, pushed := others || !all }
 
 def env : M (List Frame) := do return (← get).frames
 def rtd (d : Nat) : M Nat := do return rtDepthOf (← env) d
@@ -814,12 +1165,38 @@ def staticNat (env : List Frame) (f : Core) : Option ProcInfo := do
     if (varOf env d s).isSome || rtDepthOf env d != 0 then none else some pi
   | _ => none
 
+/-- Does the routine body read or name a frame outside its own?  A body that does not can be
+    run from anywhere, since it needs no environment but its arguments. -/
+partial def outerRef (depth : Nat) (c : Core) : Bool :=
+  match c with
+  | .loadCell d _ | .refCell d _ => d ≥ depth
+  | _ => (childrenD c).any fun (k, ch) => outerRef (depth + k) ch
+
+/-- A call through a procedure-valued slot whose routine cannot be known statically, such as
+    a procedure parameter: the C signature a plain entry point for it would have, when the
+    slot's mode allows one.  Which routine the slot holds is looked up at run time. -/
+def dynNat (env : List Frame) (f : Core) : Option NatSig := do
+  match strip f with
+  | .loadCell d s =>
+    if (varOf env d s).isSome || (staticNat env f).isSome then none else
+    let fr ← env[d]?
+    let m ← (fr.modes[s]?).join
+    match m with
+    | .proc ps r =>
+      let ptys ← ps.mapM CTy.ofMode
+      let rty : Option CTy ← (match r with
+        | .void => some none
+        | _ => (CTy.ofMode r).map some)
+      some { ptys := ptys.toArray, rty := rty }
+    | _ => none
+  | _ => none
+
 /-- Does the native spine of `c` contain such a call? -/
 partial def hasNatCall (env : List Frame) (c : Core) : Bool :=
   match c with
   | .at _ e | .monop _ _ e | .widen _ _ e => hasNatCall env e
   | .dyop _ _ _ l r => hasNatCall env l || hasNatCall env r
-  | .call f _ => (staticNat env f).isSome
+  | .call f _ => (staticNat env f).isSome || (dynNat env f).isSome
   | _ => false
 
 /-- Can `c` be computed as a native value of mode `m`, calls included? -/
@@ -831,7 +1208,12 @@ partial def natOk (env : List Frame) (m : Mode) (c : Core) : Bool :=
     | some pi =>
       CTy.ofMode m == pi.sig.rty && pi.sig.rty.isSome && args.length == pi.sig.ptys.size
         && (List.range args.length).all fun i => natOk env (pi.sig.ptys[i]!).toMode args[i]!
-    | none => false
+    | none =>
+      match dynNat env f with
+      | some sg =>
+        CTy.ofMode m == sg.rty && sg.rty.isSome && args.length == sg.ptys.size
+          && (List.range args.length).all fun i => natOk env (sg.ptys[i]!).toMode args[i]!
+      | none => false
   | .monop op mm e =>
     monopResult op mm == some m && (match CTy.ofMode mm with
       | some t => (monopC op t "x").isSome && natOk env mm e
@@ -846,7 +1228,10 @@ partial def natOk (env : List Frame) (m : Mode) (c : Core) : Bool :=
 /-- The mode a node yields, counting the calls whose callee is known. -/
 def resultModeE (env : List Frame) (c : Core) : Option Mode :=
   match strip c with
-  | .call f _ => do let pi ← staticNat env f; let t ← pi.sig.rty; some t.toMode
+  | .call f _ =>
+    match staticNat env f with
+    | some pi => do let t ← pi.sig.rty; some t.toMode
+    | none => do let sg ← dynNat env f; let t ← sg.rty; some t.toMode
   | _ => resultMode c
 
 /-- May this operand be left to be evaluated after a call to its right?  Only when doing so
@@ -869,6 +1254,100 @@ def reserveNative : M Nat := do
 
 mutual
 
+/-- The offset of `a[i]` or `a[i, j]` in a promoted row.  The subscripts are evaluated in
+    order and the bounds checked before anything else happens, which is the order the
+    evaluator follows when the element is the destination of an assignment. -/
+partial def rowOffset (rv : RowVar) (idx : List CoreIdx) : M String := do
+  let mut xs : Array String := #[]
+  for ix in idx do
+    match ix with
+    | .index e =>
+      let v ← match scalarExpr (← env) (.int 0) e with
+        | some s => pure s
+        | none => do gen e; pure "a68_int()"
+      let k ← fresh
+      emit s!"int64_t x{k} = {v};"
+      xs := xs.push s!"x{k}"
+    | _ => pure ()
+  let k ← fresh
+  let r := rv.name
+  if rv.dims == 1 then
+    emit s!"size_t o{k} = a68_ao({r}_l0, {r}_u0, {xs[0]!});"
+  else
+    emit s!"size_t o{k} = a68_ao2({r}_l0, {r}_u0, {r}_l1, {r}_u1, {xs[0]!}, {xs[1]!});"
+  return s!"o{k}"
+
+/-- A value of the element type, computed into a C variable. -/
+partial def rowValue (ty : CTy) (src : Core) : M String := do
+  let ev ← env
+  let k ← fresh
+  match scalarExpr ev ty.toMode src with
+  | some e => emit s!"{ty.name} v{k} = {e};"
+  | none =>
+    if hasNatCall ev src && natOk ev ty.toMode src then
+      let e ← anf ty.toMode src
+      emit s!"{ty.name} v{k} = {e};"
+    else do
+      gen src
+      emit s!"{ty.name} v{k} = {ty.popFn}();"
+  return s!"v{k}"
+
+/-- The declaration of a row promoted to a C array: its bounds, evaluated in the order the
+    generator evaluates them, and storage for its elements with every flag cleared. -/
+partial def genRowDecl (rv : RowVar) (init : Core) : M Unit := do
+  match strip init with
+  | .newRow bs _ _ =>
+    let mut k := 0
+    for (lo, hi) in bs do
+      let l ← match scalarExpr (← env) (.int 0) lo with
+        | some s => pure s
+        | none => do gen lo; pure "a68_int()"
+      emit s!"{rv.name}_l{k} = {l};"
+      let u ← match scalarExpr (← env) (.int 0) hi with
+        | some s => pure s
+        | none => do gen hi; pure "a68_int()"
+      emit s!"{rv.name}_u{k} = {u};"
+      k := k + 1
+    let r := rv.name
+    let n0 := s!"({r}_u0 >= {r}_l0 ? {r}_u0 - {r}_l0 + 1 : 0)"
+    let n := if rv.dims == 2 then s!"{n0} * ({r}_u1 >= {r}_l1 ? {r}_u1 - {r}_l1 + 1 : 0)" else n0
+    if rv.fields.isEmpty then
+      emit s!"{r}_p = ({rv.ty.name}*) a68_row_alloc((size_t)({n}), sizeof({rv.ty.name})); {r}_d = (uint8_t*) a68_row_alloc((size_t)({n}), 1);"
+    else
+      for fk in [0:rv.fields.size] do
+        let t := rv.fields[fk]!
+        emit s!"{r}_p{fk} = ({t.name}*) a68_row_alloc((size_t)({n}), sizeof({t.name})); {r}_d{fk} = (uint8_t*) a68_row_alloc((size_t)({n}), 1);"
+  | _ => pure ()
+
+/-- A call through a procedure-valued slot.  When the routine the slot holds at run time has
+    a plain C entry point that needs no environment, that is called; otherwise the call is
+    boxed.  The slot is read first and the arguments are evaluated after it, once, on
+    whichever path is taken, which is the evaluator's order. -/
+partial def dynCall (sg : NatSig) (f : Core) (args : List Core) (dest : Option String) : M Unit := do
+  match strip f with
+  | .loadCell d s =>
+    let k ← fresh
+    let rtyName := match sg.rty with | some t => t.name | none => "void"
+    let plist := if sg.ptys.isEmpty then "void" else ", ".intercalate (sg.ptys.toList.map CTy.name)
+    let ptrTy := rtyName ++ " (*)(" ++ plist ++ ")"
+    emit s!"void* f{k} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({← rtd d}, {s}, W))];"
+    emit ("if (f" ++ toString k ++ ") {")
+    indent do
+      let as ← natArgs sg.ptys args
+      let callE := "((" ++ ptrTy ++ ") f" ++ toString k ++ ")(" ++ ", ".intercalate as.toList ++ ")"
+      match dest with
+      | some v => emit s!"{v} = {callE};"
+      | none => emit s!"(void) {callE};"
+      jumpCheck
+    emit "} else {"
+    indent do
+      genNode (.call f args)
+      match dest, sg.rty with
+      | some v, some t => emit s!"{v} = {t.popFn}();"
+      | _, _ => emit "a68_v(a68rt_pop(W));"
+    emit "}"
+  | _ => genNode (.call f args)
+
 /-- Put a native expression in a fresh C variable, so that it is evaluated here. -/
 partial def hoistT (t : CTy) (e : String) : M String := do
   let k ← fresh
@@ -877,12 +1356,12 @@ partial def hoistT (t : CTy) (e : String) : M String := do
 
 /-- The arguments of a direct call, evaluated left to right: an argument is hoisted into a
     C variable whenever a later argument makes a call, unless delaying it is unobservable. -/
-partial def natArgs (pi : ProcInfo) (args : List Core) : M (Array String) := do
+partial def natArgs (ptys : Array CTy) (args : List Core) : M (Array String) := do
   let ev ← env
   let mut as : Array String := #[]
   for i in [0:args.length] do
     let a := args[i]!
-    let pty := pi.sig.ptys[i]!
+    let pty := ptys[i]!
     let x ← anf pty.toMode a
     let later := (args.drop (i + 1)).any (hasNatCall ev)
     let x ← if later && !delayable ev a then hoistT pty x else pure x
@@ -899,13 +1378,21 @@ partial def anf (m : Mode) (c : Core) : M String := do
   match c with
   | .at _ e => anf m e
   | .call f args =>
-    let pi := (staticNat ev f).get!
-    let as ← natArgs pi args
-    let k ← fresh
-    let rty := pi.sig.rty.get!
-    emit s!"{rty.name} t{k} = a68_nf{pi.nidx}({", ".intercalate as.toList});"
-    jumpCheck
-    return s!"t{k}"
+    match staticNat ev f with
+    | some pi =>
+      let as ← natArgs pi.sig.ptys args
+      let k ← fresh
+      let rty := pi.sig.rty.get!
+      emit s!"{rty.name} t{k} = a68_nf{pi.nidx}({", ".intercalate as.toList});"
+      jumpCheck
+      return s!"t{k}"
+    | none =>
+      let sg := (dynNat ev f).get!
+      let rty := sg.rty.get!
+      let k ← fresh
+      emit s!"{rty.name} t{k};"
+      dynCall sg f args (some s!"t{k}")
+      return s!"t{k}"
   | .monop op mm e =>
     let x ← anf mm e
     return (monopC op (CTy.ofMode mm).get! x).getD "0"
@@ -952,6 +1439,27 @@ partial def genNative (k : Nat) (sg : NatSig) (body : Core) (outer : List Frame)
 
 /-- Emit code leaving the value of `c` on the operand stack. -/
 partial def gen (c : Core) : M Unit := do
+  -- an element of a row promoted to a C array, whatever its subscripts
+  match c with
+  | .deref (.slice base idx true) =>
+    match strip base with
+    | .refCell d sl =>
+      match rowOf (← env) d sl with
+      | some rv =>
+        if !rv.fields.isEmpty then pure () else
+        let o ← rowOffset rv idx
+        emit s!"a68_v({rv.ty.pushFn}(({rv.name}_d[{o}] ? {rv.name}_p[{o}] : {rv.ty.undefFn}()), W));"
+        return
+      | none => pure ()
+    | _ => pure ()
+  | .deref sel@(.select _ _ true) =>
+    -- a field of an element of a row of structures kept as C arrays
+    if let some (rv, f, idx) := srowFieldDst (← env) sel then
+      let o ← rowOffset rv idx
+      let fty := rv.fields[f]!
+      emit s!"a68_v({fty.pushFn}(({rv.name}_d{f}[{o}] ? {rv.name}_p{f}[{o}] : {fty.undefFn}()), W));"
+      return
+  | _ => pure ()
   -- an expression that calls a routine with a plain C entry point is computed natively,
   -- its calls made as C calls, and boxed once
   let ev0 ← env
@@ -1052,16 +1560,49 @@ partial def genVoid (c : Core) : M Unit := do
     | some pi =>
       if args.length == pi.sig.ptys.size &&
           (List.range args.length).all (fun i => natOk ev (pi.sig.ptys[i]!).toMode args[i]!) then
-        let as ← natArgs pi args
+        let as ← natArgs pi.sig.ptys args
         emit s!"(void) a68_nf{pi.nidx}({", ".intercalate as.toList});"
         jumpCheck
       else do gen c; emit "a68_v(a68rt_pop(W));"
-    | none => do gen c; emit "a68_v(a68rt_pop(W));"
+    | none =>
+      match dynNat ev f with
+      | some sg =>
+        if args.length == sg.ptys.size &&
+            (List.range args.length).all (fun i => natOk ev (sg.ptys[i]!).toMode args[i]!) then
+          dynCall sg f args none
+        else do gen c; emit "a68_v(a68rt_pop(W));"
+      | none => do gen c; emit "a68_v(a68rt_pop(W));"
   | _ => gen c; emit "a68_v(a68rt_pop(W));"
 
 /-- `x +:= e` in statement position: the variable or cell is updated in place, with
     nothing boxed and no reference built.  Returns whether it applied. -/
 partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : M Bool := do
+  -- `a[i] +:= e` on a row promoted to a C array: the element, then the right operand, then
+  -- the current value with its undefined test, as the evaluator reads them
+  match strip l with
+  | .slice base idx true =>
+    match strip base with
+    | .refCell dd ss =>
+      if let some rv := rowOf (← env) dd ss then
+        if !rv.fields.isEmpty || !assignsNatively rv.ty op then return false
+        let o ← rowOffset rv idx
+        let rs ← rowValue rv.ty r
+        let cur := s!"({rv.name}_d[{o}] ? {rv.name}_p[{o}] : {rv.ty.undefFn}())"
+        match nativeAssignOp op rv.ty cur rs with
+        | some e => emit s!"{rv.name}_p[{o}] = {e}; {rv.name}_d[{o}] = 1;"; return true
+        | none => return false
+    | _ => pure ()
+  | .select _ _ true =>
+    if let some (rv, f, idx) := srowFieldDst (← env) l then
+      let fty := rv.fields[f]!
+      if !assignsNatively fty op then return false
+      let o ← rowOffset rv idx
+      let rs ← rowValue fty r
+      let cur := s!"({rv.name}_d{f}[{o}] ? {rv.name}_p{f}[{o}] : {fty.undefFn}())"
+      match nativeAssignOp op fty cur rs with
+      | some e => emit s!"{rv.name}_p{f}[{o}] = {e}; {rv.name}_d{f}[{o}] = 1;"; return true
+      | none => return false
+  | _ => pure ()
   match m1 with
   | .ref tm =>
     match CTy.ofMode tm, strip l with
@@ -1159,6 +1700,21 @@ partial def storeScalar (dst src : Core) : M Bool := do
     -- `a[i] := <scalar>` writes the element in place
     match strip base with
     | .refCell dd ss =>
+      if let some rv := rowOf (← env) dd ss then
+        -- a promoted row: subscripts and bounds first, then the value, as the evaluator does
+        let o ← rowOffset rv idx
+        if rv.fields.isEmpty then
+          let v ← rowValue rv.ty src
+          emit s!"{rv.name}_p[{o}] = {v}; {rv.name}_d[{o}] = 1;"
+        else
+          -- a structure display into an element: its fields in order, then the stores
+          let es : List Core := match strip src with | .collateral es _ _ => es | _ => []
+          let mut vs : Array String := #[]
+          for k in [0:rv.fields.size] do
+            vs := vs.push (← rowValue rv.fields[k]! (es[k]?.getD (.lit .undef)))
+          for k in [0:rv.fields.size] do
+            emit s!"{rv.name}_p{k}[{o}] = {vs[k]!}; {rv.name}_d{k}[{o}] = 1;"
+        return true
       if (← lvar dd ss).isSome then return false else
       match scalarExprAny (← env) src with
       | some (m, e) =>
@@ -1181,6 +1737,12 @@ partial def storeScalar (dst src : Core) : M Bool := do
       | none => return false
     | _ => return false
   | dst' =>
+    if let some (rv, f, idx) := srowFieldDst (← env) dst' then
+      -- a field of an element of a row of structures kept as C arrays
+      let o ← rowOffset rv idx
+      let v ← rowValue rv.fields[f]! src
+      emit s!"{rv.name}_p{f}[{o}] = {v}; {rv.name}_d{f}[{o}] = 1;"
+      return true
     -- `f OF … OF a[i] := <scalar>` writes the field in place
     match fieldChain (← env) dst' with
     | none => return false
@@ -1355,7 +1917,7 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
       | .decl sl m _ => if sl < size then a := a.set! sl (some m)
       | _ => pure ()
     return a
-  let fr := planFrame n size modes stmts wantValue
+  let fr := planFrame n size modes stmts wantValue (← get).modeTab
   -- Routines declared here that can also be plain C functions.  A routine's body sees those
   -- declared before it or in the same run of consecutive routine declarations, since no
   -- call can happen between two of them; the units of the block see a routine once its
@@ -1407,14 +1969,24 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
     | .label _ | .exit => true | _ => false
   emit "{"
   indent do
-    emit s!"uint32_t e{n} = a68_env_depth(); uint32_t s{n} = a68_stack_depth();"
+    -- the depths are only wanted where a jump lands on one of this block's labels, and
+    -- reading them is two calls into the runtime, so a block without labels skips them
+    if stmts.any (fun st => match st with | .label _ => true | _ => false) then
+      emit s!"uint32_t e{n} = a68_env_depth(); uint32_t s{n} = a68_stack_depth();"
     for i in [0:size] do
       match fr.vars[i]? with
       | some (some (v, ty, u)) =>
         emit (s!"{ty.name} {v} = 0;" ++ (if u then s!" uint8_t {v}_i = 0;" else ""))
       | _ => pure ()
+    for i in [0:size] do
+      match fr.rows[i]? with
+      | some (some rv) =>
+        emit s!"int64_t {rv.name}_l0 = 1, {rv.name}_u0 = 0, {rv.name}_l1 = 1, {rv.name}_u1 = 0; {rv.ty.name} *{rv.name}_p = NULL; uint8_t *{rv.name}_d = NULL;"
+        for k in [0:rv.fields.size] do
+          emit s!"{(rv.fields[k]!).name} *{rv.name}_p{k} = NULL; uint8_t *{rv.name}_d{k} = NULL;"
+      | _ => pure ()
     if fr.pushed then emit s!"a68_v(a68rt_enter({size}, W));"
-    modify fun st => { st with frames := { fr with procs := Array.replicate size none } :: st.frames }
+    modify fun st => { st with frames := { fr with procs := Array.replicate size none, modes := modes } :: st.frames }
     if onStack then emit "a68_v(a68rt_push_void(W));"
     let mut produced := false
     for i in [0:stmts.size] do
@@ -1437,8 +2009,24 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
               gen init
               emit (s!"{v} = {ty.popFn}();" ++ (if u then s!" {v}_i = 1;" else ""))
         | _ =>
-          gen init
-          emit s!"a68_v(a68rt_store(0, {slot}, W));"
+          match fr.rows[slot]? with
+          | some (some rv) => genRowDecl rv init
+          | _ =>
+            -- a routine text: its boxed function learns its parameter modes, and when it has a
+            -- plain entry point that needs no environment, the table of entry points records
+            -- it for calls through procedure parameters
+            let fb := (← get).fns.size
+            match strip init, modes[slot]?.join with
+            | .routine _ _ _, some pm@(.proc _ _) => modify fun st => { st with procMode := some pm }
+            | _, _ => pure ()
+            gen init
+            modify fun st => { st with procMode := none }
+            emit s!"a68_v(a68rt_store(0, {slot}, W));"
+            match strip init, procsFinal[slot]?.join with
+            | .routine _ _ body, some pi =>
+              if !outerRef 1 body then
+                modify fun st => { st with nativeOfFn := st.nativeOfFn.push (fb, pi.nidx) }
+            | _, _ => pure ()
       | .unit e =>
         if vp[i]! == true then genVoid e
         else if onStack then do gen e; emit "a68_v(a68rt_nip(W));"
@@ -1457,6 +2045,14 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
     if wantValue && !onStack && !produced && dest.isNone then emit "a68_v(a68rt_push_void(W));"
     modify fun st => { st with frames := st.frames.tail }
     emit s!"B{n}: {if fr.pushed then "a68_v(a68rt_leave(W));" else ";"}"
+    -- the storage of promoted rows goes with the block; a jump out of the block leaves it
+    for i in [0:size] do
+      match fr.rows[i]? with
+      | some (some rv) =>
+        emit s!"free({rv.name}_p); free({rv.name}_d);"
+        for k in [0:rv.fields.size] do
+          emit s!"free({rv.name}_p{k}); free({rv.name}_d{k});"
+      | _ => pure ()
     -- a block with labels keeps its value on the stack even when a variable was asked for
     match dest with
     | some (ty, v) => if onStack then emit s!"{v} = {ty.popFn}();"
@@ -1556,9 +2152,14 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   let savedLabels := s.labels
   let savedDepth := s.depth
   let savedFrames := s.frames
-  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;" }
+  -- a declared routine's parameter modes, so that calls through its procedure parameters
+  -- know the C signature of a plain entry point
+  let pmodes : Array (Option Mode) := match s.procMode with
+    | some (.proc ps _) => (Array.range frameSize).map fun i => ps[i]?
+    | _ => #[]
+  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;", procMode := none }
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
-  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, pushed := true }] }
+  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pushed := true }] }
   gen body
   emit "a68_v(a68rt_leave(W));"
   let st ← get
@@ -1605,6 +2206,7 @@ def prelude : String := "
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define W lean_io_mk_world()
 
@@ -1829,11 +2431,36 @@ lean_object* a68rt_append(uint32_t d, uint32_t s, lean_object* w);
 
 /* A promoted variable read before it was assigned: report exactly what the evaluator
    would have reported for an uninitialised cell of that mode. */
+lean_object* a68rt_index_error(int64_t i, int64_t l, int64_t u, lean_object* w);
+lean_object* a68rt_cell_cproc(uint32_t d, uint32_t s, lean_object* w);
 static int64_t  a68_und_i(void) { a68_v(a68rt_undef_error(0, W)); return 0; }
 static double   a68_und_r(void) { a68_v(a68rt_undef_error(1, W)); return 0.0; }
 static uint8_t  a68_und_b(void) { a68_v(a68rt_undef_error(2, W)); return 0; }
 static uint32_t a68_und_c(void) { a68_v(a68rt_undef_error(3, W)); return 0; }
 static uint64_t a68_und_u(void) { a68_v(a68rt_undef_error(4, W)); return 0; }
+/* Rows promoted to C arrays: bounds checks that report what the evaluator's subscripting
+   reports, and element reads that apply its undefined test. */
+static void a68_index_error(int64_t i, int64_t l, int64_t u) { a68_v(a68rt_index_error(i, l, u, W)); exit(1); }
+static inline size_t a68_ao(int64_t l, int64_t u, int64_t i) {
+  if (__builtin_expect(i < l || i > u, 0)) a68_index_error(i, l, u);
+  return (size_t)(i - l);
+}
+static inline size_t a68_ao2(int64_t l0, int64_t u0, int64_t l1, int64_t u1, int64_t i, int64_t j) {
+  if (__builtin_expect(i < l0 || i > u0, 0)) a68_index_error(i, l0, u0);
+  if (__builtin_expect(j < l1 || j > u1, 0)) a68_index_error(j, l1, u1);
+  return (size_t)((i - l0) * (u1 - l1 + 1) + (j - l1));
+}
+static void* a68_row_alloc(size_t n, size_t sz) {
+  void* p = calloc(n ? n : 1, sz);
+  if (!p) exit(1);
+  return p;
+}
+#define A68_AR(S, T, UND) static inline T a68_ar_##S(T* p, uint8_t* d, int64_t l, int64_t u, int64_t i) { size_t o = a68_ao(l, u, i); return d[o] ? p[o] : UND(); } static inline T a68_ar2_##S(T* p, uint8_t* d, int64_t l0, int64_t u0, int64_t l1, int64_t u1, int64_t i, int64_t j) { size_t o = a68_ao2(l0, u0, l1, u1, i, j); return d[o] ? p[o] : UND(); }
+A68_AR(i, int64_t, a68_und_i)
+A68_AR(r, double, a68_und_r)
+A68_AR(b, uint8_t, a68_und_b)
+A68_AR(c, uint32_t, a68_und_c)
+A68_AR(u, uint64_t, a68_und_u)
 
 #define A68_INT_MAX 2147483647LL
 
@@ -1882,6 +2509,71 @@ static inline double a68_diveq_r(double a, double b) {
   if (b == 0.0) return a68_die_r(3);
   return a / b;
 }
+/* Exponentiation and the REAL standard functions, following the evaluator: INT ** INT and
+   REAL ** INT by square-and-multiply with its checks, REAL ** REAL as exp (y ln x), and each
+   function with its domain check and, except exp and exp2, a check of its result. */
+static inline int64_t a68_pow_i(int64_t m, int64_t n) {
+  if (n < 0) return a68_die_i(8);
+  if (m == 0 && n == 0) return 1;
+  if (m == 0 || m == 1) return m;
+  if (m == -1) return (n % 2 == 0) ? 1 : -1;
+  uint64_t nn = (uint64_t) n, bit = 1; int64_t mm = m, p = 1;
+  for (;;) {
+    if (nn & bit) p = a68_mul_i(p, mm);
+    bit <<= 1;
+    if (bit <= nn) mm = a68_mul_i(mm, mm);
+    if (!(bit <= nn)) break;
+  }
+  return p;
+}
+static inline double a68_pow_ri(double x, int64_t n) {
+  uint64_t nn = n < 0 ? (uint64_t)(-(n + 1)) + 1 : (uint64_t) n;
+  double p;
+  if (x == 0.0 && nn == 0) p = 1.0;
+  else if (x == 0.0 || x == 1.0) p = x;
+  else if (x == -1.0) p = (nn % 2 == 0) ? 1.0 : -1.0;
+  else {
+    uint64_t bit = 1; double mm = x; p = 1.0;
+    for (;;) {
+      if (nn & bit) p = p * mm;
+      bit <<= 1;
+      if (bit <= nn) mm = mm * mm;
+      if (!(bit <= nn)) break;
+    }
+    if (p != p || p > 1.7976931348623157e308 || p < -1.7976931348623157e308) return a68_die_r(2);
+  }
+  return n < 0 ? 1.0 / p : p;
+}
+static inline double a68_pow_rr(double x, double y) {
+  if (y == 0.0) return 1.0;
+  if (x < 0.0) return a68_die_r(7);
+  if (x == 0.0) { if (y < 0.0) return a68_die_r(7); return 0.0; }
+  return exp(y * log(x));
+}
+static inline double a68_m_acos(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(acos(x)); }
+static inline double a68_m_arccos(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(acos(x)); }
+static inline double a68_m_arccosh(double x) { return a68_chk_r(acosh(x)); }
+static inline double a68_m_arcsin(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(asin(x)); }
+static inline double a68_m_arcsinh(double x) { return a68_chk_r(asinh(x)); }
+static inline double a68_m_arctan(double x) { return a68_chk_r(atan(x)); }
+static inline double a68_m_arctanh(double x) { return a68_chk_r(atanh(x)); }
+static inline double a68_m_asin(double x) { if (x < -1.0 || x > 1.0) return a68_die_r(3); return a68_chk_r(asin(x)); }
+static inline double a68_m_atan(double x) { return a68_chk_r(atan(x)); }
+static inline double a68_m_cbrt(double x) { return a68_chk_r(cbrt(x)); }
+static inline double a68_m_cos(double x) { return a68_chk_r(cos(x)); }
+static inline double a68_m_cosh(double x) { return a68_chk_r(cosh(x)); }
+static inline double a68_m_curt(double x) { return a68_chk_r(cbrt(x)); }
+static inline double a68_m_exp(double x) { return exp(x); }
+static inline double a68_m_exp2(double x) { return exp2(x); }
+static inline double a68_m_ln(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(log(x)); }
+static inline double a68_m_log(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(log10(x)); }
+static inline double a68_m_log10(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(log10(x)); }
+static inline double a68_m_log2(double x) { return a68_chk_r(log2(x)); }
+static inline double a68_m_sin(double x) { return a68_chk_r(sin(x)); }
+static inline double a68_m_sinh(double x) { return a68_chk_r(sinh(x)); }
+static inline double a68_m_sqrt(double x) { if (x < 0.0) return a68_die_r(3); return a68_chk_r(sqrt(x)); }
+static inline double a68_m_tan(double x) { return a68_chk_r(tan(x)); }
+static inline double a68_m_tanh(double x) { return a68_chk_r(tanh(x)); }
 static inline int64_t a68_entier(double x) {
   if (x < -2147483647.0 || x > 2147483647.0) return a68_die_i(4);
   return (int64_t) __builtin_floor(x);
@@ -1903,7 +2595,7 @@ static inline uint32_t a68_repr(int64_t x) {
 def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : String := Id.run do
   let (_, st) := (do
       let idx ← genFunction 0 0 core
-      pure idx : M Nat).run {}
+      pure idx : M Nat).run { modeTab := modes }
   -- the mode declarations, sorted so that the emitted C does not depend on hash order
   let decls := modes.toArray.qsort (fun a b => a.1 < b.1)
   let st := decls.foldl (fun st (n, m) =>
@@ -1921,6 +2613,14 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool) : 
     if sg != "" then out := out ++ sg ++ ";\n"
   for f in st.fns do
     out := out ++ s!"static void {f.name}(void);\n"
+  -- the plain entry point of each compiled routine, indexed by boxed function index plus one,
+  -- for calls through procedure parameters; NULL where there is none
+  let natTab := (Array.range (st.fns.size + 1)).map fun i =>
+    if i == 0 then "NULL" else
+    match st.nativeOfFn.find? (fun (fi, _) => fi + 1 == i) with
+    | some (_, k) => s!"(void*) a68_nf{k}"
+    | none => "NULL"
+  out := out ++ "static void* const a68_nf_of_fn[] = { " ++ ", ".intercalate natTab.toList ++ " };\n"
   for h in st.holes do
     out := out ++ s!"static void {h.name}(void);\n"
   out := out ++ "\n"

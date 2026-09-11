@@ -1,0 +1,34 @@
+# Calls through procedure parameters.  A routine whose body uses nothing but its own    #
+# parameters can be called through a parameter by its plain C entry point; one that    #
+# reads an outer variable must go the boxed way, and so must anything else.  Both paths #
+# have to give the evaluator's results, in its order, including a jump out of a call.  #
+BEGIN
+  INT offset := 100;
+  PROC fold = (PROC (INT, INT) INT f, INT seed, INT n) INT:
+    BEGIN INT acc := seed; FOR i TO n DO acc := f(acc, i) OD; acc END;
+  PROC add = (INT a, INT b) INT: a + b;
+  PROC mix = (INT a, INT b) INT: (a * 31 + b) MOD 1000003;
+  PROC shifted = (INT a, INT b) INT: a + b + offset;
+  PROC apply = (PROC (REAL) REAL g, REAL x) REAL: g(g(x));
+  PROC half = (REAL x) REAL: x / 2.0;
+  PROC each = (PROC (INT) VOID visit, INT n) VOID: FOR i TO n DO visit(i) OD;
+  PROC show = (INT v) VOID: print((v));
+  PROC trace = (INT a, INT b) INT: (print((a)); a + b);
+  PROC pick = (PROC (INT) BOOL p, INT n) INT:
+    BEGIN INT count := 0; FOR i TO n DO IF p(i) THEN count +:= 1 FI OD; count END;
+  PROC even = (INT v) BOOL: v MOD 2 = 0;
+  PROC stop at = (INT a, INT b) INT: IF b > 3 THEN GO TO stopped ELSE a + b FI;
+  print((fold(add, 0, 10), fold(mix, 7, 20), newline));
+  print((fold(shifted, 0, 3), newline));
+  offset := 1;
+  print((fold(shifted, 0, 3), newline));
+  print((apply(half, 10.0), newline));
+  each(show, 5);
+  print(newline);
+  print((fold(trace, 0, 4), newline));
+  print((pick(even, 9), newline));
+  INT result := fold(stop at, 0, 10);
+  print(("not reached", result, newline));
+stopped:
+  print(("stopped", newline))
+END

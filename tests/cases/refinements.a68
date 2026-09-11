@@ -1,0 +1,22 @@
+BEGIN # refinements (an a68g extension): the program is followed by named texts #
+   INT n := 0;
+   initialise;
+   WHILE n < 4 DO
+      step
+   OD;
+   report
+END.
+
+initialise:
+   n := 1.
+
+step:
+   print ((whole (n, 0), " "));
+   n +:= 1.
+
+report:
+   print ((newline, "done at ", whole (n, 0), newline));
+   finish.
+
+finish:
+   print (("bye", newline)).

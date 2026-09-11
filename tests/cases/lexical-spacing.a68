@@ -1,0 +1,16 @@
+BEGIN # white space inside tags and denotations, and format texts nested in formats #
+   INT a b
+       c = 12;
+   print ((abc, newline));
+   INT big = 1 234 567;
+   REAL r = 3   .   1 4159 e 0, s = 1.e2;
+   print ((big, fixed (r, 0, 5), fixed (s, 0, 1), newline));
+   BITS b1 = 2r 0 0 1 1, b2 = 16r ff 00;
+   print ((b1, newline, b2, newline));
+   print ((ABS 16r 44, newline));
+   BOOL yes = TRUE;
+   printf (($"answer: "f(yes | $"yes"$ | $"no"$)l$));
+   printf (($"other: "f(NOT yes | $"yes"$ | $"no"$)l$));
+   INT k = 2;
+   printf (($"["f( k=0 | $$ | $n(k-1)(d", ")d$ )"]"l$, 7, 8))
+END

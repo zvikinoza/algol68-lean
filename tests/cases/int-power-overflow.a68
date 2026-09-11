@@ -1,0 +1,6 @@
+# INT ** INT reports overflow as multiplication does. #
+BEGIN
+  print((2 ** 30, newline));
+  INT n := 40;
+  print((2 ** n, newline))
+END

@@ -1,0 +1,7 @@
+# sqrt of a negative REAL is an error. #
+BEGIN
+  REAL v := 4.0;
+  print((sqrt(v), newline));
+  v := -4.0;
+  print((sqrt(v), newline))
+END

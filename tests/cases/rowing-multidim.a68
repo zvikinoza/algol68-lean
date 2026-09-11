@@ -1,0 +1,15 @@
+# rowing a value, or a row of one dimension fewer, into a multi-dimensional row #
+[,]INT a = 5;
+print ((1 LWB a, 1 UPB a, 2 LWB a, 2 UPB a, a[1,1], newline));
+[]INT r = (1, 2, 3);
+[,]INT b = r;
+print ((1 UPB b, 2 UPB b, b[1,2], newline));
+FLEX [1:0, 1:0]INT f := 7;
+print ((1 UPB f, 2 UPB f, f[1,1], newline));
+f := ((1, 2), (3, 4));
+print ((f, newline));
+[,,]REAL c = 2;
+print ((3 UPB c, c[1,1,1], newline));
+MODE NUMBER = REAL;
+PROC corner = ([,]NUMBER m)NUMBER: m[1 LWB m, 2 LWB m];
+print ((corner (4), corner (((1.5, 2), (3, 4))), newline))
