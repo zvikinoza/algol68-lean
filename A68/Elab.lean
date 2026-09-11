@@ -125,12 +125,44 @@ def newLabel : Elab Nat := do
   set { s with labelCount := s.labelCount + 1 }
   return s.labelCount
 
+/-- Standard-environ names that a68g lets a program write with any number of `short` or
+    `long` words in front (`parser-taxes.c`, `is_mappable_routine`). -/
+def mappableRoutines : List String :=
+  ["arccos", "arccosdg", "arccot", "arccotdg", "arcsin", "arcsindg", "arctan", "arctandg", "beta",
+   "betainc", "cbrt", "complexarccos", "complexarccosh", "complexarcsin", "complexarcsinh",
+   "complexarctan", "complexarctanh", "complexcos", "complexcosh", "complexexp", "complexln",
+   "complexsin", "complexsinh", "complexsqrt", "complextan", "complextanh", "cos", "cosdg", "cospi",
+   "cot", "cotdg", "cotpi", "curt", "erf", "erfc", "exp", "gamma", "gammainc", "gammaincg",
+   "gammaincgf", "ln", "log", "pi", "sin", "sindg", "sinpi", "sqrt", "tan", "tandg", "tanpi",
+   "nextrandom", "random", "bitspack", "bitswidth", "byteswidth", "expwidth", "intwidth", "maxbits",
+   "maxint", "maxreal", "realwidth", "smallreal"]
+
+def dropPrefix (s pre : String) : String := String.ofList (s.toList.drop pre.length)
+
+partial def isMappable (z pre : String) : Bool :=
+  if pre != "" && z.startsWith pre then isMappable (dropPrefix z pre) pre
+  else mappableRoutines.contains z
+
 def lookup (name : String) : Elab (Option Binding) := do
   let s ← get
   for sc in s.scopes do
     match sc.names.lookup name with
     | some b => return some b
     | none => pure ()
+  -- a68g (`bind_lengthety_identifier`): an undeclared `short …`/`long …` identifier drops
+  -- its leading `short` (or `long`) words one at a time until it names a mappable routine
+  -- of the standard environ, so `long long long max int` is `long long max int` and
+  -- `short short max int` is `max int`
+  let base := s.scopes.getLast?
+  for pre in ["short", "long"] do
+    if name.startsWith pre then
+      let mut u := name
+      repeat
+        u := dropPrefix u pre
+        match base.bind (·.names.lookup u) with
+        | some b => if isMappable u pre then return some b
+        | none => pure ()
+        if !u.startsWith pre then break
   return none
 
 /-- All user operators with a given name, innermost first. -/
@@ -195,6 +227,27 @@ partial def softCoerce (c : Core) (m : Mode) : Elab (Core × Mode) := do
 inductive Strength where | strong | firm | meek | soft
   deriving BEq, Inhabited
 
+/-- The members of a union with nested unions expanded: a68g flattens
+    `UNION (UNION (A, B), C)` to `UNION (A, B, C)`, so a united value is always tagged with
+    a mode that is not itself a union. -/
+partial def flatMembers (tb : Mode.Table) (ms : List Mode) (fuel : Nat := 16) : List Mode :=
+  ms.flatMap fun m => match Mode.resolve tb m with
+    | .union ns => if fuel = 0 then [m] else flatMembers tb ns (fuel - 1)
+    | _ => [m]
+
+/-- Unite `c`, already coerced to the member `m` of a union: a value coerced to a member
+    that is itself a union carries its own tag already and is not wrapped again. -/
+def uniteInto (tb : Mode.Table) (m : Mode) (c : Core) : Core :=
+  if Mode.isUnion tb m then c else .unite m c
+
+/-- Uniting a union value into a union that has all of its members keeps the value. -/
+def unionIncluded (tb : Mode.Table) (src : Mode) (dstMembers : List Mode) : Bool :=
+  match Mode.resolve tb src with
+  | .union ss =>
+    let dm := flatMembers tb dstMembers
+    (flatMembers tb ss).all fun s => dm.any (Mode.eqv tb s)
+  | _ => false
+
 /-- Try to coerce `c : from` to `to` with the given strength. -/
 partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12) : Elab (Option Core) := do
   if fuel = 0 then return none
@@ -236,8 +289,10 @@ partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12)
     match dstR with
     | .void => return some (.voiding c)
     | .union ms =>
+      let tb ← tbl
       for m in ms do
-        if let some c' ← coerce .firm c src m (fuel - 1) then return some (.unite m c')
+        if let some c' ← coerce .firm c src m (fuel - 1) then return some (uniteInto tb m c')
+      if unionIncluded tb src ms then return some c
       return none
     | .simplout =>
       let (c', m') ← meekCoerce c src
@@ -281,8 +336,10 @@ partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12)
   | .firm =>
     match dstR with
     | .union ms =>
+      let tb ← tbl
       for m in ms do
-        if let some c' ← coerce .firm c src m (fuel - 1) then return some (.unite m c')
+        if let some c' ← coerce .firm c src m (fuel - 1) then return some (uniteInto tb m c')
+      if unionIncluded tb src ms then return some c
       return none
     | _ => return none
   | _ => return none
@@ -774,9 +831,10 @@ partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
 /-- A priori elaboration of context-free constructs. -/
 partial def elabPrimary (e : Expr) : Elab (Core × Mode) := do
   match e with
-  | .intLit v long _ => return (.lit (.int v), .int long)
-  | .realLit t long _ => return (.lit (.real (Numfmt.parseFloat t)), .real long)
-  | .bitsLit r d long _ => return (.lit (.bits (bitsValue r d)), .bits long)
+  -- a68g: SHORT modes are the base modes, so `SHORT SHORT 5` is an INT (as `Mode.ofSyn`)
+  | .intLit v long _ => return (.lit (.int v), .int (max long 0))
+  | .realLit t long _ => return (.lit (.real (Numfmt.parseFloat t)), .real (max long 0))
+  | .bitsLit r d long _ => return (.lit (.bits (bitsValue r d)), .bits (max long 0))
   | .strLit s _ =>
     if s.length == 1 then return (.lit (.char s.front.toNat), .char)
     else return (.lit (Value.ofString s), .string)
@@ -1175,9 +1233,15 @@ partial def elabCaseConfBody (sc : Core) (alts : List (ModeSyn × Option String 
   | oc :: revAlts =>
     let altCores := revAlts.reverse
     let mut coreAlts : List (Mode × Option Nat × Core) := []
+    let tb ← tbl
     for (a, c) in alts.zip altCores do
       let (msyn, name, _) := a
-      coreAlts := coreAlts ++ [(modeOf msyn, if name.isSome then some 0 else none, c)]
+      -- a united value is tagged with a mode that is not a union, so an alternative whose
+      -- mode is a union with unions among its members is tested against all of them
+      let am := match Mode.resolve tb (modeOf msyn) with
+        | .union ns => if ns.any (Mode.isUnion tb) then Mode.union (flatMembers tb ns) else modeOf msyn
+        | _ => modeOf msyn
+      coreAlts := coreAlts ++ [(am, if name.isSome then some 0 else none, c)]
     return (.caseConf sc coreAlts oc, m)
   | _ => err "internal: conformity case"
 

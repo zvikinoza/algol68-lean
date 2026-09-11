@@ -54,7 +54,7 @@ def keywords : List String :=
    "BY","TO","WHILE","DO","OD","PROC","OP","PRIO","MODE","REF","STRUCT","UNION","FLEX","HEAP",
    "LOC","LONG","SHORT","INT","REAL","BOOL","CHAR","STRING","BITS","BYTES","VOID","COMPL",
    "FORMAT","FILE","CHANNEL","SEMA","SKIP","NIL","EMPTY","TRUE","FALSE","GOTO","GO","IS","ISNT","COMPLEX",
-   "AT","OF","EXIT","PAR","CO","COMMENT","PR","PRAGMAT","NEW"]
+   "AT","OF","EXIT","PAR","CO","COMMENT","PR","PRAGMAT","NEW","UNTIL"]
 
 def baseModes : List (String × ModeSyn) :=
   [("INT",.int),("REAL",.real),("BOOL",.bool),("CHAR",.char),("STRING",.string),("BITS",.bits),
@@ -886,7 +886,29 @@ partial def parseLoop : P Expr := do
     by_ := some (.intLit 1 0 p2 |> fun e => .monadic "-" e p2)
   if (← acceptBold "WHILE") then while_ := some (← parseSerial [.bold "DO"])
   expectBold "DO"
-  let body ← parseSerial [.bold "OD"]
+  let body ← parseSerial [.bold "OD", .bold "UNTIL"]
+  if (← isBold "UNTIL") then
+    -- a68g extension `DO s UNTIL u OD`: after the body in every iteration the loop stops
+    -- when `u` holds; `u` sees the declarations of the body (genie-enclosed.c).  This is
+    -- `WHILE [w; IF w' THEN] s; NOT u [ELSE FALSE FI] DO SKIP OD`, the until part being an
+    -- enquiry clause of its own.
+    let pu ← curPos
+    adv
+    if (match body.items.getLast? with | some (.decl _) => true | _ => false) then
+      fail "a serial clause before UNTIL must end with a unit"
+    let u ← parseSerial [.bold "OD"]
+    expectBold "OD"
+    let notU : Expr := .cond [(u, .mk [.unit (.boolLit false pu)])] (some (.mk [.unit (.boolLit true pu)])) pu
+    let cont : Serial := .mk (body.items ++ [.unit notU])
+    let whileC : Serial := match while_ with
+      | none => cont
+      | some w =>
+        match w.items.reverse with
+        | .unit wl :: restRev =>
+          .mk (restRev.reverse ++
+            [.unit (.cond [(.mk [.unit wl], cont)] (some (.mk [.unit (.boolLit false pu)])) pu)])
+        | _ => .mk (w.items ++ [.unit (.cond [(.mk [], cont)] none pu)])   -- rejected later: no value
+    return .loop var from_ by_ to_ (some whileC) (.mk []) p
   expectBold "OD"
   return .loop var from_ by_ to_ while_ body p
 
