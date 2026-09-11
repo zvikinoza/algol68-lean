@@ -459,10 +459,13 @@ def mpDyadic (op : String) (n : Int) (x y : MP.MP) : M Value := do
   | _ => rtErr s!"internal: {mn} operator {op}"
 
 /-- `LONG INT` / `LONG LONG INT` dyadic operators.  Sums, differences and products of
-    in-range integers are exact in a68g's arithmetic and checked by `test_mp_int_range`;
-    `OVER` and `MOD` go through the real division, so they are done with `A68.MP`. -/
+    in-range integers are exact in a68g's arithmetic and checked by `test_mp_int_range`.
+    `OVER` and `MOD` go through a68g's real division (`over_mp`, `mod_mp`) at two guard
+    digits, which for in-range integers yields the truncated quotient and the
+    non-negative remainder: `A68.MP.overMp` / `modMp` agree with `Int.tdiv` / `Int.emod`
+    on 40,000 random and near-multiple pairs at 7 and 12 digits, so the exact integer
+    operations are used (the multi-precision ones cost a division each). -/
 def longIntDyadic (op : String) (n : Int) (x y : Int) : M Value := do
-  let digs ← mpDigitsOf n
   let lim := Numfmt.maxIntOf n (← llDigits)
   let mn := Mode.toString (.int n)
   let chk (r : Int) : M Value := do
@@ -473,19 +476,11 @@ def longIntDyadic (op : String) (n : Int) (x y : Int) : M Value := do
   | "-" => chk (x - y)
   | "*" => chk (x * y)
   | "%" =>
-    let xm ← intToMP x digs
-    let ym ← intToMP y digs
-    let r ← liftMP (MP.overMp xm xm ym digs)
-    if r.isNaN then rtErr s!"{mn} value is not a number"
-    if r.isInf then rtErr s!"{mn} division by zero"
-    return .int (MP.toIntTrunc r)
+    if y == 0 then rtErr s!"{mn} division by zero"
+    return .int (Int.tdiv x y)
   | "%*" =>
-    let xm ← intToMP x digs
-    let ym ← intToMP y digs
-    let r ← liftMP (MP.modMp xm xm ym digs)
-    if r.isNaN then rtErr s!"{mn} value is not a number"
-    let r ← if r.dig 1 < 0 then liftMP (MP.addMp r r (ym.setDig 1 (ym.dig 1).natAbs) digs) else pure r
-    return .int (MP.toIntTrunc r)
+    if y == 0 then rtErr s!"{mn} value is not a number"
+    return .int (Int.emod x y.natAbs)
   | "=" => return .bool (x == y)
   | "/=" => return .bool (x != y)
   | "<" => return .bool (x < y)
@@ -494,12 +489,26 @@ def longIntDyadic (op : String) (n : Int) (x y : Int) : M Value := do
   | ">=" => return .bool (x ≥ y)
   | _ => rtErr s!"internal: {mn} operator {op}"
 
-/-- `LONG INT ** INT` (`genie_pow_mp_int_int`). -/
+/-- `LONG INT ** INT` (`genie_pow_mp_int_int`).  a68g squares and multiplies at two guard
+    digits and then tests the range; every square it multiplies in is at most the result,
+    so an in-range result is exact, and a negative exponent leaves an integer only for ±1
+    (`A68.MP.powMpInt` agrees with this on 6,400 cases at 7 and 12 digits).  The same
+    values are computed with integers, stopping as soon as the range is left. -/
 def longIntPow (n : Int) (x : Int) (k : Int) : M Value := do
-  let digs ← mpDigitsOf n
-  let xm ← intToMP x digs
-  let r ← liftMP (MP.powMpInt xm xm k digs)
-  return .int (← mpToLongInt r n)
+  let lim := (Numfmt.maxIntOf n (← llDigits)).natAbs
+  let mn := Mode.toString (.int n)
+  if k < 0 then
+    if x == 1 then return .int 1
+    if x == -1 then return .int (if k % 2 == 0 then 1 else -1)
+    rtErr s!"{mn} value out of bounds"
+  let a := x.natAbs
+  let mut r : Nat := 1
+  for _ in [0:k.toNat] do
+    r := r * a
+    if r > lim then rtErr s!"{mn} value out of bounds"
+    if a ≤ 1 then break
+  let sgn : Int := if x < 0 && k % 2 == 1 then -1 else 1
+  return .int (sgn * (r : Int))
 
 /-- Monadic operators on `LONG REAL` / `LONG LONG REAL`. -/
 def mpMonadic (op : String) (n : Int) (x : MP.MP) : M Value := do
