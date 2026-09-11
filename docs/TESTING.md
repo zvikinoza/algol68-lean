@@ -7,17 +7,19 @@ serve that goal.
 ## 1. In-repo regression suite (`tests/cases`)
 
 Small programs covering every construct area (formats, loops and cases,
-procedures and operators, modes, names into rows). Their expected outputs were
-recorded from a68g (`tests/run-cases.sh --record`) and are checked with
-`tests/run-cases.sh` through the evaluator and `tests/run-cases-compiled.sh`
-through the C back end. All 16 pass on both. Six of them are regression cases for
-defects the external corpus and the fuzzer found in compiled programs: a
-`GO TO` out of a routine that hung, values of declared modes that could not be
-printed, subscripts through a `REF` row parameter, an event routine that leaves
-with a `GO TO`, the evaluation order of direct calls, and `REAL` division.  Three
-cover a68g's library extensions: `format-items` (bits, `h` and C-style patterns),
-`stdenv-strings` (regular expressions, string transput, `evaluate`, `BYTES`, associated
-strings) and `stdenv-processes` (`system`, `fork`, the `execve` family).
+procedures and operators, modes, names into rows, transput, long arithmetic).
+Their expected outputs and exit statuses were recorded from a68g and are checked
+with `tests/run-cases.sh` through the evaluator and `tests/run-cases-compiled.sh`
+through the C back end, at `-O0`, `-O1` and `-O2`. All 62 pass on every one.
+
+Many of them are regression cases for defects the corpus or the fuzzer found, and
+for each optimisation of the emitted code: rows kept as C arrays (of primitive
+elements, of structures, of unions), `STRING` buffers, conditional and case clauses
+computed natively, blocks with labels, calls through procedure parameters, heap
+cells given back after boxed calls, a `GO TO` out of a routine into a loop body.
+Others pin a68g behaviours: `LONG` and `LONG LONG` arithmetic, `COMPL` to the last
+bit, library extensions (`format-items`, `stdenv-strings`, `stdenv-processes`),
+unions that were never given a value.
 
 ## 2. Number-formatting differential test (`tests/fmt`)
 
@@ -30,68 +32,50 @@ exceptions are `fixed` of values ≥ 10⁷⁰ (documented in COMPATIBILITY.md).
 
 Two corpora of real programs are fetched and run twice under a68g. A program
 is *golden* if a68g accepts it, it exits successfully with nothing on stderr,
-and both runs produce the same output. The `difftest.sh` driver then runs
-`a68lean` on every golden program (with an empty standard input, a timeout,
-and the program's own directory as working directory) and compares the bytes.
+and both runs produce the same output. Every golden program is then run with
+an empty standard input, a 90-second limit and its own directory as working
+directory, through the evaluator and compiled at `-O2`, and its bytes and exit
+status are compared with a68g's.
 
-| corpus | golden programs | byte-identical |
-|---|---|---|
-| Rosetta Code, ALGOL 68 solutions | 744 | 645 |
-| Algol 68 Genie bundled test set (39 files) | 29 | 16 |
+| corpus | golden programs | evaluator | compiled `-O2` |
+|---|---:|---:|---:|
+| Rosetta Code, ALGOL 68 solutions | 744 | 724 | 737 |
+| Algol 68 Genie bundled test set | 29 | 28 | 28 |
+| **total** | **773** | **752** | **765** |
 
 A program that calls `random` without `first random` is not golden, even when
 its two reference runs agree: a68g seeds its generator from the clock, so such a
-program is only reproducible by accident, when both runs land in the same second.
-Earlier versions of this table counted those, which is why its totals differ.
-Programs that seed with `first random` are reproduced exactly: a68lean
-implements a68g's taus113 generator.
+program is only reproducible by accident. Programs that seed with `first random`
+are reproduced exactly: a68lean implements a68g's taus113 generator.
 
-The 112 programs that do not match fall into these groups:
+The eight programs that do not match when compiled:
 
-* **Unsupported a68g extensions** (about 30): library procedures such as
-  `evaluate`, `system`, `get directory`, `grep in string` and `local time`, and
-  the `r`, `n`, `h` and `%` format items.
-* **Parser gaps** (about 30): syntax a68g accepts and a68lean does not, most of
-  them a68g extensions to the Revised Report such as `DOUBLE`, refinements and
-  partial parametrisation.
-* **Multi-precision `LONG REAL`** (about 12 of the 17 output differences):
-  output that depends on a68g's 42- and 70-digit reals, which are IEEE doubles
-  here. The rest are `PAR`, printing infinities, and a few layout corner cases.
-* **Time** (15): programs that exceed the 90-second limit under the evaluator.
-  13 of them pass when compiled; see below.
-* **Genuine gaps** (the remainder): a scalar rowed into a multi-dimensional row,
-  `BYTES`, and a handful of single-program cases listed by `tests/classify.sh`.
+* **The clock and the machine** (4): `Date-format`, `System-time`, `Hostname` and the
+  test set's `end-of-time` print the date, the host name or a speed measured while
+  running. Their recorded output cannot be reproduced by a68g itself either.
+* **`PAR`** (1): `Concurrent-computing` prints in whatever order a68g's threads ran.
+* **Unsupported extensions** (2): `HTTP` fetches a web page with `http content`, and
+  `Metered-concurrency` uses semaphores (`DOWN`, `UP`) between parallel units.
+* **Time** (1): `Square-form-factorization` gives a68g's output but needs about 150
+  seconds of `LONG INT` arithmetic, which is a68g's multi-precision code re-done in
+  Lean and slower than a68g's C.
 
-The a68g test set relies heavily on optional libraries (GSL, MPFR, plotutils,
-R, the network) and on `LONG LONG REAL`; the 29 programs that run
-deterministically on a plain a68g were used, of which 16 are reproduced exactly.
+The evaluator additionally exceeds the limit on 13 programs that pass compiled
+(Erdős–Nicolas numbers, Ulam numbers, safe primes and others): it is a direct
+interpreter of the core representation, and those programs run for minutes in it.
 
 ## 3a. The C back end
 
-Everything above runs the interpreter. `tests/difftest-compiled.sh` runs the
-same corpus through `a68lean compile`, executes the resulting native binaries
-and compares their bytes with a68g's recorded output. Because both back ends
-share `A68.Runtime`, a difference between them can only come from the compiled
-*structure* — frames, control flow, jumps — which is what this test exercises.
-The same script with `-O0` versus `-O2` checks that the optimiser changes no
-observable behaviour.
-
-A random 60 of the golden programs, compiled at `-O2`: 52 match a68g byte for
-byte, and each of the other 8 also fails under the evaluator: five are front-end
-errors, two depend on multi-precision `LONG REAL`, and one on `LONG INT`
-overflow behaviour. Of the 15 programs that exceed the time limit
-under the evaluator, 13 match when compiled; Erdős–Nicolas numbers and the
-test set's rationals program exceed it compiled as well.
-
-Running the corpus this way found four defects that only compiled programs had,
-each now fixed and covered by an in-repo case: a subscript through a
-`REF STRING` or `REF [] INT` parameter sliced the cell holding the name instead of
-the row; values of declared modes such as `MODE YEAR = INT` could not be printed,
-because the compiled runtime had no table of mode declarations; a `GO TO` from a
-routine to a label outside it hung, because landing never cleared the pending
-jump; and an event routine leaving with a `GO TO` was taken to have returned,
-because the runtime did not look at the pending jump after calling compiled
-code.
+Both back ends share `A68.Runtime`, so a difference between them can only come from
+the compiled structure — frames, control flow, jumps, promoted variables — which is
+what running the corpus compiled exercises. It found defects only compiled programs
+had, each now fixed and covered by a case: a subscript through a `REF STRING`
+parameter sliced the cell holding the name instead of the row; values of declared
+modes could not be printed; a `GO TO` from a routine to a label outside it hung; an
+event routine leaving with a `GO TO` was taken to have returned; a routine leaving by a
+jump had the top of its caller's operand stack taken as its result, which emptied the
+stack when the label was in a loop body; and compiled programs saw their own path as
+`argv (1)` where a68g gives `a68g` and the source file.
 
 ## 4. Differential fuzzing (`fuzz/`)
 

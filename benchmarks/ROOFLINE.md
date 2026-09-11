@@ -7,12 +7,7 @@ algorithm on the same machine with the same memory traffic. Every benchmark
 therefore ships with a C twin, and the gap to it is the budget an optimisation
 has to spend.
 
-Machine: Apple M2, 8 cores. Times are CPU time, best of N.
-
-A note on reading the tables. Absolute nanoseconds per operation depend on what
-else the machine is doing, so where a run was made under load the **slowdown
-against the C twin** is the number to trust: both the twin and the compiled
-binary are stretched by the same factor, and the ratio survives.
+Machine: Apple M2, 8 cores. Times are CPU time (user + sys).
 
 ## Where this started
 
@@ -29,52 +24,51 @@ three arithmetic operations per iteration.
 Compiled code was slower than the evaluator it replaced. Compiling the control
 flow to C had removed the interpreter's dispatch, but every value operation still
 crossed into the runtime — several calls per Algol operation, each allocating a
-Lean `IO` result — and that cost more than the dispatch it replaced.
-
-Sampling confirmed it: `mi_malloc_small` and `mi_free` dominated, because
-computing `s + i * 3` allocated a `Value.int` for the product and another for the
-sum and then freed them.
+Lean `IO` result — and that cost more than the dispatch it replaced. Sampling
+confirmed it: `mi_malloc_small` and `mi_free` dominated, because computing
+`s + i * 3` allocated a `Value.int` for the product and another for the sum and
+then freed them.
 
 ## Where it is now
 
-Each benchmark timed against its own C twin on the same machine, the variants
-interleaved so that load falls on all of them alike, best of three, CPU time.
-a68g is best of two.
+Every benchmark against its C twin and against a68g's interpreter. The C twin and
+the compiled program are each the best of three interleaved runs, a68g one run.
 
-| benchmark | what it is | hand-written C | a68g interpreted | a68lean `-O2` | vs C |
-|---|---|---:|---:|---:|---:|
-| `intloop` | integer arithmetic in a loop | 0.11 s | – | 0.16 s | **1.5x** |
-| `calls` | five million calls of a two-parameter procedure | 0.02 s | 0.96 s | 0.04 s | **2.0x** |
-| `ctl_fib` | naive Fibonacci, 18 million recursive calls | 0.02 s | 2.82 s | 0.05 s | **2.5x** |
-| `ctl_mutual` | three-way mutual recursion, 10 million calls | 0.06 s | 3.05 s | 0.09 s | **1.5x** |
-| `ctl_hof` | a procedure passed as a parameter, called 12 million times | 0.06 s | 2.60 s | 10.98 s | 183x |
-| `arraysum` | fill and sum a row, 40 million element accesses | 0.11 s | – | 3.62 s | 33x |
+| benchmark | what it is | C twin | a68g | a68lean `-O2` | vs C | faster than a68g |
+|---|---|---:|---:|---:|---:|---:|
+| `intloop` | integer arithmetic in a loop | 0.06 s | 1.44 s | 0.09 s | 1.5x | 16x |
+| `arraysum` | fill and sum a row, 40 million accesses | 0.06 s | 2.79 s | 0.09 s | 1.5x | 31x |
+| `sieve` | sieve of Eratosthenes on a `[] BOOL` | 0.01 s | 1.85 s | 0.02 s | 2.0x | 92x |
+| `data_matmul` | matrix multiplication on `[,] REAL` | 0.05 s | 2.89 s | 0.09 s | 1.8x | 32x |
+| `data_struct` | a row of structures, field by field | <0.01 s | 2.06 s | 0.02 s | ~4x | 103x |
+| `data_union` | a row of a union, dispatched by conformity | 0.02 s | 1.29 s | 0.04 s | 2.0x | 32x |
+| `data_string` | building and comparing strings | <0.01 s | 1.44 s | 0.01 s | ~2x | 144x |
+| `calls` | five million calls of a two-parameter procedure | 0.01 s | 0.57 s | 0.02 s | ~2x | 28x |
+| `ctl_fib` | naive Fibonacci, 18 million recursive calls | 0.01 s | 2.09 s | 0.03 s | ~3x | 70x |
+| `ctl_mutual` | three-way mutual recursion | 0.04 s | 2.31 s | 0.07 s | 1.8x | 33x |
+| `ctl_ops` | user-defined operators | 0.07 s | 2.53 s | 0.09 s | 1.3x | 28x |
+| `ctl_case` | a twelve-way case clause in a hot loop | 0.02 s | 1.32 s | 0.04 s | 2.0x | 33x |
+| `ctl_goto` | Collatz steps with `ANDF`, `OREL` and a `GO TO` out | 0.01 s | 4.12 s | 0.07 s | ~7x | 59x |
+| `ctl_hof` | a procedure passed as a parameter | 0.06 s | 2.92 s | 0.30 s | 5.0x | 10x |
+| `num_divmod` | `OVER` and `MOD` | 0.02 s | 1.12 s | 0.05 s | 2.5x | 22x |
+| `num_horner` | polynomial evaluation in `REAL` | <0.01 s | 1.03 s | 0.01 s | ~2x | 103x |
+| `num_mandel` | Mandelbrot iteration | 0.01 s | 2.11 s | 0.03 s | ~3x | 70x |
+| `num_math` | `sqrt`, `exp`, `ln`, `sin` in a loop | 0.04 s | 1.20 s | 0.06 s | 1.5x | 20x |
+| `num_power` | `**` on `INT` and `REAL` | 0.02 s | 1.10 s | 0.07 s | 3.5x | 16x |
+| `num_real` | `REAL` arithmetic | 0.01 s | 1.30 s | 0.02 s | 2.0x | 65x |
+| `data_slice` | a sliding window taken with a slice | 0.07 s | 2.02 s | 1.53 s | 22x | 1.3x |
+| `data_list` | walking a linked list of `HEAP` nodes | 0.03 s | 1.84 s | 2.84 s | 95x | 0.6x |
 
-The C twins of `calls` and `ctl_fib` run close to the timer's 10 ms resolution,
-so those two ratios are approximate. Before the last two changes below, `calls`
-took 5.55 s and `ctl_fib` 16.66 s.
+Several C twins run close to the timer's 10 ms resolution, so ratios marked `~`
+are approximate.
 
-Scalar code and procedure calls with primitive signatures are now essentially at
-C speed, and 24 to 56 times faster than a68g's interpreter. Two shapes are not:
-an indirect call through a procedure parameter, and row access, where every
-element is still a call into the runtime.
+Twenty of the twenty-two benchmarks are within about 1.3x to 7x of hand-written C
+and 10 to 144 times faster than a68g. Two are not: heap structures reached
+through `REF`, and slices. Both are discussed at the end.
 
-The loop body `intloop` emits has nothing in it at all:
+## How it got there
 
-```c
-for (int64_t i1 = from1; ; i1 += by1) {
-  if (has1 && ((by1 > 0 && i1 > to1) || (by1 < 0 && i1 < to1))) break;
-  a68_line(6);
-  p0_0 = a68_mod_i(a68_add_i(p0_0, a68_mul_i(i1, 3LL)), 1000003LL);
-}
-```
-
-No frame is pushed, nothing is boxed, the operand stack is not touched, and
-reaching a statement is a store to a C variable rather than a call. A `WHILE`
-loop with `+:=` in its body compiles the same way, with no run-time calls
-whatsoever.
-
-The changes that got there, in the order the profile called for:
+In the order the profile called for:
 
 1. **Primitive values are computed in native C types.** `INT`, `REAL`, `BOOL`,
    `CHAR` and `BITS` at their unwidened length become `int64_t`, `double`,
@@ -86,75 +80,65 @@ The changes that got there, in the order the profile called for:
    text or format text inside the frame could reach it from another C function.
    When every slot qualifies, the run-time frame is not pushed at all. A `FOR`
    counter becomes the C induction variable.
-3. **The assigning operators are updates, not references.** `x +:= e` used to
-   take a reference to `x`, which cost four calls and, worse, made the analysis
-   refuse to promote `x` at all. In statement position it is now a native
-   update, and the analysis knows it.
-4. **Statement position is modelled.** Sequencing pops the value of its
-   left-hand side, so that side is generated as a statement and nothing is
-   pushed. A frame with no slots is not pushed. A condition that needs
-   statements to compute it goes into a C variable rather than onto the stack,
-   which is what a `WHILE` clause needs, since the elaborator puts the whole
-   loop body inside it.
-5. **Row elements are read and written in one call**, and written in place. The
-   bounds check used to sit in a `try`, which kept the row alive across the
-   update and made every write copy the whole element array.
-6. **Declaring a procedure no longer costs a block its C variables.** A block
-   containing a routine text used to keep every slot in a cell, because the
-   routine is a separate C function that reaches the frame through the run-time
-   environment. Only the slots such a text actually reads or names need that, and
-   the analysis now asks exactly that question.
-7. **Routines with primitive signatures are plain C functions.** A routine whose
-   parameters and result are primitive gets a second entry point that takes its
-   arguments as C arguments and returns its result, and a call whose callee is
-   certain, reachable without an environment switch, goes straight to it. Calls
-   inside expressions are hoisted in the evaluator's order, so C's unspecified
-   operand order never reorders side effects. `fib` compiles to
+3. **The assigning operators are updates, not references**, and statement
+   position is modelled, so `x +:= e` and sequencing push nothing.
+4. **Routines with primitive signatures are plain C functions**, called directly
+   when the callee is certain, with calls inside expressions hoisted in the
+   evaluator's order so C's unspecified operand order never reorders side effects.
+   Naive Fibonacci compiles to the recursive C one would write, plus a jump check.
+5. **Rows live in C memory.** A fixed row of primitive elements used only through
+   subscripts, bounds enquiries and element updates is a C array with a flag per
+   element for the undefined test. `arraysum` went from 5.85 s to 0.09 s and the
+   sieve from 5.15 s to 0.02 s. A row of structures of primitive fields is one C
+   array per field (`data_struct`, 13.6 s to 0.02 s).
+6. **Unions in a row are a tag array and a payload array**, and a conformity clause
+   on an element is a `switch` on the tag, with the bound value a C variable
+   (`data_union`, 14.5 s to 0.04 s).
+7. **Strings are C buffers.** A `STRING` variable declared with a denotation and used
+   through reads, subscripts, comparisons, assignments and `+:=` is a growable byte
+   buffer, turned back into a runtime value only where a whole-string value is
+   needed (`data_string`, 1.26 s to 0.01 s).
+8. **Choices are C.** Conditional and case clauses of primitive mode are C
+   conditional expressions and `switch`es written into a C variable, and `ANDF` and
+   `OREL` are `&&` and `||` (`ctl_case`, 1.58 s to 0.04 s).
+9. **Blocks with labels keep their C variables.** With labels every unit used to count
+   as a possible value of the block, so every assignment in it was an escape; now a
+   unit followed by another before any `EXIT` is a statement (`ctl_goto`, 12.5 s to
+   0.07 s together with 8).
+10. **Calls through procedure parameters go to C.** A routine with a plain entry point
+    and no captured environment is recorded in a table; a call through a procedure
+    parameter looks the entry point up once per invocation of the caller and calls it
+    directly (`ctl_hof`, 16.4 s to 0.30 s).
+11. **Heap cells are given back** after a boxed call whose result holds no names and
+    whose body lets no reference escape: three million such calls went from 134 MB to
+    9 MB resident.
+12. **Numbers.** `**`, the mathematical functions and `REAL` division compute natively
+    with a68g's checks (`num_power`, 31.8 s to 0.07 s; `num_math`, 27.6 s to 0.06 s).
 
-   ```c
-   static int64_t a68_nf0(int64_t a0_0) {
-     int64_t rv0 = 0;
-     if ((uint8_t)((a0_0) < (2LL))) {
-       rv0 = a0_0;
-     } else {
-       int64_t t1 = a68_nf0(a68_sub_i(a0_0, 1LL));
-       if (a68_jump()) return 0;
-       int64_t t2 = t1;
-       int64_t t3 = a68_nf0(a68_sub_i(a0_0, 2LL));
-       if (a68_jump()) return 0;
-       rv0 = a68_add_i(t2, t3);
-     }
-     return rv0;
-   }
-   ```
-
-   which is the C one would write by hand, plus a jump check that is one load.
-
-`-O0` gains almost none of this, and that is the design: promotion needs the
-block structure flattened first, so that an assignment is a statement rather
-than the value of its own block. The optimiser earns the native code.
+`-O0` gains little of this, by design: promotion needs the block structure
+flattened first, so that an assignment is a statement rather than the value of its
+own block. The optimiser earns the native code.
 
 ## What is left
 
-The profile has moved again, so the ordering has too:
+1. **Heap structures.** `data_list` walks 40,000 `HEAP` nodes 250 times. Testing a
+   `REF` against `NIL`, reading a field through it and moving along a link are one
+   runtime call each now (they were nine), but each call still resolves a frame,
+   reads a cell of the Lean heap and matches a `Value`, about 150 ns, where C loads a
+   pointer. Closing this gap means keeping structures that are reached through names
+   in memory the emitted C can address, with the runtime's heap as the fallback.
+2. **Slices.** `data_slice` takes a 500-element window of a row 40,000 times. Building
+   the slice is done by the runtime in Lean and costs about 30 ns an element, and so
+   does each read of the window. Copying the window into a C array was tried and made
+   the benchmark slower, because converting the row out of Lean cost more than the
+   reads it saved; the real fix is slicing C arrays natively, which needs the analysis
+   to reason about a `REF` slice aliasing the row it came from.
+3. **Boxed callers.** In `ctl_hof` the procedure taking the parameter is itself boxed,
+   because its signature contains a `PROC`; each of its 120,000 invocations enters and
+   leaves a run-time frame.
 
-1. **Row access.** `arraysum` and the sieve spend nearly all their time in one
-   runtime call per element. The call resolves the frame, reads the cell,
-   matches the row, checks the subscript and boxes the result, every time.
-   Getting array code near C means keeping rows of primitive mode in memory the
-   emitted C can address directly, rather than as a Lean array of boxed values.
-2. **Indirect calls.** A procedure parameter, a `PROC` variable, or a routine
-   called from somewhere its captured environment is not already in effect still
-   goes through the operand stack, `a68rt_call`, a Lean array of arguments and
-   the dispatcher, with a full save and restore of the environment. `ctl_hof` is
-   that case, at 183 times its C twin.
-3. **Frame cells are never reclaimed.** Three million boxed procedure calls
-   reach 232 MB resident, because each frame allocates cells that are never
-   freed. a68g reclaims them with a frame stack. Direct calls push no frame, so
-   they sidestep this, but every other call does not.
-
-One thing that was tried and abandoned: making the hot accessors return their
-value directly instead of an `IO` result, to save the result object. Converting
-the action out of `IO` allocates an `Except` in its place, and an A/B on the
-sieve made it slower, 4.46 s to 6.04 s. Avoiding that allocation means changing
-the monad the runtime is written in, not the signature of its entry points.
+One thing that was tried and abandoned early: making the hot accessors return their
+value directly instead of an `IO` result. Converting the action out of `IO`
+allocates an `Except` in its place, and an A/B on the sieve made it slower, 4.46 s
+to 6.04 s. Avoiding that allocation means changing the monad the runtime is written
+in, not the signature of its entry points.

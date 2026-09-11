@@ -13,50 +13,49 @@ machine-checked theorems (see [docs/VERIFICATION.md](docs/VERIFICATION.md)).
 
 ## Status
 
-| Test suite | Programs | Byte-identical to a68g |
-|---|---|---|
-| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic) | 744 | 645 |
-| Algol 68 Genie bundled test set (a68g-runnable, deterministic) | 29 | 16 |
-| In-repo regression cases, evaluator and C back end | 13 | 13 |
-| Random programs through the evaluator (seeds 1–1000) | 1,000 | 1,000 |
-| Golden corpus sample through the C back end, `-O2` | 60 | 52 |
+| Test | Programs | Byte-identical to a68g |
+|---|---:|---:|
+| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic), compiled `-O2` | 744 | 737 |
+| Algol 68 Genie bundled test set (a68g-runnable, deterministic), compiled `-O2` | 29 | 28 |
+| The same 773 programs through the evaluator | 773 | 752 |
+| In-repo regression cases, evaluator and C back end at `-O0`, `-O1`, `-O2` | 62 | 62 |
+| Random programs through the C back end, `-O1` and `-O2` | 300 | 300 |
+| Random programs through the evaluator | 300 | 300 |
 
-In that compiled sample, every program the C back end gets wrong also fails under
-the evaluator. The corpus failures are mostly a68g extensions that are not implemented
-(library procedures such as `system` and `evaluate`, some format items, some
-syntax), output that depends on a68g's multi-precision `LONG REAL` arithmetic
-(`LONG REAL` is an IEEE double here), and programs too slow for the evaluator's
-time limit, most of which pass when compiled. See
-[docs/TESTING.md](docs/TESTING.md).
+Of the eight corpus programs that differ when compiled, four print the date, the
+host name or a speed measured while running, one depends on the order in which
+a68g's threads ran a `PAR` clause, two use extensions not implemented here (a web
+page fetched with `http content`, semaphores between parallel units), and one,
+Square-form factorization, gives a68g's output but needs about 150 seconds of
+multi-precision arithmetic. The evaluator additionally runs out of time on 13
+programs that pass compiled. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Speed of the compiled program
 
-`a68lean compile` produces a native binary, and for numeric and array code that
-binary is now close to hand-written C. Every benchmark in `benchmarks/` ships
-with a C twin computing the same answer, which is the ceiling the emitted code
-is measured against.
+`a68lean compile` produces a native binary, and for most code that binary is close
+to hand-written C. Every benchmark in `benchmarks/` ships with a C twin computing
+the same answer, which is the ceiling the emitted code is measured against.
 
-Timed against its C twin on the same machine, best of three:
-
-| benchmark | vs hand-written C |
-|---|---:|
-| `intloop`, integer arithmetic in a loop | **1.5x** |
-| the same, before this work | 350x |
-| `ctl_fib`, 18 million recursive calls | **2.5x** |
-| the same, a68g interpreted | 141x |
-| `calls`, five million procedure calls | **2.0x** |
-| `ctl_hof`, a procedure passed as a parameter | 183x |
-| `arraysum`, 40 million row element accesses | 33x |
+| benchmark | vs hand-written C | faster than a68g |
+|---|---:|---:|
+| `intloop`, integer arithmetic in a loop | 1.5x | 16x |
+| `arraysum`, 40 million row element accesses | 1.5x | 31x |
+| `data_matmul`, matrix multiplication | 1.8x | 32x |
+| `data_union`, a row of a union dispatched by conformity | 2.0x | 32x |
+| `data_string`, building and comparing strings | ~2x | 144x |
+| `ctl_fib`, 18 million recursive calls | ~3x | 70x |
+| `ctl_case`, a twelve-way case clause | 2.0x | 33x |
+| `ctl_hof`, a procedure passed as a parameter | 5.0x | 10x |
+| `data_slice`, a sliding window taken by slicing | 22x | 1.3x |
+| `data_list`, walking a linked list of `HEAP` nodes | 95x | 0.6x |
 
 Values of primitive mode are computed in native C types, locals that cannot
-escape become C variables rather than run-time cells, the assigning operators are
-updates rather than references, and a routine whose parameters and result are
-primitive is a plain C function called directly. A loop over scalars compiles to
-a C loop with no calls into the runtime, and naive Fibonacci to the recursive C
-one would write by hand. Two shapes have not got there: an indirect call through
-a procedure parameter, and row access, where every element is still one call. See
-[benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for the analysis and for what
-is still slow.
+escape become C variables, rows, rows of structures and rows of unions become C
+arrays, strings become C buffers, choices become C conditionals and switches, and
+routines with primitive signatures are plain C functions called directly. Twenty
+of the twenty-two benchmarks are within about 1.3x to 7x of C; structures reached
+through `REF` and slices still go through the runtime. See
+[benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for all 22 and for what is left.
 
 ## Quick start
 
@@ -104,8 +103,9 @@ fuzz/run.sh 1 200           # differential fuzzing: 200 random programs from see
   loops, brief forms `(…|…|…)` and `|:`), routine texts, casts, slices with
   trims and `AT`, selections, jumps and labels, `EXIT` completers, formats.
   User-defined operators and priorities are discovered by a pre-scan.
-* **Modes**: `INT REAL BOOL CHAR BITS COMPL STRING VOID`, `LONG`/`LONG LONG`
-  (`LONG INT` with a68g's 49/84-digit limits and `PR precision`), `REF`,
+* **Modes**: `INT REAL BOOL CHAR BITS BYTES COMPL STRING VOID`, `LONG` and
+  `LONG LONG` versions of the numeric modes as a68g's multi-precision numbers
+  (42- and 70-digit reals, 49- and 84-digit integers, `PR precision`), `REF`,
   multi-dimensional and `FLEX` rows, `PROC`, `STRUCT`, `UNION`, recursive
   mode declarations, structural mode equivalence.
 * **Elaboration**: the Algol 68 coercion system with its five strengths
@@ -115,8 +115,10 @@ fuzz/run.sh 1 200           # differential fuzzing: 200 random programs from see
   scope resolution to frames and slots; enquiry-clause scoping.
 * **Execution**: 32-bit `INT` with overflow detection, IEEE `REAL` with
   a68g's checks for infinities and NaNs, a68g's square-and-multiply `**`,
-  uninitialised-value detection, names into rows and structs (slices, trims,
-  fields), flexible rows with bounds checks, closures, jumps, `stop`.
+  a68g's multi-precision arithmetic re-implemented digit for digit (`A68/MP*.lean`),
+  `COMPL` arithmetic to the last bit, uninitialised-value detection, names into
+  rows and structs (slices, trims, fields), flexible rows with bounds checks,
+  closures, jumps, `stop`.
 * **Transput**: `print`/`write`, `printf` with the a68g picture language
   (integral, real, string, boolean, choice and general patterns, replicators,
   insertions, `k` alignment, embedded formats `f(…)`), `read`/`readf`,
@@ -125,12 +127,18 @@ fuzz/run.sh 1 200           # differential fuzzing: 200 random programs from see
   byte-exact `whole`, `fixed`, `float` reproducing a68g's multi-precision
   formatting including its double-to-decimal conversion quirks.
 * **Standard prelude**: arithmetic, string and bits operators, the
-  mathematical functions, `char in string`, `string in string`, character
-  classification, a68g's taus113 random generator (`random`, `first random`),
-  environment enquiries.
-* **Two back ends**: a direct evaluator, and a C back end that emits a
-  self-contained C program (compiled control flow, one C function per routine
-  text) linked against the same runtime, so both produce identical bytes.
+  mathematical and complex functions at every length, `char in string`,
+  `string in string`, character classification, a68g's taus113 random generator
+  (`random`, `first random`), environment enquiries, and a68g's extensions:
+  regular expressions, `evaluate`, `system`, `fork` and the `execve` family,
+  directories and file enquiries, `getenv`, local and UTC time.
+* **Two back ends**: a direct evaluator, and a C back end that emits a C
+  program linked against the same runtime, so both produce identical bytes. The
+  emitted code computes primitive values in C types, keeps locals that cannot
+  escape in C variables, rows of primitive elements, structures and unions in C
+  arrays and strings in C buffers, and calls routines with primitive signatures
+  as plain C functions, falling back to the runtime wherever the analysis cannot
+  prove that safe.
 * **Optimiser**: constant folding by evaluation, coercion simplification,
   constant control flow and frameless-block flattening, mirroring a68g's
   optimiser passes; the same rewrites are proved correct over the formal core.
@@ -145,6 +153,9 @@ A68/Mode.lean        modes and mode equivalence
 A68/Core.lean        runtime values and the core representation
 A68/Builtins.lean    modes of the standard prelude
 A68/Numfmt.lean      byte-exact number formatting (whole/fixed/float)
+A68/MP.lean          a68g's multi-precision arithmetic (mp.c), digit for digit
+A68/MPMath.lean      multi-precision functions, π and complex (mp-math.c, mp-pi.c, mp-complex.c)
+A68/MPFmt.lean       formatting of LONG and LONG LONG values
 A68/Elab.lean        elaborator: mode checking, coercions, operator identification
 A68/Interp.lean      evaluator, standard prelude, formatted transput, files
 A68/Opt.lean         optimisation passes over the core representation
@@ -154,6 +165,7 @@ A68/Serial.lean      mode and format tables carried by compiled programs
 A68/Pretty.lean      readable rendering of the core representation (dump)
 A68/Verified/        machine-checked theorems
 csrc/stubs.c         default dispatch hooks for the interpreter binary
+csrc/sys.c           operating-system procedures and COMPL arithmetic, as a68g calls C
 Main.lean            command line driver
 tests/               regression suite and differential-test scripts
 fuzz/                grammar-based program generator and fuzz driver

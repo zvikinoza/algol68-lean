@@ -246,6 +246,28 @@ program rather than a plugin loaded back into an interpreter:
   directly in a cell, or a chain of field selections rooted at one, is read and
   written by one call that carries a native value, `s +:= c` appends to a string
   in place, and anything else falls back to the general machinery.
+* **Rows, strings and unions in C memory.** A fixed row of primitive elements used only
+  through subscripts, bounds enquiries and element updates in statement position is a
+  C array with a defined-flag per element, so a read is a bounds check and a load. A
+  row of structures of primitive fields is one C array per field; a row of a union of
+  primitive modes is a tag array and a payload array, and a conformity clause on an
+  element is a `switch` on the tag. A `STRING` variable declared with a denotation and
+  used through reads, subscripts, comparisons, assignments and `+:=` is a growable C
+  buffer, made a runtime value again only where a whole-string value is needed. Each
+  has its own escape analysis (`rowEscapes`, `srowEscapes`, `urowEscapes`,
+  `strEscapes`), and anything it does not recognise keeps the cell.
+* **Choices and jumps stay in C.** Conditional and case clauses of primitive mode are C
+  conditional expressions and `switch`es, written into a C variable when assigned;
+  `ANDF` and `OREL` are `&&` and `||`. In a block with labels, a unit followed by
+  another before any `EXIT` is a statement, so its variables are still promoted.
+* **Calls through procedure parameters.** A routine with a plain entry point and no
+  captured environment is recorded in a table indexed by its boxed function; a call
+  through a procedure parameter looks the entry point up once per invocation of the
+  caller (a parameter is an identity, so it cannot change) and calls it directly,
+  falling back to the boxed call for anything else.
+* **Heap cells are given back.** A routine whose result mode holds no names and whose
+  body lets no reference escape marks the heap on entry and releases it on return, so
+  boxed calls do not grow the heap without bound.
 * **Reaching a statement is a store, not a call.** The current line lives in a C
   variable that the error reporters read when a compiled program is running.
 * **Tables are rebuilt at start-up.** Modes tag united values and drive the
