@@ -381,6 +381,8 @@ def refSub (r : Value) (l u : Array Int) (offs : Array Nat) : M Value := do
 @[extern "erf"] opaque cErf (x : Float) : Float
 @[extern "erfc"] opaque cErfc (x : Float) : Float
 @[extern "log1p"] opaque cLog1p (x : Float) : Float
+def piOver180 : Float := 0.0174532925199432957692369076848861271344287188854172545609719144
+def d180OverPi : Float := 57.2957795130823208767981548141051703324054724665643215491602438
 
 /-- The bytes of a string: an Algol 68 character is a byte. -/
 def strBytes (s : String) : ByteArray := s.foldl (fun acc c => acc.push c.toNat.toUInt8) ByteArray.empty
@@ -2173,6 +2175,22 @@ partial def mathFn (name : String) (x : Float) : M Float := do
     | "erf" => pure (cErf x)
     | "erfc" => pure (cErfc x)
     | "ln1p" => pure (cLog1p x)
+    -- a68g single-math.c, with its constants for pi / 180 and 180 / pi
+    | "sindg" => pure (Float.sin (x * piOver180))
+    | "cosdg" => pure (Float.cos (x * piOver180))
+    | "tandg" => pure (Float.tan (x * piOver180))
+    | "arcsindg" | "asindg" => pure (Float.asin x * d180OverPi)
+    | "arccosdg" | "acosdg" => pure (Float.acos x * d180OverPi)
+    | "arctandg" | "atandg" => pure (Float.atan x * d180OverPi)
+    | "cot" => do let z := Float.sin x; if z == 0.0 then rtErr "math exception" else pure (Float.cos x / z)
+    | "sec" => do let z := Float.cos x; if z == 0.0 then rtErr "math exception" else pure (1.0 / z)
+    | "csc" => do let z := Float.sin x; if z == 0.0 then rtErr "math exception" else pure (1.0 / z)
+    | "cotdg" => do
+      let z := Float.sin (x * piOver180)
+      if z == 0.0 then rtErr "math exception" else pure (Float.cos (x * piOver180) / z)
+    | "secdg" => do let z := Float.cos (x * piOver180); if z == 0.0 then rtErr "math exception" else pure (1.0 / z)
+    | "cscdg" => do let z := Float.sin (x * piOver180); if z == 0.0 then rtErr "math exception" else pure (1.0 / z)
+    | "cas" => pure (Float.cos x + Float.sin x)
     | _ => rtErr s!"unknown math function {name}"
   checkReal r
 
@@ -2674,7 +2692,9 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
         "asin","acos","atan","sinh","cosh","tanh","arcsinh","arccosh","arctanh","cbrt","curt",
         "longsqrt","longexp","longln","longlog","longsin","longcos","longtan","longarcsin","longarccos",
         "longarctan","longlongsqrt","longlongexp","longlongln","longlongsin","longlongcos","longlongtan",
-        "longlongarctan","longlongarcsin","longlongarccos","gamma","lngamma","erf","erfc","ln1p"].contains fn then
+        "longlongarctan","longlongarcsin","longlongarccos","gamma","lngamma","erf","erfc","ln1p",
+        "sindg","cosdg","tandg","arcsindg","asindg","arccosdg","acosdg","arctandg","atandg",
+        "cot","sec","csc","cotdg","secdg","cscdg","cas"].contains fn then
       Value.real <$> mathFn fn (← expectReal x)
     else rtErr s!"unsupported standard procedure {fn}/1"
   | _, _ => rtErr s!"unsupported standard procedure {name}/{args.length}"
