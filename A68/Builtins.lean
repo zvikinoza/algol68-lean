@@ -144,6 +144,7 @@ def procs : List (String × Mode) :=
    ("secdg", realFn 0), ("cscdg", realFn 0), ("arcsindg", realFn 0), ("asindg", realFn 0),
    ("arccosdg", realFn 0), ("acosdg", realFn 0), ("arctandg", realFn 0), ("atandg", realFn 0),
    ("cot", realFn 0), ("sec", realFn 0), ("csc", realFn 0), ("cas", realFn 0),
+   ("sinpi", realFn 0), ("cospi", realFn 0), ("tanpi", realFn 0), ("cotpi", realFn 0),
    ("rewind", PROCFILE), ("erase", PROCFILE),
    ("resetpossible", proc [REFFILE] bool), ("rewindpossible", proc [REFFILE] bool),
    ("setpossible", proc [REFFILE] bool), ("getpossible", proc [REFFILE] bool),

@@ -381,7 +381,21 @@ def refSub (r : Value) (l u : Array Int) (offs : Array Nat) : M Value := do
 @[extern "erf"] opaque cErf (x : Float) : Float
 @[extern "erfc"] opaque cErfc (x : Float) : Float
 @[extern "log1p"] opaque cLog1p (x : Float) : Float
-def piOver180 : Float := 0.0174532925199432957692369076848861271344287188854172545609719144
+@[extern "fmod"] opaque cFmod (x y : Float) : Float
+
+/-- a68g `a68g_sinpi_real` and `a68g_cospi_real`: exact at the multiples of a half. -/
+def sinPi (x : Float) : Float :=
+  let x := cFmod x 2.0
+  let x := if x ≤ -1.0 then x + 2.0 else if x > 1.0 then x - 2.0 else x
+  if x == 0.0 || x == 1.0 then 0.0 else if x == 0.5 then 1.0
+  else if x == -0.5 then -1.0 else Float.sin (3.141592653589793 * x)
+
+def cosPi (x : Float) : Float :=
+  let x := cFmod (Float.abs x) 2.0
+  if x == 0.5 || x == 1.5 then 0.0 else if x == 0.0 then 1.0
+  else if x == 1.0 then -1.0 else Float.cos (3.141592653589793 * x)
+
+def piOver180 : Float :=0.0174532925199432957692369076848861271344287188854172545609719144
 def d180OverPi : Float := 57.2957795130823208767981548141051703324054724665643215491602438
 
 /-- The bytes of a string: an Algol 68 character is a byte. -/
@@ -2191,6 +2205,17 @@ partial def mathFn (name : String) (x : Float) : M Float := do
     | "secdg" => do let z := Float.cos (x * piOver180); if z == 0.0 then rtErr "math exception" else pure (1.0 / z)
     | "cscdg" => do let z := Float.sin (x * piOver180); if z == 0.0 then rtErr "math exception" else pure (1.0 / z)
     | "cas" => pure (Float.cos x + Float.sin x)
+    | "sinpi" => pure (sinPi x)
+    | "cospi" => pure (cosPi x)
+    | "tanpi" | "cotpi" => do
+      let y := cFmod x 1.0
+      let y := if y ≤ -0.5 then y + 1.0 else if y > 0.5 then y - 1.0 else y
+      if name == "tanpi" then
+        if y == 0.5 then rtErr "math exception"
+        pure (if y == -0.25 then -1.0 else if y == 0.0 then 0.0 else if y == 0.25 then 1.0 else sinPi y / cosPi y)
+      else
+        if y == 0.0 then rtErr "math exception"
+        pure (if y == -0.25 then -1.0 else if y == 0.25 then 1.0 else if y == 0.5 then 0.0 else cosPi y / sinPi y)
     | _ => rtErr s!"unknown math function {name}"
   checkReal r
 
@@ -2694,7 +2719,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
         "longarctan","longlongsqrt","longlongexp","longlongln","longlongsin","longlongcos","longlongtan",
         "longlongarctan","longlongarcsin","longlongarccos","gamma","lngamma","erf","erfc","ln1p",
         "sindg","cosdg","tandg","arcsindg","asindg","arccosdg","acosdg","arctandg","atandg",
-        "cot","sec","csc","cotdg","secdg","cscdg","cas"].contains fn then
+        "cot","sec","csc","cotdg","secdg","cscdg","cas","sinpi","cospi","tanpi","cotpi"].contains fn then
       Value.real <$> mathFn fn (← expectReal x)
     else rtErr s!"unsupported standard procedure {fn}/1"
   | _, _ => rtErr s!"unsupported standard procedure {name}/{args.length}"
