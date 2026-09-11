@@ -259,6 +259,19 @@ partial def coerce (s : Strength) (c : Core) (src dst : Mode) (fuel : Nat := 12)
         else
           -- widening to a row (BITS → [] BOOL)
           if widenable srcR dstR then return some (.widen srcR dstR c) else return none
+    | .row d _ em =>
+      -- rowing into a multi-dimensional row, as a68g does: a row of `d - 1` dimensions gains
+      -- a first dimension `1:1`, and a value `M` becomes a `[1:1, …, 1:1] M`.  Both are
+      -- one-element row displays, which both back ends already build.
+      match srcR with
+      | .ref _ => return none
+      | .row k _ em' =>
+        if k + 1 == d && (← eqv em' em) then return some (.collateral [c] false d)
+        else return none
+      | _ =>
+        if let some c' ← coerce .strong c src em (fuel - 1) then
+          return some ((List.range d).foldl (fun acc k => Core.collateral [acc] false (k + 1)) c')
+        else return none
     | .ref (.row 1 _ em) =>
       match srcR with
       | .ref x => if (← eqv x em) then return some (.rowOf c) else return none
@@ -432,6 +445,10 @@ def builtinMonadic (op : String) (e : Core) (m : Mode) : Elab (Option (Core × M
   | "CONJ", .compl _ => return some (.monop "CONJ" m e, m)
   | "LWB", .row _ _ _ | "UPB", .row _ _ _ => return some (.monop op m e, .int 0)
   | "ELEMS", .row _ _ _ => return some (.monop op m e, .int 0)
+  -- a SEMA is a name of an INT (a68g: `MODE SEMA = STRUCT (REF INT F)`): `LEVEL n` makes
+  -- one holding `n`, and `LEVEL s` reads its level
+  | "LEVEL", .int 0 => return some (.gen e, .sema)
+  | "LEVEL", .sema => return some (.deref e, .int 0)
   | _, _ =>
     let _ := tb
     return none
@@ -782,6 +799,7 @@ partial def elabPrimary (e : Expr) : Elab (Core × Mode) := do
   | .format items _ =>
     let cs ← items.mapM elabFormatItem
     return (.fmt cs, .format)
+  | .vacant _ => err "an argument may only be omitted in the actual parameters of a call"
   | _ =>
     -- context-sensitive constructs reached without a context: use firm
     elabUnit e .firm
@@ -867,12 +885,55 @@ partial def elabCall (f : Expr) (args : List Expr) : Elab (Core × Mode) := do
   | .proc ps r =>
     if ps.length != args.length then
       err s!"procedure expects {ps.length} arguments, {args.length} given"
+    if args.any (fun a => match a with | .vacant _ => true | _ => false) then
+      return ← elabPartialCall f args ps r
     let mut cs : List Core := []
     for (a, p) in args.zip ps do
       let (c, _) ← elabUnit a (.strong p)
       cs := cs ++ [c]
     return (.call fc cs, r)
   | _ => err s!"call of a non-procedure of mode {fm}"
+
+/-- Partial parametrisation (a68g implements Lindsey's proposal): `f (a, , c)` with
+    `f : PROC (A, B, C) R` yields a `PROC (B) R`.  The procedure and the arguments that are
+    given are evaluated at the call, in that order, and kept; the omitted ones become the
+    parameters of the new procedure, in their original order.  This is elaborated as a
+    block whose frame holds those values and which yields a routine text over the omitted
+    parameters:
+
+        ( PROC (A, B, C) R p = f; A a = …; C c = …; (B b) R: p (a, b, c) )
+
+    so both back ends need nothing new.  A partial call of a partial procedure composes. -/
+partial def elabPartialCall (f : Expr) (args : List Expr) (ps : List Mode) (r : Mode) : Elab (Core × Mode) := do
+  pushScope
+  let (fc, fm) ← elabUnit f .meekAny
+  let fSlot ← newSlot
+  let mut stmts : List CoreStmt := [.decl fSlot fm fc]
+  let mut given : List (Option Nat) := []    -- the slot holding each given argument
+  let mut missing : List Mode := []
+  for (a, p) in args.zip ps do
+    match a with
+    | .vacant _ =>
+      given := given ++ [none]
+      missing := missing ++ [p]
+    | _ =>
+      let (c, _) ← elabUnit a (.strong p)
+      let s ← newSlot
+      stmts := stmts ++ [.decl s p (.at a.pos c)]
+      given := given ++ [some s]
+  let mut k := 0
+  let mut callArgs : List Core := []
+  for g in given do
+    match g with
+    | some s => callArgs := callArgs ++ [.loadCell 1 s]
+    | none =>
+      callArgs := callArgs ++ [.loadCell 0 k]
+      k := k + 1
+  let body := Core.call (.loadCell 1 fSlot) callArgs
+  let routine := Core.routine missing.length missing.length body
+  let sc ← popScope
+  let labelBase := (← get).labelCount
+  return (.block sc.size (stmts ++ [CoreStmt.unit routine]).toArray labelBase 0, .proc missing r)
 
 partial def elabSlice (arr : Expr) (idx : List Indexer) : Elab (Core × Mode) := do
   let (ac, am) ← elabUnit arr .weak
