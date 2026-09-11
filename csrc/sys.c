@@ -352,3 +352,92 @@ lean_obj_res a68_sys_getenv(b_lean_obj_arg name) {
   free(n);
   return v != NULL ? a68_bytes(v, strlen(v)) : a68_bytes("", 0);
 }
+
+/* COMPLEX arithmetic and functions as a68g computes them (single.c, single-math.c).  The
+   expressions are a68g's own, compiled by a C compiler that, like the one a68g was built
+   with, fuses a multiplication and an addition within one expression into a single
+   operation, so the last figures of a result agree with a68g's and not only the first
+   fifteen.  Part 0 of a result is its real part, part 1 its imaginary part. */
+#include <complex.h>
+#include <math.h>
+
+#define A68_ABS(x) ((x) >= 0 ? (x) : -(x))
+
+/* genie_mul_complex (which 0) and genie_div_complex (which 1) */
+double a68_compl_op(uint8_t which, uint8_t part, double re_x, double im_x, double re_y, double im_y) {
+  double re = 0.0, im = 0.0;
+  if (which == 0) {
+    re = re_x * re_y - im_x * im_y;
+    im = im_x * re_y + re_x * im_y;
+  } else if (A68_ABS (re_y) >= A68_ABS (im_y)) {
+    double r = im_y / re_y, den = re_y + r * im_y;
+    re = (re_x + r * im_x) / den;
+    im = (im_x - r * re_x) / den;
+  } else {
+    double r = re_y / im_y, den = im_y + r * re_y;
+    re = (re_x * r + im_x) / den;
+    im = (im_x * r - re_x) / den;
+  }
+  return part == 0 ? re : im;
+}
+
+/* genie_pow_complex_int for a non-negative exponent; a negative one divides 1 by this */
+double a68_compl_pow(uint8_t part, double re_x, double im_x, uint64_t j) {
+  double re_z = 1.0, im_z = 0.0;
+  double re_y = re_x, im_y = im_x;
+  uint64_t expo = 1;
+  while (expo <= j) {
+    double rea;
+    if (expo & j) {
+      rea = re_z * re_y - im_z * im_y;
+      im_z = re_z * im_y + im_z * re_y;
+      re_z = rea;
+    }
+    rea = re_y * re_y - im_y * im_y;
+    im_y = im_y * re_y + re_y * im_y;
+    re_y = rea;
+    expo <<= 1;
+  }
+  return part == 0 ? re_z : im_z;
+}
+
+/* a68g_hypot_real, which OP ABS on COMPLEX uses */
+double a68_compl_abs(double x, double y) {
+  double xabs = A68_ABS (x), yabs = A68_ABS (y), min, max;
+  if (xabs < yabs) {
+    min = xabs;
+    max = yabs;
+  } else {
+    min = yabs;
+    max = xabs;
+  }
+  if (min == 0) {
+    return max;
+  } else {
+    double u = min / max;
+    return max * sqrt (1 + u * u);
+  }
+}
+
+/* the C_C_FUNCTION routines: the C library's complex functions */
+double a68_compl_fn(uint8_t which, uint8_t part, double re, double im) {
+  double complex z = re + im * _Complex_I;
+  switch (which) {
+    case 0: z = csqrt (z); break;
+    case 1: z = cexp (z); break;
+    case 2: z = clog (z); break;
+    case 3: z = csin (z); break;
+    case 4: z = ccos (z); break;
+    case 5: z = ctan (z); break;
+    case 6: z = casin (z); break;
+    case 7: z = cacos (z); break;
+    case 8: z = catan (z); break;
+    case 9: z = csinh (z); break;
+    case 10: z = ccosh (z); break;
+    case 11: z = ctanh (z); break;
+    case 12: z = casinh (z); break;
+    case 13: z = cacosh (z); break;
+    default: z = catanh (z); break;
+  }
+  return part == 0 ? creal (z) : cimag (z);
+}

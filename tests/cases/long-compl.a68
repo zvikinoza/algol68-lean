@@ -1,0 +1,12 @@
+# LONG and LONG LONG COMPLEX arithmetic (cmul_mp, cdiv_mp, powers) and operators #
+LONG COMPL a := LONG 1.5 I LONG 2.25, b := LONG 3.0 I -LONG 0.5;
+print((a + b, newline, a - b, newline, a * b, newline, a / b, newline));
+print((a = b, a /= b, a = a, newline));
+print((a ** 3, newline, a ** -2, newline));
+print((RE a, IM a, newline, CONJ a, newline, ABS a, newline, ARG a, newline));
+print((SHORTEN a, newline));
+LONG LONG COMPL c := a; print((c * c, newline));
+c /:= LONG LONG 3.0 I LONG LONG 1.0; print((c, newline));
+a +:= 1.1; print((a, newline));
+LONG COMPL z := 1.1; print((z, newline));
+print((-a, newline))

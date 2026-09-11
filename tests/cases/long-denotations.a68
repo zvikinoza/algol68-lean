@@ -1,0 +1,20 @@
+# a REAL denotation widened to LONG is read again at LONG precision; a formula is not #
+print((LENG 1.1, newline));
+print((LONG 1.0 + 1.1, newline));
+LONG REAL a := 1.1; print((a, newline));
+LONG REAL b := 1; print((b + 1.1, newline));
+print((LONG LONG 1.0 + 1.1, newline));
+LONG LONG REAL c := LONG 1.1; print((c, newline));
+LONG COMPL z := 1.1; print((z, newline));
+[]LONG REAL r = (1.1, 1.2); print((r, newline));
+LONG REAL x := -1.1; print((x, newline));
+BOOL bb := TRUE;
+LONG REAL y := IF bb THEN 1.1 ELSE LONG 2.0 FI; print((y, newline));
+print((LONG 1.0 * (1.1), newline));
+PROC f = (LONG REAL q) LONG REAL: q; print((f(1.1), newline));
+print((long sqrt(1.1), newline));
+print((LONG 1.1 = 1.1, 1.1 < LONG 1.1, newline));
+print((ABS 1.1 + LONG 0.0, newline));
+REAL rr = 1.1; LONG REAL xx := rr; print((xx, newline));
+LONG REAL p := 1; p +:= 1.1; print((p, newline));
+LONG REAL v := 1; v := v + 1.1 * 2; print((v, newline))

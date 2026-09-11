@@ -63,7 +63,7 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
       let core ← Opt.run core0 level
       if rest.contains "-v" then
         IO.println s!"core nodes: {Opt.size core0} -> {Opt.size core}"
-      let cCode := CodeGen.program core modes ll (A68.isRegression toks) (A68.echoesOf toks)
+      let cCode := CodeGen.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file
       let cFile := out ++ ".c"
       IO.FS.writeFile cFile cCode
       if cOnly then IO.println s!"wrote {cFile}"; return 0

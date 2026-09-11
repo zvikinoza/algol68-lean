@@ -1,0 +1,30 @@
+# A GO TO out of a routine to a label inside a loop body, directly and from an event routine. #
+BEGIN
+  FOR nr TO 3 DO
+    print(("<"));
+    PROC jump = VOID: GO TO done;
+    print((nr, "|"));
+    jump;
+    print("never");
+    done: print((">", newline))
+  OD;
+  FOR nr TO 2 DO
+    PROC leave = (INT k) INT: (k > 2 | GO TO out | k * 10);
+    FOR nf DO print((leave(nf), " ")) OD;
+    out: print(newline)
+  OD;
+  FILE f; STRING line; CHAR sep = ",";
+  associate(f, line); make term(f, sep);
+  FOR nr TO 3 DO
+    line := "a,bb,ccc";
+    print(("["));
+    on logical file end(f, (REF FILE g) BOOL: finished);
+    FOR nf DO
+      STRING field; get(f, field);
+      print((field, "|"));
+      get(f, space)
+    OD;
+    finished: reset(f);
+    print(("]", newline))
+  OD
+END

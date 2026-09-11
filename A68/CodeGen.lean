@@ -169,6 +169,8 @@ structure Frame where
   /-- per slot of a routine's parameters: the C variable of the current C function that keeps
       the plain entry point of the routine a procedure parameter holds, once looked up -/
   pcache : Array (Option String) := #[]
+  /-- per slot: the C buffer a STRING variable was promoted to -/
+  strs   : Array (Option String) := #[]
   pushed : Bool := true
   deriving Inhabited
 
@@ -193,6 +195,11 @@ def rowOf (env : List Frame) (d s : Nat) : Option RowVar := do
   let f ← env[d]?
   let r ← f.rows[s]?
   r
+
+def strOf (env : List Frame) (d s : Nat) : Option String := do
+  let f ← env[d]?
+  let v ← f.strs[s]?
+  v
 
 /-- The promoted row a node names through its variable, `a` in `LWB a`. -/
 def rowName (env : List Frame) (c : Core) : Option RowVar :=
@@ -275,6 +282,16 @@ def cstring (s : String) : String :=
       let d := "0123456789abcdef"
       "\\x" ++ String.singleton (d.get ⟨n / 16⟩) ++ String.singleton (d.get ⟨n % 16⟩)
     else String.singleton c) ++ "\""
+
+/-- A C string literal of arbitrary bytes.  An octal escape takes at most three figures, so
+    unlike `\x` it cannot swallow a figure that follows it. -/
+def cbytes (bs : List Nat) : String :=
+  "\"" ++ String.join (bs.map fun b =>
+    if b == 34 then "\\\"" else if b == 92 then "\\\\" else if b == 63 then "\\?"
+    else if b < 32 || b > 126 then
+      "\\" ++ String.singleton (Char.ofNat (48 + b / 64 % 8)) ++ String.singleton (Char.ofNat (48 + b / 8 % 8))
+        ++ String.singleton (Char.ofNat (48 + b % 8))
+    else String.singleton (Char.ofNat b)) ++ "\""
 
 /-- One lower-case hexadecimal figure. -/
 def hexFig (n : Nat) : Char := if n < 10 then Char.ofNat (48 + n) else Char.ofNat (87 + n)
@@ -370,6 +387,31 @@ def isChoice (c : Core) : Bool :=
   match strip c with
   | .cond .. | .caseInt .. | .block .. | .seq .. => true
   | _ => false
+
+/-- The bytes of a string denotation: a row of characters with lower bound 1. -/
+def strLit (c : Core) : Option (List Nat) :=
+  match strip c with
+  | .lit (.row l _ es) =>
+    if l.size == 1 && l[0]! == 1 then
+      es.toList.mapM fun | .char ch => some ch | _ => none
+    else none
+  | _ => none
+
+/-- The C buffer of the promoted STRING a node reads. -/
+def strName (env : List Frame) (c : Core) : Option String :=
+  match strip c with
+  | .loadCell d s => strOf env d s
+  | .deref e => match strip e with | .refCell d s => strOf env d s | _ => none
+  | _ => none
+
+/-- An operand of a string comparison as the C pointer and length of its bytes. -/
+def strOperand (env : List Frame) (c : Core) : Option (String × String) :=
+  match strName env c with
+  | some sv => some (s!"{sv}.p", s!"{sv}.n")
+  | none =>
+    match strLit c with
+    | some bs => some (s!"(const uint8_t*) {cbytes bs}", toString bs.length)
+    | none => none
 
 /-- Which statements of a block are generated in statement position, where the value is
     thrown away.  Without labels only the last unit supplies the block's value, so every
@@ -583,6 +625,13 @@ def SelChain.fieldsWord (c : SelChain) : Nat := Id.run do
 def SelChain.args (c : SelChain) : String :=
   s!"{c.depth}, {c.slot}, {c.spec}u, {c.i}, {c.j}, {c.fieldsWord}u"
 
+/-- `NIL`, possibly still inside the frameless block a cast leaves. -/
+partial def isNilLit (c : Core) : Bool :=
+  match strip c with
+  | .lit .nil => true
+  | .block 0 stmts _ _ => stmts.size == 1 && (match stmts[0]! with | .unit e => isNilLit e | _ => false)
+  | _ => false
+
 /-- The C form of a monadic operator on a native operand, when it has one.  Each form
     reproduces the check its interpreted counterpart performs. -/
 def monopC (op : String) (t : CTy) (x : String) : Option String :=
@@ -665,6 +714,15 @@ partial def rowReadC (env : List Frame) (ty : CTy) (base : Core) (idx : List Cor
   else
     some s!"a68_ar2_{ty.sfx}({r}_p, {r}_d, {r}_l0, {r}_u0, {r}_l1, {r}_u1, {is[0]!}, {is[1]!})"
 
+/-- `s[i]` on a STRING kept in a C buffer, with the bounds check the evaluator performs. -/
+partial def strRead (env : List Frame) (ty : CTy) (sv : String) (idx : List CoreIdx) : Option String := do
+  if ty != .u32 then none else
+  match idx with
+  | [.index a] => do
+    let ia ← scalarExpr env (.int 0) a
+    some s!"a68_str_at(&{sv}, {ia})"
+  | _ => none
+
 /-- `a[i]` and `a[i, j]` where `a` is a row held directly in a cell: one call that returns
     a native value, instead of a reference built on the operand stack and then dereferenced. -/
 partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List CoreIdx) : Option String := do
@@ -672,6 +730,7 @@ partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List Core
     | .refCell d sl => some (d, sl)
     | .loadCell d sl => some (d, sl)
     | _ => none
+  if (strOf env d sl).isSome then strRead env ty ((strOf env d sl).getD "") idx else
   if (varOf env d sl).isSome || (rowOf env d sl).isSome then none else
   match idx with
   | [.index a] => do
@@ -690,7 +749,7 @@ partial def rowRead (env : List Frame) (ty : CTy) (base : Core) (idx : List Core
 partial def selChain (env : List Frame) : Core → Option SelChain
   | .at _ e => selChain env e
   | .refCell d s =>
-    if (varOf env d s).isSome || (rowOf env d s).isSome then none
+    if (varOf env d s).isSome || (rowOf env d s).isSome || (strOf env d s).isSome then none
     else some { depth := rtDepthOf env d, slot := s }
   -- the cell holds a `REF`; the structure is what it designates
   | .loadCell d s | .deref (.refCell d s) =>
@@ -729,7 +788,8 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
   | .lit (.real x) => if ty == .f64 then some (creal x) else none
   | .lit (.bool b) => if ty == .u8 then some (if b then "1" else "0") else none
   | .lit (.char ch) => if ty == .u32 then some s!"{ch}u" else none
-  | .lit (.bits b) => if ty == .u64 then some s!"{b}ull" else none
+  -- a LONG BITS value too wide for 64 bits is boxed from its digits instead
+  | .lit (.bits b) => if ty == .u64 && b < 2 ^ 64 then some s!"{b}ull" else none
   | .loadCell d s =>
     match varOf env d s with
     | some (v, vt, u) => if vt == ty then some (readVar (v, vt, u)) else none
@@ -749,6 +809,16 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     | none => do
       let ch ← fieldChain env (.select f e true)
       some s!"{ty.selFn}({ch.args})"
+  | .identRel l r isnt => do
+    -- `p IS NIL` and `p ISNT NIL` on a variable held in a cell
+    if ty != .u8 then none else
+    let cellRead (x : Core) : Option (Nat × Nat) := match strip x with
+      | .loadCell d s => some (d, s)
+      | .deref e => match strip e with | .refCell d s => some (d, s) | _ => none
+      | _ => none
+    let (d, s) ← if isNilLit r then cellRead l else if isNilLit l then cellRead r else none
+    if (varOf env d s).isSome || (rowOf env d s).isSome || (strOf env d s).isSome then none else
+    some s!"((uint8_t)({if isnt then "!" else ""}a68_isnil({rtDepthOf env d}, {s})))"
   | .andThen l r => do
     -- `&&` and `||` look at their right operand only when the evaluator would
     if ty != .u8 then none else
@@ -780,6 +850,8 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
     if (op == "LWB" || op == "UPB") && ty == .i64 then
       if let some rv := rowName env e then
         return s!"{rv.name}_{if op == "LWB" then "l" else "u"}0"
+      if let some sv := strName env e then
+        return (if op == "LWB" then s!"{sv}.l" else s!"({sv}.l + {sv}.n - 1)")
     let r ← monopResult op mm
     if r != m then none else
     let x ← scalarExpr env mm e
@@ -799,6 +871,20 @@ partial def scalarExpr (env : List Frame) (m : Mode) (c : Core) : Option String 
           if k == 1 || (k == 2 && rv.dims == 2) then
             return s!"{rv.name}_{if op == "LWB" then "l" else "u"}{k - 1}"
         | _ => pure ()
+      if let some sv := strName env r then
+        match strip l with
+        | .lit (.int 1) => return (if op == "LWB" then s!"{sv}.l" else s!"({sv}.l + {sv}.n - 1)")
+        | _ => pure ()
+    -- comparisons of strings kept in C buffers or given by denotations
+    if ty == .u8 && ["=", "/=", "<", "<=", ">", ">="].contains op then
+      match m1, m2 with
+      | .row 1 _ .char, .row 1 _ .char =>
+        match strOperand env l, strOperand env r with
+        | some (pa, na), some (pb, nb) =>
+          let cop := if op == "/=" then "!=" else if op == "=" then "==" else op
+          return s!"((uint8_t)(a68_str_cmp({pa}, {na}, {pb}, {nb}) {cop} 0))"
+        | _, _ => pure ()
+      | _, _ => pure ()
     if m1 != m2 then none else
     let opnd ← CTy.ofMode m1
     let res ← dyopResult op m1
@@ -830,7 +916,7 @@ def resultMode : Core → Option Mode
     match resultMode t with
     | some m => some m
     | none => resultMode e
-  | .andThen _ _ | .orElse _ _ => some .bool
+  | .andThen _ _ | .orElse _ _ | .identRel _ _ _ => some .bool
   | _ => none
 
 /-- A native expression for a node whose mode is not supplied by the caller. -/
@@ -1226,6 +1312,78 @@ partial def urowEscapesStmts (tab : Mode.Table) (cms : Array Mode) (d sl dims : 
   return false
 end
 
+/-- A slot whose mode is STRING. -/
+def isStringMode (tab : Mode.Table) : Option Mode → Bool
+  | some m =>
+    match Mode.resolve tab m with
+    | .row 1 true .char | .ref (.row 1 true .char) => true
+    | _ => false
+  | none => false
+
+/-- Is the slot declared with a string denotation as its initial value? -/
+def strDecl (stmts : Array CoreStmt) (slot : Nat) : Bool := Id.run do
+  for st in stmts do
+    match st with
+    | .decl sl _ init => if sl == slot then return (strLit init).isSome
+    | _ => pure ()
+  return false
+
+mutual
+/-- Does anything force the STRING slot to stay a run-time cell?  A C buffer supports reads of
+    the whole string, which make a value of it, subscripts `s[i]`, the bounds enquiries, and,
+    in statement position, assignments to it and `+:=`.  Anything that takes a reference to
+    it, or to one of its elements, keeps the cell. -/
+partial def strEscapes (d sl : Nat) (c : Core) : Bool :=
+  match c with
+  | .at _ e => strEscapes d sl e
+  | .refCell dd ss => dd == d && ss == sl
+  | .loadCell _ _ => false
+  | .deref e =>
+    match strip e with
+    | .refCell _ _ => false
+    | .slice base [.index i] true =>
+      match strip base with
+      | .refCell dd ss => if dd == d && ss == sl then strEscapes d sl i else strEscapes d sl e
+      | _ => strEscapes d sl e
+    | _ => strEscapes d sl e
+  | .voiding e => strEscapesV d sl e
+  | .block _ stmts _ _ => strEscapesStmts (d + 1) sl stmts true
+  | .loop _ f b t w body =>
+    strEscapes d sl f || strEscapes d sl b
+      || (match t with | some e => strEscapes d sl e | none => false)
+      || (match w with | some e => strEscapes (d + 1) sl e | none => false)
+      || strEscapesV (d + 1) sl body
+  | _ => (childrenD c).any fun (k, ch) => strEscapes (d + k) sl ch
+
+partial def strEscapesV (d sl : Nat) (c : Core) : Bool :=
+  match strip c with
+  | .voiding e => strEscapesV d sl e
+  | .seq a b => strEscapesV d sl a || strEscapesV d sl b
+  | .assign dst src fl =>
+    match strip dst with
+    | .refCell dd ss =>
+      if dd == d && ss == sl then strEscapes d sl src else strEscapes d sl (.assign dst src fl)
+    | _ => strEscapes d sl (.assign dst src fl)
+  | .dyop op m1 m2 l r =>
+    match strip l with
+    | .refCell dd ss =>
+      if op == "+:=" && dd == d && ss == sl then strEscapes d sl r else strEscapes d sl (.dyop op m1 m2 l r)
+    | _ => strEscapes d sl (.dyop op m1 m2 l r)
+  | .cond a b e => strEscapes d sl a || strEscapesV d sl b || strEscapesV d sl e
+  | .block _ stmts _ _ => strEscapesStmts (d + 1) sl stmts false
+  | c' => strEscapes d sl c'
+
+partial def strEscapesStmts (d sl : Nat) (stmts : Array CoreStmt) (wantValue : Bool) : Bool := Id.run do
+  let vp := voidPositions stmts wantValue
+  for i in [0:stmts.size] do
+    let bad := match stmts[i]! with
+      | .decl _ _ init => strEscapes d sl init
+      | .unit e => if vp[i]! == true then strEscapesV d sl e else strEscapes d sl e
+      | .label _ | .exit => false
+    if bad then return true
+  return false
+end
+
 /-- The selector of a conformity clause that is an element of a promoted row of unions. -/
 def unionRowSel (env : List Frame) (sel : Core) : Option (RowVar × List CoreIdx) :=
   match strip sel with
@@ -1356,7 +1514,15 @@ def planFrame (tag : Nat) (size : Nat) (slotModes : Array (Option Mode))
             else
               rows := rows.push (some { name := s!"r{tag}_{i}", ty := .i64, dims := dims, umodes := cms, utys := tys })
           | _, _ => rows := rows.push none; all := false
-  return { vars := vars, rows := rows, pushed := others || !all }
+  -- a STRING variable used only through what a C buffer supports
+  let strs : Array (Option String) := (Array.range size).map fun i =>
+    if (vars[i]?.join).isNone && (rows[i]?.join).isNone && isStringMode tab (slotModes[i]?.join)
+        && strDecl stmts i && !seenElsewhere i && !strEscapesStmts 0 i stmts wantValue then
+      some s!"s{tag}_{i}"
+    else none
+  let allP := all || (List.range size).all fun i =>
+    (vars[i]?.join).isSome || (rows[i]?.join).isSome || (strs[i]?.join).isSome
+  return { vars := vars, rows := rows, strs := strs, pushed := others || !allP }
 
 def env : M (List Frame) := do return (← get).frames
 def rtd (d : Nat) : M Nat := do return rtDepthOf (← env) d
@@ -1674,6 +1840,37 @@ partial def genNative (k : Nat) (sg : NatSig) (body : Core) (outer : List Frame)
 
 /-- Emit code leaving the value of `c` on the operand stack. -/
 partial def gen (c : Core) : M Unit := do
+  -- a STRING kept in a C buffer, read as a whole or by subscript
+  if let some sv := strName (← env) c then
+    emit s!"a68_str_push(&{sv});"
+    return
+  match strip c with
+  | .deref e =>
+    match strip e with
+    | .slice base [.index a] true =>
+      match strip base with
+      | .refCell d s =>
+        if let some sv := strOf (← env) d s then
+          match strRead (← env) .u32 sv [.index a] with
+          | some x => emit s!"a68_v(a68rt_push_char({x}, W));"
+          | none => do
+            gen a
+            emit s!"a68_v(a68rt_push_char(a68_str_at(&{sv}, a68_pop_i()), W));"
+          return
+      | _ => pure ()
+    | _ => pure ()
+  | .slice base [.index a] false =>
+    match strip base with
+    | .loadCell d s =>
+      if let some sv := strOf (← env) d s then
+        match strRead (← env) .u32 sv [.index a] with
+        | some x => emit s!"a68_v(a68rt_push_char({x}, W));"
+        | none => do
+          gen a
+          emit s!"a68_v(a68rt_push_char(a68_str_at(&{sv}, a68_pop_i()), W));"
+        return
+    | _ => pure ()
+  | _ => pure ()
   -- an element of a row promoted to a C array, whatever its subscripts
   match c with
   | .deref (.slice base idx true) =>
@@ -1837,6 +2034,14 @@ partial def genVoid (c : Core) : M Unit := do
 /-- `x +:= e` in statement position: the variable or cell is updated in place, with
     nothing boxed and no reference built.  Returns whether it applied. -/
 partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : M Bool := do
+  -- `s +:= e` on a STRING kept in a C buffer
+  if op == "+:=" then
+    match strip l with
+    | .refCell dd ss =>
+      if let some sv := strOf (← env) dd ss then
+        genStrAppend sv r
+        return true
+    | _ => pure ()
   -- `a[i] +:= e` on a row promoted to a C array: the element, then the right operand, then
   -- the current value with its undefined test, as the evaluator reads them
   match strip l with
@@ -1922,6 +2127,13 @@ partial def appendTo (m1 : Mode) (lhs rhs : Core) : M Bool := do
 /-- `dest := <value>` written straight into its C variable or its cell, leaving nothing
     on the operand stack.  Returns whether it applied. -/
 partial def storeScalar (dst src : Core) : M Bool := do
+  -- a STRING kept in a C buffer
+  match strip dst with
+  | .refCell dd ss =>
+    if let some sv := strOf (← env) dd ss then
+      genStrStore sv src
+      return true
+  | _ => pure ()
   match strip dst with
   | .refCell dd ss =>
     match ← lvar dd ss with
@@ -1962,7 +2174,17 @@ partial def storeScalar (dst src : Core) : M Bool := do
               return true
             else return false
           | none => return false
-        | none => return false
+        | none =>
+          -- `p := next OF p` into a variable holding a REF: one call reads the field and
+          -- writes the cell.  A REF is never a row, so no bounds check is skipped.
+          match (ev[dd]?).bind (fun fr => (fr.modes[ss]?).join), strip src with
+          | some m, .deref sel =>
+            match Mode.resolve (← get).modeTab m, fieldChain ev sel with
+            | .ref _, some ch =>
+              emit s!"a68_v(a68rt_sel_store({← rtd dd}, {ss}, {ch.args}, W));"
+              return true
+            | _, _ => return false
+          | _, _ => return false
   | .slice base idx true =>
     -- `a[i] := <scalar>` writes the element in place
     match strip base with
@@ -2157,7 +2379,9 @@ partial def genLit (v : Value) : M Unit := do
   | .real x => emit s!"a68_v(a68rt_push_real({creal x}, W));"
   | .bool b => emit s!"a68_v(a68rt_push_bool({if b then 1 else 0}, W));"
   | .char c => emit s!"a68_v(a68rt_push_char({c}, W));"
-  | .bits b => emit s!"a68_v(a68rt_push_bits({b}ULL, W));"
+  | .bits b =>
+    if b < 2 ^ 64 then emit s!"a68_v(a68rt_push_bits({b}ULL, W));"
+    else emit s!"a68_v(a68rt_push_bigbits({← putStr (toString b)}, W));"
   | .void => emit "a68_v(a68rt_push_void(W));"
   | .nil => emit "a68_v(a68rt_push_nil(W));"
   | .undef => emit "a68_v(a68rt_push_undef(W));"
@@ -2257,6 +2481,10 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
         for k in [0:rv.fields.size] do
           emit s!"{(rv.fields[k]!).name} *{rv.name}_p{k} = NULL; uint8_t *{rv.name}_d{k} = NULL;"
       | _ => pure ()
+    for i in [0:size] do
+      match fr.strs[i]? with
+      | some (some sv) => emit ("a68_str " ++ sv ++ " = {0};")
+      | _ => pure ()
     if fr.pushed then emit s!"a68_v(a68rt_enter({size}, W));"
     modify fun st => { st with frames := { fr with procs := Array.replicate size none, modes := modes } :: st.frames }
     if onStack then emit "a68_v(a68rt_push_void(W));"
@@ -2281,9 +2509,10 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
               gen init
               emit (s!"{v} = {ty.popFn}();" ++ (if u then s!" {v}_i = 1;" else ""))
         | _ =>
-          match fr.rows[slot]? with
-          | some (some rv) => genRowDecl rv init
-          | _ =>
+          match fr.strs[slot]?, fr.rows[slot]? with
+          | some (some sv), _ => genStrStore sv init
+          | _, some (some rv) => genRowDecl rv init
+          | _, _ =>
             -- a routine text: its boxed function learns its parameter modes, and when it has a
             -- plain entry point that needs no environment, the table of entry points records
             -- it for calls through procedure parameters
@@ -2324,6 +2553,10 @@ partial def genBlockAt (size : Nat) (stmts : Array CoreStmt) (labelBase nLabels 
         emit s!"free({rv.name}_p); free({rv.name}_d);"
         for k in [0:rv.fields.size] do
           emit s!"free({rv.name}_p{k}); free({rv.name}_d{k});"
+      | _ => pure ()
+    for i in [0:size] do
+      match fr.strs[i]? with
+      | some (some sv) => emit s!"free({sv}.p);"
       | _ => pure ()
     -- a block with labels keeps its value on the stack even when a variable was asked for
     match dest with
@@ -2367,6 +2600,32 @@ partial def genConformity (sel : Core) (alts : List (Mode × Option Nat × Core)
     gen out
     emit "a68_v(a68rt_nip(W));"
   emit "}"
+
+/-- `s := e` into a STRING kept in a C buffer: a denotation or another buffer is copied in,
+    and anything else is computed as a value whose bytes and lower bound are taken. -/
+partial def genStrStore (sv : String) (src : Core) : M Unit := do
+  match strLit src with
+  | some bs => emit s!"a68_str_setn(&{sv}, {cbytes bs}, {bs.length}, 1);"
+  | none =>
+    match strName (← env) src with
+    | some o => if o == sv then pure () else emit s!"a68_str_setn(&{sv}, (const char*) {o}.p, {o}.n, {o}.l);"
+    | none => do gen src; emit s!"a68_str_pop(&{sv});"
+
+/-- `s +:= e` on a STRING kept in a C buffer.  Appending gives the string lower bound 1, as
+    the evaluator's concatenation does. -/
+partial def genStrAppend (sv : String) (src : Core) : M Unit := do
+  match strip src with
+  | .rowOf e =>
+    match scalarExpr (← env) .char e with
+    | some ce => emit s!"a68_str_addc(&{sv}, {ce});"
+    | none => do gen src; emit s!"a68_str_popadd(&{sv});"
+  | _ =>
+    match strLit src with
+    | some bs => emit s!"a68_str_addn(&{sv}, {cbytes bs}, {bs.length});"
+    | none =>
+      match strName (← env) src with
+      | some o => emit s!"a68_str_adds(&{sv}, &{o});"
+      | none => do gen src; emit s!"a68_str_popadd(&{sv});"
 
 /-- The head of the `switch` of an integer case clause.  A selector with a native value is
     switched on directly, and a value outside `1..n` falls to `default`, which is the
@@ -2594,6 +2853,7 @@ def prelude : String := "
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string.h>
 #include <math.h>
 
 #define W lean_io_mk_world()
@@ -2625,6 +2885,7 @@ lean_object* a68rt_stack_depth(lean_object* w);
 lean_object* a68rt_stack_truncate(uint32_t d, lean_object* w);
 lean_object* a68rt_push_int(int64_t v, lean_object* w);
 lean_object* a68rt_push_bigint(uint32_t i, lean_object* w);
+lean_object* a68rt_push_bigbits(uint32_t i, lean_object* w);
 lean_object* a68rt_push_real(double v, lean_object* w);
 lean_object* a68rt_push_bool(uint8_t v, lean_object* w);
 lean_object* a68rt_push_char(uint32_t v, lean_object* w);
@@ -2650,6 +2911,7 @@ lean_object* a68rt_dup(lean_object* w);
 lean_object* a68rt_pop_int(lean_object* w);
 lean_object* a68rt_pop_bool(lean_object* w);
 lean_object* a68rt_take_top(lean_object* w);
+lean_object* a68rt_undef_result(lean_object* w);
 lean_object* a68rt_deref(lean_object* w);
 lean_object* a68rt_deproc(lean_object* w);
 lean_object* a68rt_widen(uint32_t a, uint32_t b, lean_object* w);
@@ -2785,6 +3047,9 @@ lean_object* a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t r, int64_t i, i
    runtime.  Anything that does not fit the shape falls back to the general machinery. */
 lean_object* a68rt_sel_push(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 lean_object* a68rt_sel_int(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+lean_object* a68rt_cell_isnil(uint32_t d, uint32_t s, lean_object* w);
+lean_object* a68rt_sel_store(uint32_t dd, uint32_t ds, uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
+#define a68_isnil(d,s)  a68_u8(a68rt_cell_isnil(d, s, W))
 lean_object* a68rt_sel_real(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 lean_object* a68rt_sel_bool(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
 lean_object* a68rt_sel_char(uint32_t d, uint32_t s, uint32_t sp, int64_t i, int64_t j, uint32_t f, lean_object* w);
@@ -2823,6 +3088,8 @@ lean_object* a68rt_index_error(int64_t i, int64_t l, int64_t u, lean_object* w);
 lean_object* a68rt_cell_cproc(uint32_t d, uint32_t s, lean_object* w);
 lean_object* a68rt_heap_mark(lean_object* w);
 lean_object* a68rt_heap_release(uint32_t m, lean_object* w);
+lean_object* a68rt_push_bytes(lean_object* b, uint64_t l, lean_object* w);
+lean_object* a68rt_pop_bytes(lean_object* w);
 static int64_t  a68_und_i(void) { a68_v(a68rt_undef_error(0, W)); return 0; }
 static double   a68_und_r(void) { a68_v(a68rt_undef_error(1, W)); return 0.0; }
 static uint8_t  a68_und_b(void) { a68_v(a68rt_undef_error(2, W)); return 0; }
@@ -2853,6 +3120,66 @@ A68_AR(r, double, a68_und_r)
 A68_AR(b, uint8_t, a68_und_b)
 A68_AR(c, uint32_t, a68_und_c)
 A68_AR(u, uint64_t, a68_und_u)
+/* A STRING kept in a C buffer: its bytes, how many, the capacity, and its lower bound. */
+typedef struct { uint8_t* p; int64_t n, cap, l; } a68_str;
+static void a68_str_reserve(a68_str* s, int64_t n) {
+  if (n <= s->cap) return;
+  int64_t c = s->cap ? s->cap : 16;
+  while (c < n) c *= 2;
+  s->p = (uint8_t*) realloc(s->p, (size_t) c);
+  if (!s->p) exit(1);
+  s->cap = c;
+}
+static void a68_str_setn(a68_str* s, const char* b, int64_t n, int64_t l) {
+  a68_str_reserve(s, n);
+  if (n) memcpy(s->p, b, (size_t) n);
+  s->n = n; s->l = l;
+}
+static inline void a68_str_addc(a68_str* s, uint32_t c) {
+  if (s->n == s->cap) a68_str_reserve(s, s->n + 1);
+  s->p[s->n++] = (uint8_t) c; s->l = 1;
+}
+static void a68_str_addn(a68_str* s, const char* b, int64_t n) {
+  a68_str_reserve(s, s->n + n);
+  if (n) memcpy(s->p + s->n, b, (size_t) n);
+  s->n += n; s->l = 1;
+}
+static void a68_str_adds(a68_str* s, const a68_str* o) {
+  int64_t n = o->n;
+  a68_str_reserve(s, s->n + n);
+  if (n) memmove(s->p + s->n, o->p, (size_t) n);
+  s->n += n; s->l = 1;
+}
+static inline uint32_t a68_str_at(const a68_str* s, int64_t i) {
+  if (__builtin_expect(i < s->l || i > s->l + s->n - 1, 0)) a68_index_error(i, s->l, s->l + s->n - 1);
+  return s->p[i - s->l];
+}
+static int a68_str_cmp(const uint8_t* a, int64_t na, const uint8_t* b, int64_t nb) {
+  int64_t m = na < nb ? na : nb;
+  int r = m ? memcmp(a, b, (size_t) m) : 0;
+  if (r) return r < 0 ? -1 : 1;
+  return na < nb ? -1 : (na > nb ? 1 : 0);
+}
+static void a68_str_push(const a68_str* s) {
+  lean_object* b = lean_alloc_sarray(1, (size_t) s->n, (size_t) s->n);
+  if (s->n) memcpy(lean_sarray_cptr(b), s->p, (size_t) s->n);
+  a68_v(a68rt_push_bytes(b, (uint64_t) s->l, W));
+}
+static void a68_str_pop(a68_str* s) {
+  lean_object* b = a68_take(a68rt_pop_bytes(W));
+  size_t n = lean_sarray_size(b);
+  const uint8_t* q = lean_sarray_cptr(b);
+  uint64_t l = 0;
+  for (int k = 7; k >= 0; k--) l = (l << 8) | q[k];
+  a68_str_setn(s, (const char*) q + 8, (int64_t) n - 8, (int64_t) l);
+  lean_dec(b);
+}
+static void a68_str_popadd(a68_str* s) {
+  lean_object* b = a68_take(a68rt_pop_bytes(W));
+  size_t n = lean_sarray_size(b);
+  a68_str_addn(s, (const char*) lean_sarray_cptr(b) + 8, (int64_t) n - 8);
+  lean_dec(b);
+}
 
 #define A68_INT_MAX 2147483647LL
 
@@ -2985,7 +3312,7 @@ static inline uint32_t a68_repr(int64_t x) {
 
 /-- Emit the whole program. -/
 def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
-    (echoes : List String := []) : String := Id.run do
+    (echoes : List String := []) (srcName : String := "prog.a68") : String := Id.run do
   let (_, st) := (do
       let idx ← genFunction 0 0 core
       pure idx : M Nat).run { modeTab := modes }
@@ -3030,13 +3357,13 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   for i in [0:st.fns.size] do
     out := out ++ s!"    case {i}: a68_fn{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68_jump() ? a68rt_undef_result(lean_io_mk_world()) : a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   out := out ++ "lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_object* w) {\n"
   out := out ++ "  lean_inc(env);\n  a68_v(a68rt_env_set(env, W));\n  switch (idx) {\n"
   for i in [0:st.holes.size] do
     out := out ++ s!"    case {i}: a68_hole{i}(); break;\n"
   out := out ++ "    default: break;\n  }\n"
-  out := out ++ "  lean_object* r = a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
+  out := out ++ "  lean_object* r = a68_jump() ? a68rt_undef_result(lean_io_mk_world()) : a68rt_take_top(lean_io_mk_world());\n  a68_v(a68rt_env_restore(W));\n  return r;\n}\n\n"
   -- main
   out := out ++ "int main(int argc, char** argv) {\n"
   -- `PR echo` texts are printed when the program is read, before anything it prints
@@ -3048,7 +3375,11 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   out := out ++ "  if (lean_io_result_is_error(ir)) { a68_fail(ir); }\n  lean_dec_ref(ir);\n"
   out := out ++ "  lean_io_mark_end_initialization();\n  lean_init_task_manager();\n"
   out := out ++ "  lean_object* args = lean_mk_empty_array();\n"
-  out := out ++ "  for (int i = 0; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));\n"
+  -- the program sees the arguments a68g would give it: `a68g`, the source file, and then
+  -- the arguments the binary was run with, as `a68lean run` does
+  out := out ++ "  args = lean_array_push(args, lean_mk_string(\"a68g\"));\n"
+  out := out ++ "  args = lean_array_push(args, lean_mk_string(" ++ cstring srcName ++ "));\n"
+  out := out ++ "  for (int i = 1; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));\n"
   out := out ++ s!"  a68_set_state(a68_take(a68rt_boot(lean_mk_string(A68_BLOB), {ll}, {if regression then 1 else 0}, args, W)));\n"
   out := out ++ "  a68_fn0();\n"
   out := out ++ "  uint32_t rc = a68_u32(a68rt_finish(W));\n  return (int) rc;\n}\n"

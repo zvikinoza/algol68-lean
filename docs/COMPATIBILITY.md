@@ -16,10 +16,10 @@ re-implemented in Lean.
 * `INT` is 32-bit: `max int = 2147483647`; any result outside
   `[-max int, max int]` is the runtime error *INT value overflow*
   (so `-max int - 1` is an error, as in a68g).
-* `LONG INT` has 49 decimal digits and `LONG LONG INT` 84 (a68g's
-  multi-precision radix 10⁷ with 7 and 12 digit blocks); `PR precision N PR`
-  sets `LONG LONG` to `2 + ⌈N/7⌉` blocks. Arithmetic uses Lean's arbitrary
-  precision integers with range checks at these limits.
+* `LONG` and `LONG LONG` modes use a68g's own multi-precision arithmetic,
+  reproduced digit for digit in `A68.MP` (see below): `LONG INT` has 49 decimal
+  digits and `LONG LONG INT` 84 (radix 10⁷ with 7 and 12 digit blocks);
+  `PR precision N PR` sets `LONG LONG` to `2 + ⌈N/7⌉` blocks.
 * `REAL` is IEEE double. Every arithmetic operation and mathematical function
   checks its result: an infinity is *infinite REAL value*, a NaN is
   *REAL value is not a number*, and division by zero is an error.
@@ -33,6 +33,67 @@ re-implemented in Lean.
   of the standard operators (`LONG 1 + 1`, `1.5 + LONG 1`). User-defined
   operators receive only firm coercions (no widening), exactly as in a68g.
 * `SHORT` modes are identical to the base modes.
+* `COMPL` multiplication, division and `**` use a68g's own expressions, and its
+  complex functions (`complex sqrt`, `complex arctanh`, …) call the C library as
+  a68g does. The C compiler a68g was built with fuses a multiplication and an
+  addition inside one expression into a single operation, which changes the last
+  bits of a result (the imaginary part of a root of `3x² + 4x + 5` put back into
+  the polynomial is `2.5e-17` in a68g, not 0). Those expressions therefore live in
+  `csrc/sys.c`, compiled the same way, rather than in Lean, whose floating-point
+  operations are never fused.
+* `LONG BITS` and `LONG LONG BITS` are multi-precision numbers in this build, 162 and
+  279 bits wide (`MP_BITS_WIDTH`). `LENG` of a `BITS` goes through `int_to_mp`, which
+  reads the bits as an `INT`: a value with its top bit set becomes that `INT` plus 2³²,
+  kept to as many radix-10⁷ digits as the `INT`'s magnitude has, so `LENG NOT BIN 0`
+  is 4967295.
+
+## LONG and LONG LONG arithmetic
+
+This a68g build is "level 2" (clang, no 128-bit integer or floating types, no
+MPFR), so `LONG REAL`, `LONG LONG REAL`, `LONG INT`, `LONG LONG INT` and the
+`COMPLEX` modes built on them are all a68g's multi-precision numbers (`mp.c`):
+a status word, an exponent and digits in radix 10⁷, of which `LONG` modes have 7
+and `LONG LONG` modes 12 (`2 + ⌈p/7⌉` after `PR precision p PR`). `long real
+width` is 42, `long long real width` 70, `long max real` is `1e+999999`,
+`long small real` is `1e-42`, and exponents beyond ±142857 radix digits are the
+error *multiprecision value out of bounds*.
+
+`A68.MP`, `A68.MPMath` and `A68.MPFmt` re-implement a68g's routines step by
+step rather than computing correctly rounded results, because a68g's are not:
+
+* every operation works on a scratch number two digits longer, normalises, and
+  rounds back with the "Gaussian" rounding as `mp.c` writes it (a half-way digit
+  adds one to an odd digit and two to an even one);
+* guard digits beyond the precision an operation is asked to use are left in
+  place, and later operations read them (e.g. `sqrt_mp` rounds with the guard
+  digits of an earlier `rec_mp`);
+* digits are C doubles; the only inexact double arithmetic, the quotient-digit
+  estimates of `div_mp` and `div_mp_digit` (which clang compiled to `fmadd`), is
+  reproduced exactly with integer arithmetic;
+* the elementary functions follow `mp-math.c` and `mp-pi.c`: Newton iterations
+  seeded with the C library's `sqrt`, `cbrt`, `log`, `atan`, Taylor series with
+  a68g's stopping rule, argument reduction by halving (`exp`) and thirds (`sin`),
+  and a68g's caches, which make results depend on history: π and its derived
+  constants are kept at the precision of the request that needed most digits and
+  truncated for later requests, ln 10⁷ and ln 10 are kept and rounded on each use;
+* formatting of long values (`print`, `whole`, `fixed`, `float`, general
+  patterns) is done with multi-precision arithmetic at the value's own precision,
+  as `transput-formatting.c` does, so digits are rounded where a68g rounds them;
+* `LONG INT` values are exact integers here: their sums, differences and
+  products are exact in a68g too and checked against the same range, while
+  `OVER`, `MOD` and `**` go through a68g's real division and power;
+* conversions: `LENG` and the widening of a `REAL` use `real_to_mp` (21
+  significant digits from a floating-point loop), an `INT` widens exactly,
+  `SHORTEN` of a `LONG INT` wraps as `mp_to_int`'s 32-bit weights do
+  (`SHORTEN LONG 100000000000000` is `276447232`), and a REAL denotation that is
+  widened — in a strong position, or as the operand of a standard operator —
+  is read again at the longer precision (`LONG 1.0 + 1.1` is exactly 2.1, while
+  `-1.1` widened is not, being a formula);
+* `LONG INT ** LONG INT` has no operator of its own in a68g, so both operands
+  widen to `LONG REAL`.
+
+Differential testing of about 12,000 random `LONG`/`LONG LONG` operations,
+functions, conversions and formatting calls agrees with a68g on every output.
 
 ## Printing numbers
 
@@ -161,7 +222,12 @@ reported separately by the test scripts.
 
 * Uninitialised `INT`, `REAL`, `BOOL`, `CHAR` values raise a runtime error
   when used; uninitialised `STRING`s are empty; copying a struct with
-  uninitialised fields is allowed.
+  uninitialised fields is allowed.  A union never given a value, or given `SKIP`,
+  can be copied and passed, and a conformity clause takes none of its alternatives.
+* `dpi`, `qsqrt` and the other short names a68g gives the `LONG` and `LONG LONG`
+  routines and constants are known.
+* An exponent is read with blanks after `e` and after its sign, as a68g writes it
+  (`+2.9e -51`).
 * `p IS NIL` never dereferences the variable `p` (a name is never `NIL`).
 * Row assignment to a non-`FLEX` name requires identical bounds.
 * `~` is `NOT` before an operand and `SKIP` otherwise; `~=` is `/=`;
@@ -174,11 +240,14 @@ reported separately by the test scripts.
 
 ## Known differences
 
-* **`LONG REAL` / `LONG LONG REAL`** are IEEE doubles here but 42/70-digit
-  multi-precision numbers in a68g. Programs that print such values with more
-  than about 15 significant digits differ.
-* **`LONG INT` printed through `fixed`/`float`** uses the double conversion
-  above for `INT` but exact conversion for `LONG INT`, as a68g does.
+* **`LONG INT` division by zero** gives an infinite `LONG INT` in a68g, which
+  a68g then cannot print (it loops); here it is a run-time error. Likewise
+  `ENTIER` of an infinite `LONG REAL` hangs a68g and is an error here.
+* **Long values in numeric patterns** (`$-d.3d$` and the like) are formatted
+  from their exact decimal value; a68g lengthens them to `LONG LONG` precision
+  first, which agrees except where rounding at 84 digits would carry.
+* **`long erf`, `long gamma`** and the `pi`-scaled functions (`long sinpi`, …) are
+  not provided. The `LONG COMPLEX` functions are, following `mp-complex.c`.
 * **Unsupported a68g extensions**: `UP` and `DOWN` on semaphores, `sound`, curses,
   plotutils, GSL, MPFR, R mathlib, sockets, `http content`, and the `PIPE` mode
   indicant (the values `execve child pipe` yields can be used, but `PIPE` cannot be
@@ -207,8 +276,11 @@ reported separately by the test scripts.
   is right: a display has no a priori mode, so it cannot be the operand of a
   union coercion. This can only affect programs a68g refuses outright, so it
   cannot change the output of a program a68g accepts.
-* **`COMPL` division** has no reference behaviour to match: a68g 3.13.3 stops
-  with a memory access violation on `z / w` and `z /:= w` for complex `z` and
-  `w`, whatever their values. a68lean divides, and reports a zero divisor.
+* **Running out of memory.** a68g's heap has a fixed size, and a program that
+  outgrows it stops with *not enough memory* after printing what it had printed.
+  Here memory grows until the system refuses it, so such a program keeps running
+  (a random program that triples a string 36 times is the case the fuzzer found).
+  Where a68g stops depends on its garbage collector's accounting, which is not
+  reproduced.
 * **Runtime error messages** are not byte-identical; only standard output
   and the non-zero exit status are.

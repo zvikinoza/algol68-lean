@@ -1,0 +1,12 @@
+# a68g's LONG and LONG LONG COMPLEX functions (mp-complex.c), digit for digit #
+LONG COMPL z = LONG 1.5 I LONG 0.75;
+print((long complex sqrt(z), newline, long complex exp(z), newline, long complex ln(z), newline));
+print((long complex sin(z), newline, long complex cos(z), newline, long complex tan(z), newline));
+print((long complex arcsin(z), newline, long complex arccos(z), newline, long complex arctan(z), newline));
+print((long complex sinh(z), newline, long complex cosh(z), newline, long complex tanh(z), newline));
+print((long complex arcsinh(z), newline, long complex arccosh(z), newline, long complex arctanh(z), newline));
+LONG COMPL w = -LONG 2.0 I -LONG 0.5;
+print((long complex sqrt(w), newline, long complex ln(w), newline, long complex arctan(w), newline));
+LONG LONG COMPL u = LONG LONG 0.3 I LONG LONG 1.25;
+print((long long complex sqrt(u), newline, long long complex exp(u), newline, long long complex sin(u), newline));
+print((long long complex arccos(u), newline, long long complex arctanh(u), newline))

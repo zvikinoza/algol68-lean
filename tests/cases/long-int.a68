@@ -1,0 +1,13 @@
+# LONG INT and LONG LONG INT: exact sums and products, OVER and MOD through the MP division #
+LONG INT a = 355, b = 113;
+print((a + b, a - b, a * b, newline));
+print((a % b, a %* b, -a % b, -a %* b, a % -b, a %* -b, newline));
+print((a ** 3, LONG 2 ** 150, newline));
+print((a / b, newline, a ** b, newline));
+LONG LONG INT f := 1; FOR i TO 60 DO f *:= i OD; print((f, newline));
+print((whole(f, 0), newline, fixed(a, 12, 3), newline, float(f, 30, 20, 4), newline));
+print((long max int, newline, long long max int, newline));
+print((ODD a, ABS -a, SIGN -a, SHORTEN a, LENG 7, newline));
+print((SHORTEN LONG 100000000000000, newline));
+LONG INT big = long max int; print((big % LONG 7, big %* LONG 7, big % LONG 123456789, newline));
+LONG LONG INT g = long long max int; print((g % LONG LONG 1000000007, g %* LONG LONG 1000000007, newline))

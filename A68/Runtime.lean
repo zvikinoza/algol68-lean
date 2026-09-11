@@ -250,6 +250,11 @@ def pushBigInt (i : UInt32) : IO Unit := go do
   push (.int (if s.startsWith "-" then -((String.ofList (s.toList.drop 1)).toNat! : Int)
               else (s.toNat! : Int)))
 
+/-- A BITS denotation wider than 64 bits, from its decimal digits. -/
+@[export a68rt_push_bigbits]
+def pushBigBits (i : UInt32) : IO Unit := go do
+  push (.bits (← str i).toNat!)
+
 @[export a68rt_push_real]
 def pushReal (v : Float) : IO Unit := go (push (.real v))
 
@@ -340,6 +345,11 @@ def takeTop : IO Value := do
   match st.back? with
   | some v => (← state).stack.set st.pop; pure v
   | none => throw (IO.userError "operand stack underflow")
+
+/-- The result of a compiled procedure that left by a jump: it pushed none, and the value is
+    never used, since the caller goes to the label. -/
+@[export a68rt_undef_result]
+def undefResult : IO Value := pure .undef
 
 @[export a68rt_push_array]
 def pushArray (a : Array Value) : IO Unit := go do
@@ -658,6 +668,25 @@ def selPush (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Unit
   | .undef => die "attempt to use an uninitialised value"
   | v => push v
 
+/-- `p IS NIL` on the value a cell holds: 1 for NIL, 0 for a name.  Reading the cell reports
+    an uninitialised value, as the evaluator's read of the variable does. -/
+@[export a68rt_cell_isnil]
+def cellIsNil (depth slot : UInt32) : IO UInt8 := do
+  let c ← cellOf depth slot
+  match (← run (Interp.readCell c) .undef) with
+  | .nil => return 1
+  | .undef => die "attempt to use an uninitialised value"
+  | _ => return 0
+
+/-- `x := f OF … OF y` into a variable holding a REF: the selection is read and the cell
+    written in one step, with the test for an uninitialised value the assignment makes. -/
+@[export a68rt_sel_store]
+def selStore (dd ds depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Unit := go do
+  let c ← cellOf depth slot
+  match (← run (selRead c spec i j fields) .undef) with
+  | .undef => die "attempt to use an uninitialised value"
+  | v => run (Interp.writeCell (← cellOf dd ds) v) ()
+
 @[export a68rt_sel_int]
 def selInt (depth slot spec : UInt32) (i j : Int64) (fields : UInt32) : IO Int64 := do
   let c ← cellOf depth slot
@@ -751,6 +780,36 @@ def appendTop (depth slot : UInt32) : IO Unit := go do
     match (← Interp.appendInPlace (.ref c []) v) with
     | some _ => pure ()
     | none => appendFallback c v) ()
+
+/-- A STRING that compiled code keeps in a C buffer, made a value again: a row of its bytes
+    whose lower bound is `l`, a two's complement 64-bit integer. -/
+@[export a68rt_push_bytes]
+def pushBytes (b : ByteArray) (l : UInt64) : IO Unit := go do
+  let lw : Int := if l.toNat ≥ 2 ^ 63 then (l.toNat : Int) - 2 ^ 64 else l.toNat
+  let es : Array Value := b.data.map fun x => .char x.toNat
+  push (.row #[lw] #[lw + es.size - 1] es)
+
+/-- The STRING on top of the operand stack as the contents of a C buffer: eight bytes of its
+    lower bound, least significant first, then its characters. -/
+@[export a68rt_pop_bytes]
+def popBytes : IO ByteArray :=
+  val (do
+    let v ← pop
+    let (l, es) ← match v with
+      | .row l _ es => if l.size == 1 then pure (l[0]!, es) else throw (IO.userError "STRING expected")
+      | .char c => pure ((1 : Int), #[Value.char c])
+      | .undef => die "attempt to use an uninitialised value"
+      | _ => throw (IO.userError "STRING expected")
+    let lw : Nat := if l < 0 then (l + 2 ^ 64).toNat else l.toNat
+    let mut out := ByteArray.empty
+    for k in [0:8] do
+      out := out.push (UInt8.ofNat (lw / 256 ^ k % 256))
+    for e in es do
+      match e with
+      | .char c => out := out.push (UInt8.ofNat c)
+      | .undef => die "attempt to use an uninitialised CHAR value"
+      | _ => throw (IO.userError "CHAR expected")
+    return out) ByteArray.empty
 
 /-- A promoted C variable read before it was assigned. -/
 @[export a68rt_undef_error]
