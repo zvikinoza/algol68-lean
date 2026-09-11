@@ -466,20 +466,22 @@ def mpDyadic (op : String) (n : Int) (x y : MP.MP) : M Value := do
     on 40,000 random and near-multiple pairs at 7 and 12 digits, so the exact integer
     operations are used (the multi-precision ones cost a division each). -/
 def longIntDyadic (op : String) (n : Int) (x y : Int) : M Value := do
-  let lim := Numfmt.maxIntOf n (← llDigits)
-  let mn := Mode.toString (.int n)
+  -- the limit 10^(7·digits) - 1 is built only when a result is range-checked (under
+  -- `PR precision` it is a power of hundreds of digits), and the mode's name only when
+  -- an error is reported: this is on the path of every LONG INT operation
   let chk (r : Int) : M Value := do
-    if r.natAbs > lim.natAbs then rtErr s!"{mn} value out of bounds"
+    let lim := Numfmt.maxIntOf n (← llDigits)
+    if r.natAbs > lim.natAbs then rtErr s!"{Mode.toString (.int n)} value out of bounds"
     return .int r
   match op with
   | "+" => chk (x + y)
   | "-" => chk (x - y)
   | "*" => chk (x * y)
   | "%" =>
-    if y == 0 then rtErr s!"{mn} division by zero"
+    if y == 0 then rtErr s!"{Mode.toString (.int n)} division by zero"
     return .int (Int.tdiv x y)
   | "%*" =>
-    if y == 0 then rtErr s!"{mn} value is not a number"
+    if y == 0 then rtErr s!"{Mode.toString (.int n)} value is not a number"
     return .int (Int.emod x y.natAbs)
   | "=" => return .bool (x == y)
   | "/=" => return .bool (x != y)
@@ -487,7 +489,7 @@ def longIntDyadic (op : String) (n : Int) (x y : Int) : M Value := do
   | "<=" => return .bool (x ≤ y)
   | ">" => return .bool (x > y)
   | ">=" => return .bool (x ≥ y)
-  | _ => rtErr s!"internal: {mn} operator {op}"
+  | _ => rtErr s!"internal: {Mode.toString (.int n)} operator {op}"
 
 /-- `LONG INT ** INT` (`genie_pow_mp_int_int`).  a68g squares and multiplies at two guard
     digits and then tests the range; every square it multiplies in is at most the result,
