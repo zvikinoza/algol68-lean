@@ -201,6 +201,16 @@ def enterArgs (size nargs : UInt32) : IO Unit := go do
   rt.heap.set heap
   (← state).envs.modify (·.push frame)
 
+/-- The heap's current size, taken on entry to a routine whose cells can be given back. -/
+@[export a68rt_heap_mark]
+def heapMark : IO UInt32 := val (do return UInt32.ofNat (← (← getRt).heap.get).size) 0
+
+/-- Give back every cell allocated since the mark.  Compiled code calls this only when the
+    routine that took the mark can leave none of them reachable. -/
+@[export a68rt_heap_release]
+def heapRelease (m : UInt32) : IO Unit := go do
+  (← getRt).heap.modify fun h => if m.toNat < h.size then h.shrink m.toNat else h
+
 @[export a68rt_leave]
 def leave : IO Unit := go do ((← state).envs.modify (·.pop))
 

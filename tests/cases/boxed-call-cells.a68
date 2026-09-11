@@ -1,0 +1,36 @@
+# Boxed routine calls, some of whose cells the C back end gives back when they return  #
+# and some it must not: a routine that stores a generated name outside itself, one     #
+# that returns a heap name, one that returns a procedure, one that reads into a local  #
+# through a name, and one left by a jump.  All must behave exactly as the evaluator.   #
+BEGIN
+  PROC weigh = (STRING s, INT k) INT: (UPB s * 3 + k) MOD 1000003;
+  PROC tally = ([] INT row, INT k) INT: (row[1] + row[UPB row] + k) MOD 1000003;
+  PROC label = (STRING s) STRING: s + "!";
+  REF INT kept := NIL;
+  PROC keep = (INT v) INT: (kept := HEAP INT := v * 2; v);
+  PROC fresh = (INT v) REF INT: HEAP INT := v + 1;
+  PROC adder = (INT n) PROC (INT) INT: (INT x) INT: x + 1;
+  PROC bump = (REF INT r) VOID: r +:= 1;
+  PROC counted = (STRING s) INT: (INT c := 0; bump(c); bump(c); c + UPB s);
+  STRING word := "algol";
+  [3] INT r := (1, 2, 3);
+  INT acc := 0;
+  FOR i TO 20000 DO acc := (acc + weigh(word, i) + tally(r, i)) MOD 1000003 OD;
+  print((acc, newline));
+  STRING s := "";
+  FOR i TO 3 DO s := label(s + "x") OD;
+  print((s, newline));
+  FOR i TO 5 DO acc +:= keep(i) OD;
+  print((acc, kept, newline));
+  REF INT a = fresh(10), b = fresh(20);
+  print((a, b, newline));
+  PROC (INT) INT inc = adder(5);
+  print((inc(41), newline));
+  print((counted("abc"), counted(word), newline));
+  PROC leave = (STRING t) INT: IF UPB t > 3 THEN GO TO out ELSE UPB t FI;
+  INT total := 0;
+  FOR i TO 6 DO total +:= leave(word[1:i]) OD;
+  print(("not reached", newline));
+out:
+  print((total, newline))
+END

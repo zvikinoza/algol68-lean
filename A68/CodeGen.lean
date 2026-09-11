@@ -1081,6 +1081,64 @@ partial def srowEscapesStmts (tys : Array CTy) (d sl dims : Nat) (stmts : Array 
   return false
 end
 
+/-- Is this an assigning operator, whose left operand is a name it writes through? -/
+def isAssignOpName (op : String) : Bool :=
+  ["+:=", "-:=", "*:=", "/:=", "%:=", "%*:=", "&:=", "|:="].contains op
+
+/-- A name built from a frame cell by subscripts and field selections: `x`, `a[i]`,
+    `f OF a[i]`.  Read at once or written through, such a name creates no reference that
+    outlives the statement. -/
+partial def cellName : Core → Bool
+  | .at _ e => cellName e
+  | .refCell _ _ => true
+  | .slice b _ true => cellName b
+  | .select _ b true => cellName b
+  | _ => false
+
+mutual
+/-- Could anything in `c` let a cell allocated during a routine call outlive the call?  A
+    generator; a routine or format text, which captures the environment; a call of anything
+    but a standard procedure, which could do either; or a reference to a local cell used as a
+    value, which could be stored or returned.  A name read at once, or written through by an
+    assignment or an assigning operator, is not such a reference. -/
+partial def cellsEscape (c : Core) : Bool :=
+  match c with
+  | .at _ e => cellsEscape e
+  | .gen _ | .routine _ _ _ | .fmt _ => true
+  | .refCell _ _ => true
+  | .slice _ _ true | .select _ _ true => if cellName c then true else subEscape c
+  | .deref e => if cellName e then nameIdxEscape e else cellsEscape e
+  | .assign dst src _ =>
+    (if cellName dst then nameIdxEscape dst else cellsEscape dst) || cellsEscape src
+  | .dyop op _ _ l r =>
+    (if isAssignOpName op && cellName l then nameIdxEscape l else cellsEscape l) || cellsEscape r
+  | .call f args =>
+    (match strip f with | .lit (.builtin _) => false | _ => true) || args.any cellsEscape
+  | _ => subEscape c
+
+partial def subEscape (c : Core) : Bool := (childrenD c).any fun (_, ch) => cellsEscape ch
+
+/-- The subscripts inside a name, which are ordinary expressions. -/
+partial def nameIdxEscape : Core → Bool
+  | .at _ e => nameIdxEscape e
+  | .refCell _ _ => false
+  | .slice b idx true => nameIdxEscape b || idx.any fun
+      | .index e => cellsEscape e
+      | .trim l u a => (l.toList ++ u.toList ++ a.toList).any cellsEscape
+  | .select _ b true => nameIdxEscape b
+  | e => cellsEscape e
+end
+
+/-- Can a value of this mode hold a reference to a cell, or an environment? -/
+partial def modeHoldsNames (tab : Mode.Table) (m : Mode) (fuel : Nat := 16) : Bool :=
+  if fuel == 0 then true else
+  match Mode.resolve tab m with
+  | .ref _ | .proc _ _ | .format | .file | .channel | .sema | .simplin | .named _ => true
+  | .row _ _ e => modeHoldsNames tab e (fuel - 1)
+  | .struct fs => fs.any fun (_, fm) => modeHoldsNames tab fm (fuel - 1)
+  | .union ms => ms.any fun mm => modeHoldsNames tab mm (fuel - 1)
+  | _ => false
+
 /-- Which of a frame's slots can become C variables.  A slot qualifies when its declared
     mode is primitive and nothing inside the frame needs it to live in a cell.  If no
     routine text or format text occurs in the body — those compile to separate C functions
@@ -2157,11 +2215,19 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   let pmodes : Array (Option Mode) := match s.procMode with
     | some (.proc ps _) => (Array.range frameSize).map fun i => ps[i]?
     | _ => #[]
+  -- A declared routine whose call cannot leave anything allocated during it reachable gives
+  -- its cells back when it returns normally.  Without this, every boxed call adds its
+  -- frame to a heap that only grows.  A jump out of the routine skips the release.
+  let reclaim : Bool := match s.procMode with
+    | some (.proc _ r) => !modeHoldsNames s.modeTab r && !cellsEscape body
+    | _ => false
   modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;", procMode := none }
+  if reclaim then emit "uint32_t a68_hm = a68_u32(a68rt_heap_mark(W));"
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
   modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pushed := true }] }
   gen body
   emit "a68_v(a68rt_leave(W));"
+  if reclaim then emit "a68_v(a68rt_heap_release(a68_hm, W));"
   let st ← get
   let lines := st.cur
   let f : Fn := { name := s!"a68_fn{idx}", body := lines }
@@ -2433,6 +2499,8 @@ lean_object* a68rt_append(uint32_t d, uint32_t s, lean_object* w);
    would have reported for an uninitialised cell of that mode. */
 lean_object* a68rt_index_error(int64_t i, int64_t l, int64_t u, lean_object* w);
 lean_object* a68rt_cell_cproc(uint32_t d, uint32_t s, lean_object* w);
+lean_object* a68rt_heap_mark(lean_object* w);
+lean_object* a68rt_heap_release(uint32_t m, lean_object* w);
 static int64_t  a68_und_i(void) { a68_v(a68rt_undef_error(0, W)); return 0; }
 static double   a68_und_r(void) { a68_v(a68rt_undef_error(1, W)); return 0.0; }
 static uint8_t  a68_und_b(void) { a68_v(a68rt_undef_error(2, W)); return 0; }
