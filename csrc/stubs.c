@@ -80,3 +80,4 @@ __attribute__((weak)) lean_object* a68c_field(uint64_t a, uint32_t o, uint32_t i
 __attribute__((weak)) lean_object* a68c_elem(uint64_t a, uint32_t o, uint32_t i, lean_object* w) { (void) a; (void) o; (void) i; (void) w; A68_NO_C_MEMORY("a68c_elem") }
 __attribute__((weak)) lean_object* a68c_call(uint32_t fn, uint32_t np, uint64_t fr, lean_object* b, uint32_t n, lean_object* w) { (void) fn; (void) np; (void) fr; (void) b; (void) n; (void) w; A68_NO_C_MEMORY("a68c_call") }
 __attribute__((weak)) lean_object* a68c_hole(uint32_t fn, uint32_t idx, uint64_t fr, lean_object* w) { (void) fn; (void) idx; (void) fr; (void) w; A68_NO_C_MEMORY("a68c_hole") }
+__attribute__((weak)) lean_object* a68c_gc(uint32_t what, lean_object* w) { (void) what; (void) w; return lean_io_result_mk_ok(lean_box_float(0.0)); }

@@ -1,0 +1,33 @@
+# Heap churn: many short-lived HEAP objects, rows and strings, with a small live set. #
+# Under the collector the program runs in bounded memory; its output does not depend #
+# on collection at all.                                                              #
+BEGIN
+  MODE NODE = STRUCT (INT val, REF NODE next);
+  INT total := 0;
+  FOR round TO 40 DO
+    REF NODE head := NIL;
+    FOR i TO 2000 DO head := HEAP NODE := ((i * round) MOD 1009, head) OD;
+    REF NODE p := head;
+    INT n := 0;
+    WHILE p ISNT REF NODE (NIL) DO n +:= val OF p; p := next OF p OD;
+    total := (total + n) MOD 1000003;
+    [1:500] INT a;
+    FOR i TO 500 DO a[i] := i * round OD;
+    [] INT w = a[100:200];
+    STRING s := "";
+    FOR i TO 300 DO s +:= REPR (ABS "a" + (i + round) MOD 26) OD;
+    total := (total + w[50] + UPB s + ABS s[7]) MOD 1000003
+  OD;
+  print((total, newline));
+  # a live structure that must survive every collection #
+  REF NODE keep := NIL;
+  FOR i TO 3000 DO keep := HEAP NODE := (i, keep) OD;
+  FOR round TO 20 DO
+    STRING junk := "";
+    FOR i TO 2000 DO junk +:= "x" OD
+  OD;
+  INT c := 0;
+  REF NODE q := keep;
+  WHILE q ISNT REF NODE (NIL) DO c +:= 1; q := next OF q OD;
+  print((c, newline))
+END

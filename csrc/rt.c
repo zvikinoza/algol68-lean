@@ -65,7 +65,7 @@ struct a68_obj {
   uint16_t ek;      /* leaf: element tag (T_INT … T_BITS) or EK_BYTES */
   uint32_t n;       /* slots: slot count; leaf: element count; rowd: dimensions; frame: cells */
   uint32_t rc;      /* store: descriptors sharing it (copy-on-write); others unused */
-  uint32_t pad;
+  uint32_t size;    /* bytes, header included */
   a68_obj* next;    /* every object, for the sweep */
 };
 
@@ -78,7 +78,20 @@ typedef struct a68_frame { a68_obj h; struct a68_frame* parent; uint32_t depth; 
 #define VIEW_OFF 0xffffffffu        /* a REF whose target is the row a view describes */
 
 static a68_obj* all_objects = NULL;
-static uint64_t bytes_allocated = 0;
+static uint64_t bytes_allocated = 0;      /* since the last collection */
+static uint64_t bytes_live = 0;           /* after the last collection */
+static int gc_wanted = 0;                 /* set by allocation, acted on at the next safe point */
+
+/* The collector's modes (`A68LEAN_GC`): `off`, `stress` (collect at every safe point),
+   `verify` (never reuse freed memory; check after every collection that nothing reachable
+   was freed) and `stats` (report at exit).  `A68LEAN_HEAP` limits the live bytes. */
+static int gc_off = 0, gc_stress = 0, gc_verify = 0, gc_stats = 0;
+static uint64_t gc_limit = 0;
+static uint64_t gc_min_between = 8u << 20;
+static uint64_t gc_collections = 0, gc_freed_bytes = 0, gc_peak_live = 0;
+static double gc_seconds = 0.0;
+static void gc_collect(void);
+#define GC_POLL() do { if (__builtin_expect(gc_wanted, 0)) gc_collect(); } while (0)
 
 static void* xmalloc(size_t n) {
   void* p = calloc(1, n ? n : 1);
@@ -89,9 +102,11 @@ static void* xmalloc(size_t n) {
 static a68_obj* obj_alloc(uint8_t kind, size_t size) {
   a68_obj* o = (a68_obj*) xmalloc(size);
   o->kind = kind;
+  o->size = (uint32_t) size;
   o->next = all_objects;
   all_objects = o;
   bytes_allocated += size;
+  if (!gc_off && (gc_stress || bytes_allocated > gc_min_between + 2 * bytes_live)) gc_wanted = 1;
   return o;
 }
 
@@ -185,6 +200,22 @@ __attribute__((noreturn)) static void dief(const char* fmt, int64_t a, int64_t b
   char buf[256];
   snprintf(buf, sizeof buf, fmt, (long long) a, (long long) b, (long long) c);
   die(buf);
+}
+
+/* Objects the Lean side keeps beyond a call — the name an `associate`d file writes, the
+   routine an `on logical file end` calls — are pinned for the rest of the run. */
+static a68_obj** pins = NULL;
+static size_t npins = 0, pins_cap = 0;
+
+static void pin(a68_obj* o) {
+  if (!o) return;
+  for (size_t i = 0; i < npins; i++) if (pins[i] == o) return;
+  if (npins == pins_cap) {
+    pins_cap = pins_cap ? pins_cap * 2 : 64;
+    pins = (a68_obj**) realloc(pins, pins_cap * sizeof(a68_obj*));
+    if (!pins) { fprintf(stderr, "a68lean: out of memory\n"); exit(1); }
+  }
+  pins[npins++] = o;
 }
 
 /* ---------------------------------------------------------------- tables */
@@ -751,6 +782,138 @@ static void trim_error(int64_t lo, int64_t hi, int64_t l, int64_t u) {
   die(buf);
 }
 
+/* ---------------------------------------------------------------- the collector */
+/*
+   Mark–sweep, non-moving (docs/GC-DESIGN.md §4).  Marking is a worklist over objects: a
+   SLOTS or FRAME object contributes each slot whose tag says pointer (and a frame its
+   parent), a ROWD its base, a LEAF nothing.  The roots are the operand stack, the frame
+   chain, the saved environments and the pins.  Sweeping frees every unmarked object, after
+   dropping its share of a store that stays alive.  The C functions here transcribe
+   `A68.Verified.GC`: `gc_mark` is `markAll`, `gc_sweep` is `sweep`. */
+
+static a68_obj** worklist = NULL;
+static size_t nwork = 0, work_cap = 0;
+
+static inline void gc_push_obj(a68_obj* o) {
+  if (!o || o->mark) return;
+  o->mark = 1;
+  if (nwork == work_cap) {
+    work_cap = work_cap ? work_cap * 2 : 4096;
+    worklist = (a68_obj**) realloc(worklist, work_cap * sizeof(a68_obj*));
+    if (!worklist) { fprintf(stderr, "a68lean: out of memory\n"); exit(1); }
+  }
+  worklist[nwork++] = o;
+}
+
+static inline void gc_push_val(const a68_val* v) {
+  if (tag_is_ptr(v->tag)) gc_push_obj(v->v.p);
+}
+
+static void gc_mark(void) {
+  nwork = 0;
+  for (size_t i = 0; i < sp; i++) gc_push_val(&stack[i]);
+  gc_push_obj((a68_obj*) env);
+  for (size_t i = 0; i < nsaved; i++) gc_push_obj((a68_obj*) saved[i]);
+  for (size_t i = 0; i < npins; i++) gc_push_obj(pins[i]);
+  while (nwork) {
+    a68_obj* o = worklist[--nwork];
+    switch (o->kind) {
+      case K_SLOTS: { a68_slots* s = (a68_slots*) o; for (uint32_t i = 0; i < o->n; i++) gc_push_val(&s->s[i]); break; }
+      case K_FRAME: { a68_frame* f = (a68_frame*) o; gc_push_obj((a68_obj*) f->parent); for (uint32_t i = 0; i < o->n; i++) gc_push_val(&f->c[i]); break; }
+      case K_ROWD: gc_push_obj(((a68_rowd*) o)->base); break;
+      default: break;
+    }
+  }
+}
+
+enum { K_FREED = 0xee };
+
+static void gc_sweep(void) {
+  /* a dead descriptor gives back its share of a store that survives */
+  for (a68_obj* o = all_objects; o; o = o->next)
+    if (!o->mark && o->kind == K_ROWD) {
+      a68_obj* b = ((a68_rowd*) o)->base;
+      if (b && b->mark && b->kind != K_ROWD && b->rc > 0) b->rc--;
+    }
+  a68_obj** link = &all_objects;
+  uint64_t live = 0;
+  while (*link) {
+    a68_obj* o = *link;
+    if (o->mark) { o->mark = 0; live += o->size; link = &o->next; continue; }
+    *link = o->next;
+    gc_freed_bytes += o->size;
+    if (gc_verify) { o->kind = K_FREED; o->next = NULL; }   /* kept, poisoned, never reused */
+    else free(o);
+  }
+  bytes_live = live;
+}
+
+/* In verify mode: nothing reachable may be poisoned. */
+static void gc_verify_reachable(void) {
+  gc_mark();
+  for (a68_obj* o = all_objects; o; o = o->next) if (o->mark) {
+    o->mark = 0;
+    if (o->kind == K_FREED) { fprintf(stderr, "a68lean: gc verify: a freed object is reachable\n"); abort(); }
+    switch (o->kind) {
+      case K_SLOTS: { a68_slots* s = (a68_slots*) o; for (uint32_t i = 0; i < o->n; i++) if (tag_is_ptr(s->s[i].tag) && s->s[i].v.p->kind == K_FREED) { fprintf(stderr, "a68lean: gc verify: a slot points at a freed object\n"); abort(); } break; }
+      case K_FRAME: { a68_frame* f = (a68_frame*) o; for (uint32_t i = 0; i < o->n; i++) if (tag_is_ptr(f->c[i].tag) && f->c[i].v.p->kind == K_FREED) { fprintf(stderr, "a68lean: gc verify: a cell points at a freed object\n"); abort(); } break; }
+      case K_ROWD: if (((a68_rowd*) o)->base->kind == K_FREED) { fprintf(stderr, "a68lean: gc verify: a row points at a freed store\n"); abort(); } break;
+      default: break;
+    }
+  }
+  for (size_t i = 0; i < sp; i++) if (tag_is_ptr(stack[i].tag) && stack[i].v.p->kind == K_FREED) { fprintf(stderr, "a68lean: gc verify: the operand stack holds a freed object\n"); abort(); }
+}
+
+#include <time.h>
+
+static void gc_collect(void) {
+  gc_wanted = 0;
+  if (gc_off) return;
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  gc_mark();
+  gc_sweep();
+  if (gc_verify) gc_verify_reachable();
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  gc_seconds += (double) (t1.tv_sec - t0.tv_sec) + (double) (t1.tv_nsec - t0.tv_nsec) / 1e9;
+  gc_collections++;
+  bytes_allocated = 0;
+  if (bytes_live > gc_peak_live) gc_peak_live = bytes_live;
+  if (gc_limit && bytes_live > gc_limit) die("not enough memory");
+}
+
+static void gc_report(void) {
+  if (!gc_stats) return;
+  fprintf(stderr, "a68lean gc: %llu collections, %.1f MB freed, %.1f MB peak live, %.3f s\n",
+          (unsigned long long) gc_collections, (double) gc_freed_bytes / 1048576.0,
+          (double) gc_peak_live / 1048576.0, gc_seconds);
+}
+
+static void gc_init(void) {
+  const char* m = getenv("A68LEAN_GC");
+  if (m) {
+    if (strstr(m, "off")) gc_off = 1;
+    if (strstr(m, "stress")) gc_stress = 1;
+    if (strstr(m, "verify")) gc_verify = 1;
+    if (strstr(m, "stats")) gc_stats = 1;
+  }
+  const char* h = getenv("A68LEAN_HEAP");
+  if (h) gc_limit = strtoull(h, NULL, 10);
+  atexit(gc_report);
+}
+
+/* a68g's collector procedures: `sweep heap`, `collections`, `garbage`, `garbage seconds` */
+lean_object* a68c_gc(uint32_t what, lean_object* w) {
+  (void) w;
+  switch (what) {
+    case 0: gc_collect(); return lean_io_result_mk_ok(lean_box_float(0.0));
+    case 1: return lean_io_result_mk_ok(lean_box_float((double) gc_collections));
+    case 2: return lean_io_result_mk_ok(lean_box_float((double) gc_freed_bytes));
+    case 3: return lean_io_result_mk_ok(lean_box_float(gc_seconds));
+    default: return lean_io_result_mk_ok(lean_box_float(0.0));
+  }
+}
+
 /* ---------------------------------------------------------------- the blob codec */
 
 typedef struct { uint8_t* p; size_t n, cap; } buf;
@@ -993,16 +1156,6 @@ static void env_restore(void) {
   env = saved[--nsaved];
 }
 
-/* Call a compiled routine with its arguments on the operand stack (`Interp.callValue` for
-   `.cproc`): the routine's own prologue takes them into its frame. */
-static void call_cproc(a68_val f) {
-  env_set((a68_frame*) f.v.p);
-  size_t before = sp;
-  a68_dispatch_proc(f.aux & 0xffffff);
-  env_restore();
-  if (a68_jump_flag) { sp = before; push(mk_tag(T_UNDEF)); }
-}
-
 lean_object* a68c_call(uint32_t fn, uint32_t np, uint64_t fr, lean_object* args, uint32_t nargs, lean_object* w) {
   (void) w;
   lean_inc(args);
@@ -1031,6 +1184,7 @@ lean_object* a68c_hole(uint32_t fn, uint32_t idx, uint64_t fr, lean_object* w) {
 /* ---------------------------------------------------------------- start-up and shutdown */
 
 void a68rt_boot(const char* blob, uint32_t ll, uint8_t regression, int argc, char** argv, const char* src) {
+  gc_init();
   parse_tables(blob);
   lean_object* args = lean_mk_empty_array();
   args = lean_array_push(args, lean_mk_string("a68g"));
@@ -1052,9 +1206,11 @@ void a68rt_raise_jump(uint32_t l, int w) { (void) w; a68_jump_flag = l + 1; }
 
 /* ---------------------------------------------------------------- environments */
 
-void a68rt_enter(uint32_t n, int w) { (void) w; env = frame_alloc(n); }
+void a68rt_enter(uint32_t n, int w) {
+  GC_POLL(); (void) w; env = frame_alloc(n); }
 
 void a68rt_enter_args(uint32_t n, uint32_t nargs, int w) {
+  GC_POLL();
   (void) w;
   a68_frame* f = frame_alloc(n);
   for (uint32_t i = nargs; i > 0; i--) {
@@ -1092,8 +1248,10 @@ static a68_val big_of_string(uint32_t tag, const char* s, size_t n) {
   return mk_ptr(tag, (a68_obj*) l, 0);
 }
 
-void a68rt_push_bigint(uint32_t i, int w) { (void) w; push(big_of_string(T_BIGINT, strtab[i], strlen_tab[i])); }
-void a68rt_push_bigbits(uint32_t i, int w) { (void) w; push(big_of_string(T_BIGBITS, strtab[i], strlen_tab[i])); }
+void a68rt_push_bigint(uint32_t i, int w) {
+  GC_POLL(); (void) w; push(big_of_string(T_BIGINT, strtab[i], strlen_tab[i])); }
+void a68rt_push_bigbits(uint32_t i, int w) {
+  GC_POLL(); (void) w; push(big_of_string(T_BIGBITS, strtab[i], strlen_tab[i])); }
 
 static a68_val string_row(const uint8_t* p, int64_t n, int64_t lwb) {
   a68_rowd* d = rowd_alloc(1);
@@ -1107,9 +1265,11 @@ static a68_val string_row(const uint8_t* p, int64_t n, int64_t lwb) {
   return mk_ptr(T_ROW, (a68_obj*) d, 0);
 }
 
-void a68rt_push_str(uint32_t i, int w) { (void) w; push(string_row((const uint8_t*) strtab[i], (int64_t) strlen_tab[i], 1)); }
+void a68rt_push_str(uint32_t i, int w) {
+  GC_POLL(); (void) w; push(string_row((const uint8_t*) strtab[i], (int64_t) strlen_tab[i], 1)); }
 
-void a68rt_push_bytes(const uint8_t* p, int64_t n, int64_t lwb, int w) { (void) w; push(string_row(p, n, lwb)); }
+void a68rt_push_bytes(const uint8_t* p, int64_t n, int64_t lwb, int w) {
+  GC_POLL(); (void) w; push(string_row(p, n, lwb)); }
 
 /* The STRING on top of the operand stack as bytes the caller owns; the lower bound in `*lwb`. */
 int64_t a68rt_pop_bytes(uint8_t** out, int64_t* lwb, int w) {
@@ -1137,7 +1297,8 @@ int64_t a68rt_pop_bytes(uint8_t** out, int64_t* lwb, int w) {
 }
 
 /* `SKIP` of a mode: the Lean side knows the default (`Interp.defaultOf`). */
-void a68rt_push_skip(uint32_t m, int w) { (void) w; push(decode_blob(io_ok(a68l_skip(m, LW)))); }
+void a68rt_push_skip(uint32_t m, int w) {
+  GC_POLL(); (void) w; push(decode_blob(io_ok(a68l_skip(m, LW)))); }
 
 void a68rt_pop(int w) { (void) w; (void) pop(); }
 void a68rt_dup(int w) { (void) w; a68_val v = *top(); push(v); }
@@ -1149,6 +1310,7 @@ void a68rt_nip(int w) {
 }
 
 void a68rt_push_cell(uint32_t d, uint32_t s, int w) {
+  GC_POLL();
   (void) w;
   a68_val* c = cell_of(d, s);
   if (c->tag == T_UNDEF) die("attempt to use an uninitialised value");
@@ -1323,6 +1485,7 @@ static a68_val sel_ref(uint32_t d, uint32_t s, uint32_t spec, int64_t i, int64_t
 }
 
 void a68rt_sel_push(uint32_t d, uint32_t s, uint32_t spec, int64_t i, int64_t j, uint32_t f, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = sel_read(d, s, spec, i, j, f);
   if (v.tag == T_UNDEF) die("attempt to use an uninitialised value");
@@ -1338,6 +1501,7 @@ uint8_t a68rt_cell_isnil(uint32_t d, uint32_t s, int w) {
 }
 
 void a68rt_sel_store(uint32_t dd, uint32_t ds, uint32_t d, uint32_t s, uint32_t spec, int64_t i, int64_t j, uint32_t f, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = sel_read(d, s, spec, i, j, f);
   if (v.tag == T_UNDEF) die("attempt to use an uninitialised value");
@@ -1400,9 +1564,8 @@ static int append_in_place(a68_val* c, const a68_val* elems, int64_t n) {
   return 1;
 }
 
-static void dyop_lean(uint32_t opidx, uint32_t m1, uint32_t m2, a68_val l, a68_val r);
-
 void a68rt_append_char(uint32_t d, uint32_t s, uint32_t ch, int w) {
+  GC_POLL();
   (void) w;
   a68_val* c = cell_of(d, s);
   a68_val e = mk_char(ch);
@@ -1415,6 +1578,7 @@ void a68rt_append_char(uint32_t d, uint32_t s, uint32_t ch, int w) {
 }
 
 void a68rt_append(uint32_t d, uint32_t s, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   a68_val* c = cell_of(d, s);
@@ -1469,6 +1633,7 @@ void a68rt_arith_error(uint32_t kind, int w) {
 /* ---------------------------------------------------------------- operations */
 
 void a68rt_deref(int w) {
+  GC_POLL();
   (void) w;
   a68_val r = pop();
   a68_val v;
@@ -1490,14 +1655,21 @@ static void call_value(a68_val f, uint32_t nargs) {
       return;
     }
     case T_BUILTIN: {
+      const char* name = strtab[f.aux];
+      if (strcmp(name, "associate") == 0 || strcmp(name, "onlogicalfileend") == 0 || strcmp(name, "onfileend") == 0
+          || strcmp(name, "onphysicalfileend") == 0 || strcmp(name, "onvalueerror") == 0 || strcmp(name, "onlineend") == 0)
+        for (size_t i = sp - nargs; i < sp; i++) if (tag_is_ptr(stack[i].tag)) pin(stack[i].v.p);
       buf b = {0};
       for (size_t i = sp - nargs; i < sp; i++) encode_val(&b, stack[i]);
-      sp -= nargs;
       lean_object* args = lean_alloc_sarray(1, b.n, b.n);
       memcpy(lean_sarray_cptr(args), b.p, b.n);
       free(b.p);
+      /* the arguments stay on the stack, rooted, until the call returns: the Lean side may
+         call back into compiled code, which may collect */
       lean_object* r = io_ok(a68l_call(lstr_of_table(f.aux), args, nargs, LW));
-      push(decode_blob(r));
+      a68_val res = decode_blob(r);
+      sp -= nargs;
+      push(res);
       return;
     }
     case T_NIL: die("attempt to call NIL");
@@ -1506,9 +1678,11 @@ static void call_value(a68_val f, uint32_t nargs) {
   }
 }
 
-void a68rt_deproc(int w) { (void) w; a68_val f = pop(); call_value(f, 0); }
+void a68rt_deproc(int w) {
+  GC_POLL(); (void) w; a68_val f = pop(); call_value(f, 0); }
 
 void a68rt_call(uint32_t nargs, int w) {
+  GC_POLL();
   (void) w;
   if (sp < nargs + 1) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
   a68_val f = stack[sp - nargs - 1];
@@ -1518,6 +1692,7 @@ void a68rt_call(uint32_t nargs, int w) {
 }
 
 void a68rt_widen(uint32_t src, uint32_t dst, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   const mode_info* s = &modetab[src];
@@ -1527,10 +1702,14 @@ void a68rt_widen(uint32_t src, uint32_t dst, int w) {
     return;
   }
   if (strcmp(s->kind, d->kind) == 0 && s->len == d->len) { push(v); return; }
-  push(decode_blob(io_ok(a68l_widen(src, dst, encode_blob(v), LW))));
+  push(v);   /* rooted while the Lean side widens */
+  a68_val res = decode_blob(io_ok(a68l_widen(src, dst, encode_blob(v), LW)));
+  (void) pop();
+  push(res);
 }
 
 void a68rt_row_of(int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   if (v.tag == T_REF || v.tag == T_LREF) { push(v); return; }
@@ -1545,6 +1724,7 @@ void a68rt_row_of(int w) {
 }
 
 void a68rt_unite(uint32_t m, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   a68_slots* s = slots_alloc(1);
@@ -1555,6 +1735,7 @@ void a68rt_unite(uint32_t m, int w) {
 void a68rt_voiding(int w) { (void) w; (void) pop(); push(mk_tag(T_VOID)); }
 
 void a68rt_assign(uint8_t flex, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   a68_val d = pop();
@@ -1574,30 +1755,383 @@ void a68rt_ident_rel(uint8_t isnt, int w) {
   push(mk_bool(isnt ? !same : same));
 }
 
-static void dyop_lean(uint32_t opidx, uint32_t m1, uint32_t m2, a68_val l, a68_val r) {
+
+/* ---------------------------------------------------------------- native operators */
+/*
+   The operators of the primitive modes, strings and row bounds, transcribed from
+   `Interp.dyadic` and `Interp.monadic` with their checks and messages; anything else —
+   LONG modes, COMPL, BYTES, rows compared as values, named modes — goes to the Lean side
+   unchanged.  A mode is known by the kind and length its table line gives. */
+
+#define A68_MAXINT 2147483647LL
+
+static int mode_is(uint32_t m, const char* kind, int64_t len) {
+  return m < nmode && strcmp(modetab[m].kind, kind) == 0 && modetab[m].len == len;
+}
+static int mode_kind(uint32_t m, const char* kind) { return m < nmode && strcmp(modetab[m].kind, kind) == 0; }
+
+static int64_t int_range(int64_t r) {
+  if (r > A68_MAXINT || r < -A68_MAXINT) die("INT value overflow, result too large");
+  return r;
+}
+
+static double real_check(double x) {
+  if (x != x) die("REAL value is not a number");
+  if (isinf(x)) die("infinite REAL value");
+  return x;
+}
+
+/* `Interp.powIntInt` */
+static int64_t pow_int(int64_t m, int64_t n) {
+  if (n < 0) die("invalid INT exponent");
+  if (m == 0 && n == 0) return 1;
+  if (m == 0 || m == 1) return m;
+  if (m == -1) return (n % 2 == 0) ? 1 : -1;
+  uint64_t nn = (uint64_t) n, bit = 1;
+  int64_t mm = m, p = 1;
+  for (;;) {
+    if (nn & bit) p = int_range(p * mm);
+    bit <<= 1;
+    if (bit <= nn) mm = int_range(mm * mm);
+    if (!(bit <= nn)) break;
+  }
+  return p;
+}
+
+/* `Interp.powRealIntPos` / `powRealInt` */
+static double pow_real_int(double x, int64_t n) {
+  uint64_t nn = n < 0 ? (uint64_t) (-(n + 1)) + 1 : (uint64_t) n;
+  double p;
+  if (x == 0.0 && nn == 0) p = 1.0;
+  else if (x == 0.0 || x == 1.0) p = x;
+  else if (x == -1.0) p = (nn % 2 == 0) ? 1.0 : -1.0;
+  else {
+    uint64_t bit = 1; double mm = x; p = 1.0;
+    for (;;) {
+      if (nn & bit) p = p * mm;
+      bit <<= 1;
+      if (bit <= nn) mm = mm * mm;
+      if (!(bit <= nn)) break;
+    }
+    if (isinf(p) || p != p) die("infinite REAL value");
+  }
+  return n < 0 ? 1.0 / p : p;
+}
+
+static a68_val mk_compl(double re, double im) {
+  a68_slots* c = slots_alloc(2);
+  c->s[0] = mk_real(re);
+  c->s[1] = mk_real(im);
+  return mk_ptr(T_STRUCT, (a68_obj*) c, 0);
+}
+
+static int is_string_row(a68_val v) {
+  return v.tag == T_ROW && ((a68_rowd*) v.v.p)->h.n == 1;
+}
+
+/* the characters of a string value, checked as `Interp.checkChars` checks them */
+static uint8_t* string_bytes(a68_val v, int64_t* n) {
+  a68_rowd* d = (a68_rowd*) v.v.p;
+  *n = row_count(d);
+  uint8_t* b = (uint8_t*) xmalloc((size_t) *n + 1);
+  a68_obj* st = rowd_store(d);
+  for (int64_t i = 0; i < *n; i++) {
+    a68_val e = store_get(st, row_store_index(d, i));
+    if (e.tag == T_UNDEF) { free(b); die("attempt to use an uninitialised CHAR value"); }
+    if (e.tag != T_CHAR) { free(b); die("internal: [] CHAR expected"); }
+    b[i] = (uint8_t) e.v.u;
+  }
+  return b;
+}
+
+static int cmp_op(const char* op, int c) {
+  if (strcmp(op, "=") == 0) return c == 0;
+  if (strcmp(op, "/=") == 0) return c != 0;
+  if (strcmp(op, "<") == 0) return c < 0;
+  if (strcmp(op, "<=") == 0) return c <= 0;
+  if (strcmp(op, ">") == 0) return c > 0;
+  return c >= 0;
+}
+static int is_cmp(const char* op) {
+  return strcmp(op, "=") == 0 || strcmp(op, "/=") == 0 || strcmp(op, "<") == 0
+      || strcmp(op, "<=") == 0 || strcmp(op, ">") == 0 || strcmp(op, ">=") == 0;
+}
+
+/* Try the operator natively; 1 when done (the result is in `*out`), 0 for the Lean side. */
+static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_val b, a68_val* out) {
+  if (a.tag == T_UNDEF || b.tag == T_UNDEF) return 0;   /* the Lean side reports it in the mode's words */
+  if (mode_is(m1, "int", 0) && mode_is(m2, "int", 0) && a.tag == T_INT && b.tag == T_INT) {
+    int64_t x = a.v.i, y = b.v.i;
+    if (strcmp(op, "+") == 0) { *out = mk_int(int_range(x + y)); return 1; }
+    if (strcmp(op, "-") == 0) { *out = mk_int(int_range(x - y)); return 1; }
+    if (strcmp(op, "*") == 0) { *out = mk_int(int_range(x * y)); return 1; }
+    if (strcmp(op, "%") == 0) { if (y == 0) die("INT division by zero"); *out = mk_int(x / y); return 1; }
+    if (strcmp(op, "%*") == 0) { if (y == 0) die("INT division by zero"); int64_t m = y < 0 ? -y : y; int64_t r = x % m; *out = mk_int(r < 0 ? r + m : r); return 1; }
+    if (strcmp(op, "**") == 0) { *out = mk_int(pow_int(x, y)); return 1; }
+    if (is_cmp(op)) { *out = mk_bool(cmp_op(op, x < y ? -1 : x > y ? 1 : 0)); return 1; }
+    return 0;
+  }
+  if (mode_is(m1, "real", 0) && mode_is(m2, "real", 0) && (a.tag == T_REAL || a.tag == T_INT) && (b.tag == T_REAL || b.tag == T_INT)) {
+    double x = as_real(a), y = as_real(b);
+    if (strcmp(op, "+") == 0) { *out = mk_real(real_check(x + y)); return 1; }
+    if (strcmp(op, "-") == 0) { *out = mk_real(real_check(x - y)); return 1; }
+    if (strcmp(op, "*") == 0) { *out = mk_real(real_check(x * y)); return 1; }
+    if (strcmp(op, "/") == 0) { if (y == 0.0) die("REAL value is not a number"); *out = mk_real(x / y); return 1; }
+    if (strcmp(op, "I") == 0) { *out = mk_compl(x, y); return 1; }
+    if (strcmp(op, "**") == 0) {
+      if (y == 0.0) { *out = mk_real(1.0); return 1; }
+      if (x < 0.0) die("REAL math error");
+      if (x == 0.0) { if (y < 0.0) die("REAL math error"); *out = mk_real(0.0); return 1; }
+      *out = mk_real(exp(y * log(x)));
+      return 1;
+    }
+    if (is_cmp(op)) { *out = mk_bool(cmp_op(op, x < y ? -1 : x > y ? 1 : 0)); return 1; }
+    return 0;
+  }
+  if (mode_is(m1, "real", 0) && mode_is(m2, "int", 0) && (a.tag == T_REAL || a.tag == T_INT) && b.tag == T_INT) {
+    double x = as_real(a);
+    if (strcmp(op, "**") == 0) { *out = mk_real(pow_real_int(x, b.v.i)); return 1; }
+    if (strcmp(op, "I") == 0) { *out = mk_compl(x, (double) b.v.i); return 1; }
+    return 0;
+  }
+  if (mode_kind(m1, "bool") && mode_kind(m2, "bool") && a.tag == T_BOOL && b.tag == T_BOOL) {
+    int x = a.v.u != 0, y = b.v.u != 0;
+    if (strcmp(op, "AND") == 0) { *out = mk_bool(x && y); return 1; }
+    if (strcmp(op, "OR") == 0) { *out = mk_bool(x || y); return 1; }
+    if (strcmp(op, "XOR") == 0 || strcmp(op, "/=") == 0) { *out = mk_bool(x != y); return 1; }
+    if (strcmp(op, "=") == 0) { *out = mk_bool(x == y); return 1; }
+    return 0;
+  }
+  if (mode_kind(m1, "char") && mode_kind(m2, "char") && a.tag == T_CHAR && b.tag == T_CHAR) {
+    if (is_cmp(op)) { *out = mk_bool(cmp_op(op, a.v.u < b.v.u ? -1 : a.v.u > b.v.u ? 1 : 0)); return 1; }
+    return 0;
+  }
+  if (mode_kind(m1, "row") && mode_kind(m2, "row") && is_string_row(a) && is_string_row(b)
+      && rowd_store((a68_rowd*) a.v.p)->kind == K_LEAF && rowd_store((a68_rowd*) a.v.p)->ek == T_CHAR
+      && rowd_store((a68_rowd*) b.v.p)->kind == K_LEAF && rowd_store((a68_rowd*) b.v.p)->ek == T_CHAR) {
+    /* two strings whose stores are leaves of characters: a mode of `row` of `char` is what
+       the elaborator gives both operands of the string operators */
+    int64_t na, nb;
+    if (strcmp(op, "+") == 0) {
+      uint8_t* pa = string_bytes(a, &na);
+      uint8_t* pb = string_bytes(b, &nb);
+      uint8_t* c = (uint8_t*) xmalloc((size_t) (na + nb) + 1);
+      memcpy(c, pa, (size_t) na); memcpy(c + na, pb, (size_t) nb);
+      *out = string_row(c, na + nb, 1);
+      free(pa); free(pb); free(c);
+      return 1;
+    }
+    if (is_cmp(op)) {
+      uint8_t* pa = string_bytes(a, &na);
+      uint8_t* pb = string_bytes(b, &nb);
+      int64_t m = na < nb ? na : nb;
+      int c = 0;
+      for (int64_t i = 0; i < m && c == 0; i++) c = pa[i] < pb[i] ? -1 : pa[i] > pb[i] ? 1 : 0;
+      if (c == 0) c = na < nb ? -1 : na > nb ? 1 : 0;
+      free(pa); free(pb);
+      *out = mk_bool(cmp_op(op, c));
+      return 1;
+    }
+    return 0;
+  }
+  if (mode_is(m1, "int", 0) && mode_kind(m2, "row") && a.tag == T_INT && b.tag == T_ROW) {
+    a68_rowd* d = (a68_rowd*) b.v.p;
+    int64_t k = a.v.i;
+    if (strcmp(op, "LWB") == 0 || strcmp(op, "UPB") == 0) {
+      if (k < 1 || k > (int64_t) d->h.n) die("LWB/UPB dimension out of range");
+      *out = mk_int(strcmp(op, "LWB") == 0 ? d->dim[k - 1].l : d->dim[k - 1].u);
+      return 1;
+    }
+    return 0;
+  }
+  if (mode_is(m1, "bits", 0) && mode_is(m2, "bits", 0) && a.tag == T_BITS && b.tag == T_BITS) {
+    uint64_t x = a.v.u, y = b.v.u, mask = 0xffffffffu;
+    if (strcmp(op, "AND") == 0) { *out = mk_bits(x & y); return 1; }
+    if (strcmp(op, "OR") == 0) { *out = mk_bits((x | y) & mask); return 1; }
+    if (strcmp(op, "XOR") == 0) { *out = mk_bits((x ^ y) & mask); return 1; }
+    if (strcmp(op, "=") == 0) { *out = mk_bool(x == y); return 1; }
+    if (strcmp(op, "/=") == 0) { *out = mk_bool(x != y); return 1; }
+    if (strcmp(op, "<=") == 0) { *out = mk_bool((x & y) == x); return 1; }
+    if (strcmp(op, ">=") == 0) { *out = mk_bool((x & y) == y); return 1; }
+    return 0;
+  }
+  if (mode_is(m1, "bits", 0) && mode_is(m2, "int", 0) && a.tag == T_BITS && b.tag == T_INT) {
+    uint64_t x = a.v.u, mask = 0xffffffffu;
+    int64_t k = b.v.i;
+    int64_t ak = k < 0 ? -k : k;
+    if (strcmp(op, "SHL") == 0 || strcmp(op, "SHR") == 0 || strcmp(op, "DOWN") == 0) {
+      if (ak > 32) die("shift count out of range");
+      int64_t sh = strcmp(op, "SHL") == 0 ? k : -k;
+      uint64_t r = sh >= 0 ? ((sh >= 64 ? 0 : (x << sh)) & mask) : (-sh >= 64 ? 0 : (x >> (-sh)));
+      *out = mk_bits(r);
+      return 1;
+    }
+    return 0;
+  }
+  if (mode_is(m1, "int", 0) && mode_is(m2, "bits", 0) && a.tag == T_INT && b.tag == T_BITS) {
+    if (strcmp(op, "ELEM") == 0) {
+      int64_t k = a.v.i;
+      if (k < 1 || k > 32) die("ELEM index out of range");
+      *out = mk_bool(((b.v.u >> (32 - k)) & 1) == 1);
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* `x +:= e` and its relatives on a name of a primitive mode, and `s +:= t` on a string
+   variable: the value, the operation, the write, and the name as the result. */
+static int native_assign_op(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_val b, a68_val* out) {
+  (void) m2;
+  if (a.tag != T_REF || !mode_kind(m1, "ref")) return 0;
+  /* the mode line of a REF names the mode referred to by its index */
+  uint32_t target = (uint32_t) modetab[m1].len;
+  int t_int = mode_is(target, "int", 0), t_real = mode_is(target, "real", 0), t_row = mode_kind(target, "row");
+  if (!t_int && !t_real && !t_row) return 0;
+  if (t_row && strcmp(op, "+:=") == 0 && b.tag == T_ROW && is_string_row(b)) {
+    /* appending to a string variable: in place when the cell holds a plain row */
+    a68_val* slot = a.v.p->kind == K_ROWD ? NULL : ref_slot(a);
+    if (slot && slot->tag == T_ROW) {
+      a68_rowd* src = (a68_rowd*) b.v.p;
+      int64_t n = row_count(src);
+      a68_val* tmp = (a68_val*) xmalloc((size_t) (n ? n : 1) * sizeof(a68_val));
+      a68_obj* st = rowd_store(src);
+      for (int64_t i = 0; i < n; i++) tmp[i] = store_get(st, row_store_index(src, i));
+      int ok = append_in_place(slot, tmp, n);
+      free(tmp);
+      if (ok) { *out = a; return 1; }
+    }
+    return 0;
+  }
+  if (t_row) return 0;
+  a68_val cur = ref_load(a);
+  if (cur.tag == T_UNDEF) return 0;
+  a68_val r;
+  if (t_int && cur.tag == T_INT && b.tag == T_INT) {
+    int64_t x = cur.v.i, y = b.v.i;
+    if (strcmp(op, "+:=") == 0) r = mk_int(int_range(x + y));
+    else if (strcmp(op, "-:=") == 0) r = mk_int(int_range(x - y));
+    else if (strcmp(op, "*:=") == 0) r = mk_int(int_range(x * y));
+    else if (strcmp(op, "%:=") == 0) { if (y == 0) die("INT division by zero"); r = mk_int(x / y); }
+    else if (strcmp(op, "%*:=") == 0) { if (y == 0) die("INT division by zero"); int64_t m = y < 0 ? -y : y; int64_t q = x % m; r = mk_int(q < 0 ? q + m : q); }
+    else return 0;
+  } else if (t_real && cur.tag == T_REAL && (b.tag == T_REAL || b.tag == T_INT)) {
+    double x = cur.v.r, y = as_real(b);
+    if (strcmp(op, "+:=") == 0) r = mk_real(real_check(x + y));
+    else if (strcmp(op, "-:=") == 0) r = mk_real(real_check(x - y));
+    else if (strcmp(op, "*:=") == 0) r = mk_real(real_check(x * y));
+    else if (strcmp(op, "/:=") == 0) { if (y == 0.0) die("REAL value is not a number"); r = mk_real(x / y); }
+    else return 0;
+  } else return 0;
+  store_ref(a, r);
+  *out = a;
+  return 1;
+}
+
+static int native_monop(const char* op, uint32_t m, a68_val v, a68_val* out) {
+  if (v.tag == T_UNDEF) return 0;
+  if (mode_is(m, "int", 0) && v.tag == T_INT) {
+    int64_t x = v.v.i;
+    if (strcmp(op, "-") == 0) { *out = mk_int(int_range(-x)); return 1; }
+    if (strcmp(op, "+") == 0) { *out = v; return 1; }
+    if (strcmp(op, "ABS") == 0) { *out = mk_int(x < 0 ? -x : x); return 1; }
+    if (strcmp(op, "SIGN") == 0) { *out = mk_int(x > 0 ? 1 : x < 0 ? -1 : 0); return 1; }
+    if (strcmp(op, "ODD") == 0) { *out = mk_bool(x % 2 != 0); return 1; }
+    if (strcmp(op, "REPR") == 0) { if (x < 0 || x > 255) die("REPR argument out of range"); *out = mk_char((uint32_t) x); return 1; }
+    if (strcmp(op, "BIN") == 0) {
+      if (x < 0) die("BIN argument is negative");
+      if (x > 0xffffffffLL) die("BIN argument out of range");
+      *out = mk_bits((uint64_t) x); return 1;
+    }
+    return 0;
+  }
+  if (mode_is(m, "real", 0) && (v.tag == T_REAL || v.tag == T_INT)) {
+    double x = as_real(v);
+    if (strcmp(op, "-") == 0) { *out = mk_real(-x); return 1; }
+    if (strcmp(op, "+") == 0) { *out = mk_real(x); return 1; }
+    if (strcmp(op, "ABS") == 0) { *out = mk_real(fabs(x)); return 1; }
+    if (strcmp(op, "SIGN") == 0) { *out = mk_int(x > 0 ? 1 : x < 0 ? -1 : 0); return 1; }
+    if (strcmp(op, "ENTIER") == 0) {
+      if (x < -(double) A68_MAXINT || x > (double) A68_MAXINT) die("INT value out of bounds");
+      double f = floor(x);
+      *out = mk_int(f < 0 ? -(int64_t) (uint64_t) (-f) : (int64_t) (uint64_t) f);
+      return 1;
+    }
+    if (strcmp(op, "ROUND") == 0) {
+      if (x < -(double) A68_MAXINT || x > (double) A68_MAXINT) die("INT value out of bounds");
+      double ax = fabs(x);
+      double r = floor(ax + 0.5);
+      int64_t n = (int64_t) (uint64_t) r;
+      *out = mk_int(x < 0 ? -n : n);
+      return 1;
+    }
+    return 0;
+  }
+  if (mode_kind(m, "bool") && v.tag == T_BOOL) {
+    if (strcmp(op, "NOT") == 0) { *out = mk_bool(!v.v.u); return 1; }
+    if (strcmp(op, "ABS") == 0) { *out = mk_int(v.v.u ? 1 : 0); return 1; }
+    return 0;
+  }
+  if (mode_kind(m, "char") && v.tag == T_CHAR) {
+    if (strcmp(op, "ABS") == 0) { *out = mk_int((int64_t) v.v.u); return 1; }
+    return 0;
+  }
+  if (mode_is(m, "bits", 0) && v.tag == T_BITS) {
+    if (strcmp(op, "NOT") == 0) { *out = mk_bits(0xffffffffu ^ v.v.u); return 1; }
+    if (strcmp(op, "ABS") == 0) { *out = mk_int(v.v.u >= 2147483648u ? (int64_t) v.v.u - 4294967296LL : (int64_t) v.v.u); return 1; }
+    return 0;
+  }
+  if (mode_kind(m, "row") && v.tag == T_ROW) {
+    a68_rowd* d = (a68_rowd*) v.v.p;
+    if (strcmp(op, "LWB") == 0) { *out = mk_int(d->dim[0].l); return 1; }
+    if (strcmp(op, "UPB") == 0) { *out = mk_int(d->dim[0].u); return 1; }
+    if (strcmp(op, "ELEMS") == 0) { *out = mk_int(row_count(d)); return 1; }
+    return 0;
+  }
+  return 0;
+}
+
+/* the operands stay on the stack while the Lean side computes */
+void a68rt_dyop(uint32_t op, uint32_t m1, uint32_t m2, int w) {
+  GC_POLL();
+  (void) w;
+  if (sp < 2) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
+  {
+    a68_val res;
+    const char* name = strtab[op];
+    if (native_dyop(name, m1, m2, stack[sp - 2], stack[sp - 1], &res)
+        || native_assign_op(name, m1, m2, stack[sp - 2], stack[sp - 1], &res)) {
+      sp -= 2;
+      push(res);
+      return;
+    }
+  }
   buf b = {0};
-  encode_val(&b, l);
-  encode_val(&b, r);
+  encode_val(&b, stack[sp - 2]);
+  encode_val(&b, stack[sp - 1]);
   lean_object* args = lean_alloc_sarray(1, b.n, b.n);
   memcpy(lean_sarray_cptr(args), b.p, b.n);
   free(b.p);
-  push(decode_blob(io_ok(a68l_dyop(lstr_of_table(opidx), m1, m2, args, LW))));
-}
-
-void a68rt_dyop(uint32_t op, uint32_t m1, uint32_t m2, int w) {
-  (void) w;
-  a68_val r = pop();
-  a68_val l = pop();
-  dyop_lean(op, m1, m2, l, r);
+  a68_val res = decode_blob(io_ok(a68l_dyop(lstr_of_table(op), m1, m2, args, LW)));
+  sp -= 2;
+  push(res);
 }
 
 void a68rt_monop(uint32_t op, uint32_t m, int w) {
+  GC_POLL();
   (void) w;
-  a68_val v = pop();
-  push(decode_blob(io_ok(a68l_monop(lstr_of_table(op), m, encode_blob(v), LW))));
+  {
+    a68_val res;
+    if (native_monop(strtab[op], m, *top(), &res)) { (void) pop(); push(res); return; }
+  }
+  a68_val res = decode_blob(io_ok(a68l_monop(lstr_of_table(op), m, encode_blob(*top()), LW)));
+  (void) pop();
+  push(res);
 }
 
 void a68rt_select(uint32_t idx, uint8_t via_ref, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   if (via_ref) { push(ref_field(v, idx)); return; }
@@ -1634,6 +2168,7 @@ void a68rt_select(uint32_t idx, uint8_t via_ref, int w) {
 /* The indexer values were pushed in order; `kinds` holds four bits per indexer: bit 0 = a
    trim, bit 1 = a lower bound was given, bit 2 = an upper bound, bit 3 = an `AT`. */
 void a68rt_slice(uint32_t nidx, uint64_t kinds, uint8_t via_ref, int w) {
+  GC_POLL();
   (void) w;
   indexer ixs[64];
   if (nidx > 64) die("internal: too many subscripts");
@@ -1703,6 +2238,7 @@ void a68rt_slice(uint32_t nidx, uint64_t kinds, uint8_t via_ref, int w) {
 }
 
 void a68rt_new_row(uint32_t ndims, uint8_t flex, int w) {
+  GC_POLL();
   (void) w; (void) flex;
   if (sp < 2 * ndims + 1) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
   a68_rowd* d = rowd_alloc(ndims);
@@ -1727,6 +2263,7 @@ void a68rt_new_row(uint32_t ndims, uint8_t flex, int w) {
 }
 
 void a68rt_gen(int w) {
+  GC_POLL();
   (void) w;
   a68_val v = pop();
   a68_slots* c = slots_alloc(1);
@@ -1735,6 +2272,7 @@ void a68rt_gen(int w) {
 }
 
 void a68rt_collateral(uint32_t n, uint8_t is_struct, uint32_t dims, int w) {
+  GC_POLL();
   (void) w;
   if (sp < n) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
   const a68_val* vs = &stack[sp - n];
@@ -1844,6 +2382,7 @@ static int conforms(uint32_t m, uint32_t vm) {
 }
 
 uint8_t a68rt_conform(uint32_t m, uint8_t bind, int w) {
+  GC_POLL();
   (void) w;
   a68_val v = *top();
   uint32_t vm;

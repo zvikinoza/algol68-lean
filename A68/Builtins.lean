@@ -243,6 +243,12 @@ def consts : List (String × Mode) :=
    ("newline", PROCFILE), ("newpage", PROCFILE), ("space", PROCFILE), ("backspace", PROCFILE),
    ("stop", proc [] void), ("random", proc [] REAL), ("longrandom", proc [] LREAL),
    ("clock", proc [] REAL), ("seconds", proc [] REAL), ("cputime", proc [] REAL),
+   -- a68g's collector procedures; their values are those of this implementation's collector
+   ("sweepheap", proc [] void), ("gcheap", proc [] void), ("preemptivegc", proc [] void),
+   ("preemptivesweep", proc [] void), ("preemptivesweepheap", proc [] void),
+   ("collections", proc [] INT), ("sweeps", proc [] INT), ("garbagecollections", proc [] INT),
+   ("garbage", proc [] INT), ("garbagefreed", proc [] INT), ("garbagerefused", proc [] INT),
+   ("sweepsrefused", proc [] INT), ("garbageseconds", proc [] REAL), ("collectseconds", proc [] REAL),
    ("nil", ref void), ("programidf", STRING)]
 
 /-- The functions of one `LONG` / `LONG LONG REAL` argument that a68g's prelude has. -/

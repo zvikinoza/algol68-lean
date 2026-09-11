@@ -316,6 +316,9 @@ partial def updatePath (v : Value) (path : List Sel) (nv : Value) : M Value := d
 @[extern "a68c_elem"] opaque cElem (a : UInt64) (o : UInt32) (i : UInt32) : IO ByteArray
 @[extern "a68c_call"] opaque cCall (fn np : UInt32) (frame : UInt64) (args : @& ByteArray) (nargs : UInt32) : IO ByteArray
 @[extern "a68c_hole"] opaque cHole (fn idx : UInt32) (frame : UInt64) : IO ByteArray
+/-- The compiled program's collector: 0 collects, 1 counts collections, 2 the bytes freed,
+    3 the seconds spent.  The evaluator has no collector, so its answers are zero. -/
+@[extern "a68c_gc"] opaque cGc (what : UInt32) : IO Float
 
 /-- The united modes inside a value, which have to be in the mode table before the value
     is encoded. -/
@@ -3046,6 +3049,12 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let k ← expectInt n
     let r ← nextRandom
     return .int (1 + Int.ofNat ((r * Float.ofInt k).toUInt64.toNat))
+  | "sweepheap", [] | "gcheap", [] | "preemptivegc", [] | "preemptivesweep", [] | "preemptivesweepheap", [] =>
+    let _ ← cGc 0; return .void
+  | "collections", [] | "sweeps", [] | "garbagecollections", [] => return .int (← cGc 1).toUInt64.toNat
+  | "garbage", [] | "garbagefreed", [] => return .int (← cGc 2).toUInt64.toNat
+  | "garbagerefused", [] | "sweepsrefused", [] => return .int 0
+  | "garbageseconds", [] | "collectseconds", [] => return .real (← cGc 3)
   | "clock", [] | "seconds", [] | "cputime", [] => do
     let t ← IO.monoMsNow
     return .real (Float.ofNat t / 1000.0)

@@ -1,0 +1,32 @@
+# Values reachable only through roots the collector must know: a file's associated #
+# string and event routine, a name of a sub-row, a union's value and a procedure     #
+# parameter, each used after heavy allocation.                                       #
+BEGIN
+  PROC churn = VOID: FOR round TO 30 DO STRING t := ""; FOR i TO 1000 DO t +:= "y" OD OD;
+  # a routine that captures the outer frame, called after churn #
+  INT n := 0;
+  PROC step = INT: (n +:= 1; n);
+  step; step; churn; print((step, newline));
+  # a name of a sub-row, and a union holding a row #
+  [1:20] INT a; FOR i TO 20 DO a[i] := i * i OD;
+  REF [] INT v = a[5:8];
+  UNION (INT, [] INT) u := a[2:4];
+  churn;
+  v[2] := 999;
+  print((a[6], v[1], (u | ([] INT r): r[3] | 0), newline));
+  # a procedure passed as a parameter, applied after churn #
+  PROC apply = (PROC (INT) INT f, INT x) INT: (churn; f(x));
+  INT base := 100;
+  print((apply((INT k) INT: k + base, 7), newline));
+  # an associated string and an event routine #
+  STRING buf := "10 20 30 40";
+  FILE f; associate(f, buf);
+  INT hits := 0;
+  on logical file end(f, (REF FILE g) BOOL: (hits +:= 1; FALSE));
+  INT x, y; get(f, (x, y));
+  churn;
+  get(f, (x, y)); print((x, y, newline));
+  churn;
+  INT z := 0;
+  get(f, (z, z)) # ends the file: the mender runs, then a68g stops #
+END
