@@ -144,6 +144,14 @@ of long values. A `LONG` real denotation is elaborated as a `DENOT` operator on
 its text, converted at run time at the precision of its length, so no double
 ever stands in for it.
 
+The one place a68g's own arithmetic is inexact, the quotient-digit estimate of its
+division routines (doubles combined with fused multiply-add), is reproduced exactly
+but cheaply: `MP.qDigit` first computes the estimate with plain doubles, and falls
+back to the exact big-integer emulation only when that quotient lies within 10⁻⁶ of
+an integer. Both estimates are within 2·10⁻¹⁵ of the exact quotient, so outside that
+margin they truncate to the same digit. `LONG INT` arithmetic stays on exact integers,
+which is what a68g's multi-precision routines compute for in-range integers.
+
 Transput lives in the same module: unformatted `print`/`put`, the formatted
 `printf`/`putf` picture machine (frames, moulds, sign shifting, zero
 suppression, replicated collections, embedded formats, column alignment),
