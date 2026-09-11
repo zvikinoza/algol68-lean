@@ -13,10 +13,19 @@ target stubs.o pkg : FilePath := do
   let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
   buildO oFile srcJob flags
 
+/-- Operating-system services of the standard environment (processes, pipes, directories,
+    time, regular expressions), linked into `a68lean` and into compiled programs alike. -/
+target sys.o pkg : FilePath := do
+  let oFile := pkg.buildDir / "csrc" / "sys.o"
+  let srcJob ← inputTextFile <| pkg.dir / "csrc" / "sys.c"
+  let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
+  buildO oFile srcJob flags
+
 extern_lib liba68stubs pkg := do
   let name := nameToStaticLib "a68stubs"
   let job ← fetch <| pkg.target ``stubs.o
-  buildStaticLib (pkg.staticLibDir / name) #[job]
+  let sysJob ← fetch <| pkg.target ``sys.o
+  buildStaticLib (pkg.staticLibDir / name) #[job, sysJob]
 
 @[default_target]
 lean_lib A68 where

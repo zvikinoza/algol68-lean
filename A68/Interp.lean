@@ -1,6 +1,7 @@
 import A68.Core
 import A68.Elab
 import A68.Numfmt
+import A68.Parser
 
 /-!
 # A68.Interp — evaluator for the elaborated `Core` representation
@@ -53,6 +54,8 @@ structure FileSt where
   eof     : Bool := false                    -- stand in: no more input available
   dirty   : Bool := false                    -- has unflushed output for a disk file
   onDisk  : Bool := false
+  fd      : Int := -1                        -- an operating-system descriptor: an end of a pipe
+  channel : Nat := 3                         -- 0 stand out, 1 stand in, 2 stand error, 3 stand back, 4 associate
   deriving Inhabited
 
 structure Rt where
@@ -346,19 +349,98 @@ def refSub (r : Value) (l u : Array Int) (offs : Array Nat) : M Value := do
     | _ => return .ref c (path ++ [.sub l u offs])
   | _ => rtErr "internal: refSub"
 
+-- ## Operating-system services (`csrc/sys.c`)
+
+@[extern "a68_sys_fork"] opaque sysFork (u : Unit) : BaseIO UInt32
+@[extern "a68_sys_system"] opaque sysSystem (cmd : @& ByteArray) : BaseIO UInt32
+@[extern "a68_sys_execve"] opaque sysExecve (prog : @& ByteArray) (args env : @& Array ByteArray) : BaseIO UInt32
+@[extern "a68_sys_execve_child"] opaque sysExecveChild (prog : @& ByteArray) (args env : @& Array ByteArray) : BaseIO UInt32
+@[extern "a68_sys_execve_child_pipe"] opaque sysExecveChildPipe (prog : @& ByteArray) (args env : @& Array ByteArray) : BaseIO ByteArray
+@[extern "a68_sys_execve_output"] opaque sysExecveOutput (prog : @& ByteArray) (args env : @& Array ByteArray) : BaseIO ByteArray
+@[extern "a68_sys_waitpid"] opaque sysWaitpid (pid : UInt32) : BaseIO UInt32
+@[extern "a68_sys_read_fd"] opaque sysReadFd (fd : UInt32) : BaseIO ByteArray
+@[extern "a68_sys_write_fd"] opaque sysWriteFd (fd : UInt32) (b : @& ByteArray) : BaseIO UInt32
+@[extern "a68_sys_close_fd"] opaque sysCloseFd (fd : UInt32) : BaseIO UInt32
+@[extern "a68_sys_time"] opaque sysTime (utc : UInt8) : BaseIO ByteArray
+@[extern "a68_sys_walltime"] opaque sysWalltime (u : Unit) : BaseIO Float
+@[extern "a68_sys_readdir"] opaque sysReaddir (path : @& ByteArray) : BaseIO (Array ByteArray)
+@[extern "a68_sys_stat_mode"] opaque sysStatMode (path : @& ByteArray) : BaseIO UInt32
+@[extern "a68_sys_open_status"] opaque sysOpenStatus (path : @& ByteArray) : BaseIO UInt32
+@[extern "a68_sys_regex"] opaque sysRegex (pat str : @& ByteArray) (notbol : UInt8) : BaseIO ByteArray
+@[extern "a68_sys_strerror"] opaque sysStrerror (e : UInt32) : BaseIO ByteArray
+@[extern "a68_sys_errno"] opaque sysErrno (u : Unit) : BaseIO UInt32
+@[extern "a68_sys_set_errno"] opaque sysSetErrno (e : UInt32) : BaseIO UInt32
+@[extern "a68_sys_getcwd"] opaque sysGetcwd (u : Unit) : BaseIO ByteArray
+@[extern "a68_sys_chdir"] opaque sysChdir (path : @& ByteArray) : BaseIO UInt32
+@[extern "a68_sys_realpath"] opaque sysRealpath (path : @& ByteArray) : BaseIO ByteArray
+@[extern "a68_sys_sleep"] opaque sysSleep (secs : UInt32) : BaseIO UInt32
+@[extern "a68_sys_getenv"] opaque sysGetenv (name : @& ByteArray) : BaseIO ByteArray
+-- a68g computes these with the C library
+@[extern "tgamma"] opaque cTgamma (x : Float) : Float
+@[extern "lgamma"] opaque cLgamma (x : Float) : Float
+@[extern "erf"] opaque cErf (x : Float) : Float
+@[extern "erfc"] opaque cErfc (x : Float) : Float
+@[extern "log1p"] opaque cLog1p (x : Float) : Float
+
+/-- The bytes of a string: an Algol 68 character is a byte. -/
+def strBytes (s : String) : ByteArray := s.foldl (fun acc c => acc.push c.toNat.toUInt8) ByteArray.empty
+def bytesStr (b : ByteArray) : String := String.ofList (b.toList.map fun x => Char.ofNat x.toNat)
+def uint32At (b : ByteArray) (i : Nat) : Nat :=
+  (b.get! i).toNat + (b.get! (i+1)).toNat * 256 + (b.get! (i+2)).toNat * 65536 + (b.get! (i+3)).toNat * 16777216
+def int32At (b : ByteArray) (i : Nat) : Int :=
+  let u := uint32At b i
+  if u ≥ 2147483648 then (u : Int) - 4294967296 else u
+def signed32 (u : UInt32) : Int := if u.toNat ≥ 2147483648 then (u.toNat : Int) - 4294967296 else u.toNat
+def u32 (k : Int) : UInt32 := UInt32.ofNat (k % 4294967296).toNat
+/-- Little-endian bytes of the low `n` bytes of a number, as a C object is laid out. -/
+def leBytes (v : Nat) (n : Nat) : ByteArray := Id.run do
+  let mut b := ByteArray.empty
+  let mut x := v
+  for _ in [0:n] do
+    b := b.push (x % 256).toUInt8
+    x := x / 256
+  return b
+
+/-- The program, arguments and environment of an `execve` call; a68g refuses an argument
+    row whose strings are all empty. -/
+def execArgs (p as en : Value) : M (ByteArray × Array ByteArray × Array ByteArray) := do
+  let prog ← strOf p
+  let (_, _, aes) ← expectRow as
+  let (_, _, ees) ← expectRow en
+  let av ← aes.mapM fun e => do pure (strBytes (← strOf e))
+  let ev ← ees.mapM fun e => do pure (strBytes (← strOf e))
+  if !av.any (·.size > 0) then rtErr "empty argument row"
+  return (strBytes prog, av, ev)
+
+/-- a68g collects transput in C strings, so a NUL character ends the text that reaches the
+    file until the buffer is next purged: after each item of `print`, at a new line or page
+    of `printf`, and at the end of a formatted call.  While this is set, standard output
+    and standard error take nothing. -/
+initialize nulCut : IO.Ref Bool ← IO.mkRef false
+
 def fileOut (fid : Nat) (s : String) : M Unit := do
   let colRef := (← read).col
   for c in s.toList do
     if c == '\n' then colRef.set 0 else colRef.modify (· + 1)
-  if fid == 0 then emit s
-  else if fid == 2 then
-    let stderr ← IO.getStderr
-    stderr.putStr s
+  if fid == 0 || fid == 2 then
+    if !(← nulCut.get) then
+      let s ← if s.any (· == '\x00') then do
+          nulCut.set true
+          pure (String.ofList (s.toList.takeWhile (· != '\x00')))
+        else pure s
+      if fid == 0 then emit s
+      else
+        let stderr ← IO.getStderr
+        stderr.putStr s
   else
     let fs ← (← read).files.get
     match fs[fid]? with
     | none => rtErr "file is not open"
     | some f0 =>
+      if f0.fd ≥ 0 then
+        let _ ← sysWriteFd f0.fd.toNat.toUInt32 (strBytes s)
+        (← read).files.modify fun fs => fs.set! fid { f0 with writing := true }
+        return
       -- an associated file whose string was reassigned starts from the string's current value
       let f ← if f0.loaded then pure f0 else do
         match f0.assoc with
@@ -440,7 +522,9 @@ def bitsMask (long : Int) : Nat := 2 ^ (bitsWidthOf long) - 1
 -- ## Output of values (unformatted transput)
 
 def fileOutByte (fid : Nat) (b : UInt8) : M Unit := do
-  if fid == 0 then emitByte b
+  if fid == 0 then
+    if !(← nulCut.get) then
+      if b == 0 then nulCut.set true else emitByte b
   else fileOut fid (String.singleton (Char.ofNat b.toNat))
 
 /-- Print a value of the given mode with the standard layout. -/
@@ -455,6 +539,7 @@ partial def printValue (fid : Nat) (m : Mode) (v : Value) : M Unit := do
   | .bool, .bool b => fileOut fid (if b then "T" else "F")
   | .char, .char c => fileOutByte fid c.toUInt8
   | .bits n, .bits b => fileOut fid (Numfmt.printBits b (bitsWidthOf n))
+  | .bytes _, .row _ _ es => for e in es do fileOutByte fid (← expectChar e).toUInt8
   | .compl n, .struct #[.real re, .real im] => do
     let _ ← checkReal re; let _ ← checkReal im
     fileOut fid (Numfmt.printReal re n (← llDigits) ++ Numfmt.printReal im n (← llDigits))
@@ -1080,6 +1165,11 @@ partial def widenValue (src dst : Mode) (v : Value) : M Value := do
   | .real _, .compl _, .real x => return mkCompl x 0.0
   | .compl _, .compl _, _ => return v
   | .bits _, .bits _, _ => return v
+  -- a BYTES value is its row of characters, NUL padded to `bytes width`
+  | .bytes _, .row _ _ .char, _ => return v
+  | .bytes _, .bytes n, .row _ _ es =>
+    let w : Nat := if n ≥ 1 then 256 else 32
+    return .row #[1] #[(w : Int)] (es ++ Array.replicate (w - es.size) (.char 0))
   | .bits n, .row _ _ .bool, .bits b =>
     let w := bitsWidthOf n
     return .row #[1] #[w] ((List.range w).reverse.map fun i => Value.bool ((b / 2^i) % 2 == 1)).toArray
@@ -1380,6 +1470,23 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
       if k < 1 || k > w then rtErr "ELEM index out of range"
       return .bool ((x >>> (w - k.toNat)) &&& 1 == 1)
     | _ => rtErr s!"internal: INT/BITS operator {op}"
+  | .int _, .bytes _ =>
+    let k ← expectInt a
+    let (_, _, es) ← expectRow b
+    if k < 1 || k > es.size then rtErr s!"index {k} out of bounds [1:{es.size}]"
+    return es[(k - 1).toNat]!
+  | .bytes _, .bytes _ =>
+    let (_, _, xs) ← expectRow a
+    let (_, _, ys) ← expectRow b
+    let cmp ← compareChars xs ys
+    match op with
+    | "=" => return .bool (cmp == 0)
+    | "/=" => return .bool (cmp != 0)
+    | "<" => return .bool (cmp < 0)
+    | "<=" => return .bool (cmp ≤ 0)
+    | ">" => return .bool (cmp > 0)
+    | ">=" => return .bool (cmp ≥ 0)
+    | _ => rtErr s!"internal: BYTES operator {op}"
   | .int _, .row _ _ _ =>
     let k ← expectInt a
     let (l, u, _) ← expectRow b
@@ -1523,6 +1630,15 @@ partial def setFile (fid : Nat) (f : FileSt) : M Unit := do
     take the current value of their string). -/
 partial def loadFile (fid : Nat) : M FileSt := do
   let f ← getFile fid
+  if f.fd ≥ 0 then
+    -- the end of a pipe: take what one read gives when the characters so far are used up
+    if f.pos < f.buf.size || f.eof then return f
+    flushOut
+    let chunk ← sysReadFd f.fd.toNat.toUInt32
+    let f' := if chunk.isEmpty then { f with eof := true, loaded := true, reading := true }
+      else { f with buf := f.buf ++ chunk, loaded := true, reading := true }
+    setFile fid f'
+    return f'
   if fid == 1 then
     -- standard input is read a line at a time so that interactive programs work:
     -- pending output is flushed first, and more input is fetched only when needed
@@ -2045,6 +2161,11 @@ partial def mathFn (name : String) (x : Float) : M Float := do
     | "sinh" => pure (Float.sinh x) | "cosh" => pure (Float.cosh x) | "tanh" => pure (Float.tanh x)
     | "arcsinh" => pure (Float.asinh x) | "arccosh" => pure (Float.acosh x) | "arctanh" => pure (Float.atanh x)
     | "cbrt" | "curt" => pure (Float.cbrt x)
+    | "gamma" => pure (cTgamma x)
+    | "lngamma" => pure (cLgamma x)
+    | "erf" => pure (cErf x)
+    | "erfc" => pure (cErfc x)
+    | "ln1p" => pure (cLog1p x)
     | _ => rtErr s!"unknown math function {name}"
   checkReal r
 
@@ -2088,7 +2209,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let (_, _, es) ← expectRow row
     for e in es do
       match e with
-      | .union m v => printValue 0 m v
+      | .union m v => printValue 0 m v; nulCut.set false
       | _ => rtErr "internal: print argument"
     return .void
   | "put", [f, row] =>
@@ -2096,7 +2217,7 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let (_, _, es) ← expectRow row
     for e in es do
       match e with
-      | .union m v => printValue fid m v
+      | .union m v => printValue fid m v; nulCut.set false
       | _ => rtErr "internal: put argument"
     return .void
   | "printf", [row] | "writef", [row] =>
@@ -2136,31 +2257,52 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     else
       fileOut fid (match name with | "newline" => "\n" | "newpage" => "\x0c" | "space" => " " | _ => "\x08")
     return .void
-  | "open", [fv, nm, _] =>
+  | "open", [fv, nm, ch] | "append", [fv, nm, ch] =>
+    -- a68g opens the file when it is first used; the result says whether it is a regular
+    -- file (0), and otherwise gives the error number
     let path ← strOf nm
-    let ex ← System.FilePath.pathExists path
-    if ex then
+    let chan := match ch with | .int k => k.toNat | _ => 3
+    let status ← sysOpenStatus (strBytes path)
+    if status == 0 then
       let bytes ← IO.FS.readBinFile path
-      let _ ← newFile fv { name := path, buf := bytes, loaded := true, onDisk := true }
-      return .int 0
+      let _ ← newFile fv { name := path, buf := bytes, loaded := true, onDisk := true, channel := chan }
     else
-      return .int 1
-  | "establish", [fv, nm, _, _, _, _] =>
+      let _ ← newFile fv { name := path, loaded := true, onDisk := true, channel := chan }
+    return .int (signed32 status)
+  | "establish", [fv, nm, ch, _, _, _] =>
     let path ← strOf nm
-    let _ ← newFile fv { name := path, loaded := true, onDisk := true, writing := true }
+    let chan := match ch with | .int k => k.toNat | _ => 3
+    let _ ← newFile fv { name := path, loaded := true, onDisk := true, writing := true, channel := chan }
     return .int 0
-  | "create", [fv, _] =>
-    let _ ← newFile fv { name := "", loaded := true }
+  | "create", [fv, ch] =>
+    let chan := match ch with | .int k => k.toNat | _ => 3
+    let _ ← newFile fv { name := "", loaded := true, channel := chan }
     return .int 0
   | "associate", [fv, sv] =>
-    let _ ← newFile fv { assoc := some sv }
+    let _ ← newFile fv { assoc := some sv, channel := 4 }
     return .void
-  | "close", [f] | "lock", [f] | "scratch", [f] =>
+  | "close", [f] | "lock", [f] =>
     let fid ← fileIdOf f
+    let fs ← getFile fid
+    if fs.fd ≥ 0 then
+      let _ ← sysCloseFd fs.fd.toNat.toUInt32
+      setFile fid { fs with fd := -1, eof := true }
     flushFile fid
     return .void
+  | "scratch", [f] | "erase", [f] =>
+    -- a68g `genie_erase`: a file that has been used is removed
+    let fid ← fileIdOf f
+    flushFile fid
+    let fs ← getFile fid
+    if fs.onDisk && !fs.name.isEmpty && (fs.reading || fs.writing) then
+      match (← (IO.FS.removeFile fs.name).toBaseIO) with
+      | .ok _ => setFile fid { fs with onDisk := false, dirty := false }
+      | .error _ => rtErr "cannot scratch the file"
+    return .void
+  | "rewind", [f] => callBuiltin "reset" [f]
   | "reset", [f] =>
     let fid ← fileIdOf f
+    if !([3, 4].contains (← fileChannel f)) then rtErr "the channel does not allow resetting the file"
     flushFile fid
     let fs ← getFile fid
     setFile fid { fs with pos := 0, reading := false, writing := false, loaded := fs.assoc.isNone && fid != 1 }
@@ -2343,16 +2485,306 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     for e in es do
       v := v * 2 + (if (← expectBool e) then 1 else 0)
     return .bits v
-  | "system", [_] => rtErr "system is not supported"
+  | "bytespack", [s] | "longbytespack", [s] =>
+    let str ← strOf s
+    let w := if name == "bytespack" then 32 else 256
+    if str.length > w then rtErr s!"the string is longer than {w} characters"
+    return .row #[1] #[w] ((str.toList.map fun c => Value.char c.toNat) ++ List.replicate (w - str.length) (Value.char 0)).toArray
+  | "evaluate", [code, .fmt env items] => evaluateCall (← strOf code) env items
+  | "evaluate", [code] => evaluateCall (← strOf code) [] []
+  | "system", [cmd] =>
+    let c ← strOf cmd
+    flushOut
+    return .int (signed32 (← sysSystem (strBytes c)))
+  | "fork", [] =>
+    flushOut
+    return .int (signed32 (← sysFork ()))
+  | "getenv", [n] => return Value.ofString (bytesStr (← sysGetenv (strBytes (← strOf n))))
+  | "execve", [p, as, en] | "exec", [p, as, en] =>
+    let (prog, av, ev) ← execArgs p as en
+    flushOut
+    return .int (signed32 (← sysExecve prog av ev))
+  | "execvechild", [p, as, en] | "execsub", [p, as, en] =>
+    let (prog, av, ev) ← execArgs p as en
+    flushOut
+    return .int (signed32 (← sysExecveChild prog av ev))
+  | "execvechildpipe", [p, as, en] | "execsubpipeline", [p, as, en] =>
+    let (prog, av, ev) ← execArgs p as en
+    flushOut
+    let r ← sysExecveChildPipe prog av ev
+    let fr ← (← read).files.modifyGet fun fs => (fs.size, fs.push { fd := int32At r 0, channel := 1, reading := true })
+    let fw ← (← read).files.modifyGet fun fs => (fs.size, fs.push { fd := int32At r 4, channel := 0, writing := true })
+    return .struct #[.ref (← alloc (.file fr)) [], .ref (← alloc (.file fw)) [], .int (int32At r 8)]
+  | "execveoutput", [p, as, en, dest] | "execsuboutput", [p, as, en, dest] =>
+    let (prog, av, ev) ← execArgs p as en
+    flushOut
+    let r ← sysExecveOutput prog av ev
+    if int32At r 4 == 1 then
+      match dest with
+      | .nil => pure ()
+      | _ => writeRef dest (Value.ofString (bytesStr (r.extract 8 r.size)))
+    return .int (int32At r 0)
+  | "createpipe", [] => return .struct #[.file 1, .file 0, .int (-1)]
+  | "waitpid", [pid] => return .int (signed32 (← sysWaitpid (u32 (← expectInt pid))))
+  | "utctime", [] | "localtime", [] =>
+    let r ← sysTime (if name == "utctime" then 1 else 0)
+    return Value.rowOfList ((List.range (r.size / 4)).map fun i => Value.int (int32At r (4 * i)))
+  | "getdirectory", [d] =>
+    let arr ← sysReaddir (strBytes (← strOf d))
+    if arr.isEmpty then rtErr "cannot read the directory"
+    return Value.rowOfList ((arr.toList.drop 1).map fun b => Value.ofString (bytesStr b))
+  | "fileisdirectory", [s] | "fileisregular", [s] | "fileisblockdevice", [s] | "fileischardevice", [s]
+  | "fileisfifo", [s] | "fileislink", [s] =>
+    let mode := (← sysStatMode (strBytes (← strOf s))).toNat
+    let kind : Nat := match name with
+      | "fileisdirectory" => 0o040000 | "fileisregular" => 0o100000 | "fileisblockdevice" => 0o060000
+      | "fileischardevice" => 0o020000 | "fileisfifo" => 0o010000 | _ => 0o120000
+    return .bool (mode != 0 && (mode &&& 0o170000) == kind)
+  | "filemode", [s] => return .bits (← sysStatMode (strBytes (← strOf s))).toNat
+  | "grepinstring", [pat, str, b, e] | "grepinsubstring", [pat, str, b, e] =>
+    let p ← strOf pat
+    let (l, _, _) ← expectRow str
+    let s ← strOf str
+    let r ← sysRegex (strBytes p) (strBytes s) (if name == "grepinsubstring" then 1 else 0)
+    let ret := int32At r 0
+    if ret == 0 then
+      match b with
+      | .nil => pure ()
+      | _ => writeRef b (.int (int32At r 4 + l[0]!))
+      match e with
+      | .nil => pure ()
+      | _ => writeRef e (.int (int32At r 8 + l[0]! - 1))
+    return .int ret
+  | "subinstring", [pat, rep, rs] =>
+    match rs with
+    | .nil => return .int 3
+    | _ =>
+      let s ← strOf (← readRef rs)
+      let r ← sysRegex (strBytes (← strOf pat)) (strBytes s) 0
+      let ret := int32At r 0
+      if ret != 0 then return .int ret
+      let so := (int32At r 4).toNat
+      let eo := (int32At r 8).toNat
+      let t ← strOf rep
+      writeRef rs (Value.ofString (String.ofList (s.toList.take so) ++ t ++ String.ofList (s.toList.drop eo)))
+      return .int 0
+  | "strerror", [e] => return Value.ofString (bytesStr (← sysStrerror (u32 (← expectInt e))))
+  | "errno", [] => return .int (signed32 (← sysErrno ()))
+  | "reseterrno", [] => let _ ← sysSetErrno 0; return .void
+  | "getpwd", [] => return Value.ofString (bytesStr (← sysGetcwd ()))
+  | "setpwd", [s] =>
+    if (← sysChdir (strBytes (← strOf s))) == 0 then return .int 0
+    else rtErr "cannot change to the directory"
+  | "realpath", [s] => return Value.ofString (bytesStr (← sysRealpath (strBytes (← strOf s))))
+  | "sleep", [x] =>
+    match (← resolveUnion x) with
+    | .union (.int _) (.int k) => return .int (signed32 (← sysSleep (u32 k.natAbs)))
+    | .union (.real _) (.real r) =>
+      IO.sleep (Float.abs r * 1000.0).toUInt32
+      return .int 0
+    | _ => return .int (-1)
+  | "rows", [] => return .int 24     -- a68g's defaults when standard output is not a terminal
+  | "columns", [] => return .int 500
+  | "a68gargc", [] => return .int (← read).args.size
+  | "a68gargv", [i] => callBuiltin "argv" [i]
+  | "wallclock", [] | "wallseconds", [] | "walltime", [] => return .real (← sysWalltime ())
+  | "nan", [] => return .real (0.0 / 0.0)
+  | "inf", [] | "infinity", [] | "plusinf", [] | "plusinfinity", [] => return .real (1.0 / 0.0)
+  | "minusinf", [] | "minusinfinity", [] => return .real (-1.0 / 0.0)
+  | "isfinite", [x] => do let r ← expectReal x; return .bool (!r.isNaN && !r.isInf)
+  | "isinf", [x] | "isinfinite", [x] => do let r ← expectReal x; return .bool r.isInf
+  | "isplusinf", [x] => do let r ← expectReal x; return .bool (r.isInf && r > 0)
+  | "isminusinf", [x] => do let r ← expectReal x; return .bool (r.isInf && r < 0)
+  | "isnan", [x] => do let r ← expectReal x; return .bool r.isNaN
+  | "resetpossible", [f] | "rewindpossible", [f] | "setpossible", [f] | "binpossible", [f] =>
+    return .bool ([3, 4].contains (← fileChannel f))
+  | "getpossible", [f] => return .bool ([1, 3, 4].contains (← fileChannel f))
+  | "putpossible", [f] => return .bool ([0, 2, 3, 4].contains (← fileChannel f))
+  | "reidfpossible", [_] | "drawpossible", [_] => return .bool false
+  | "compressible", [_] => return .bool true
+  | "idf", [f] =>
+    let fs ← getFile (← fileIdOf f)
+    if fs.name.isEmpty then rtErr "attempt to use NIL" else return Value.ofString fs.name
+  | "term", [f] =>
+    let fs ← getFile (← fileIdOf f)
+    return Value.ofString (String.ofList (fs.term.map Char.ofNat))
+  | "eof", [f] | "endoffile", [f] | "eoln", [f] | "endofline", [f] =>
+    let fid ← fileIdOf f
+    let fs ← getFile fid
+    if fs.writing && fid != 1 then rtErr "the file is in write mood"
+    if !(fs.reading || fid == 1 || fs.fd ≥ 0) then rtErr "the file is in undetermined mood"
+    if name == "eof" || name == "endoffile" then return .bool (← atEnd fid)
+    if (← atEnd fid) then logicalEnd fid
+    return .bool ((← peekChar fid) == some 10)
+  | "set", [f, n] | "seek", [f, n] =>
+    -- a68g `genie_set` moves relative to the current position
+    let fid ← fileIdOf f
+    if !([3, 4].contains (← fileChannel f)) then rtErr "the channel does not allow setting the file"
+    let k ← expectInt n
+    let fs ← loadFile fid
+    let np : Int := fs.pos + k
+    if fs.buf.size == 0 || np < 0 || np ≥ fs.buf.size then
+      match fs.onEnd with
+      | some h =>
+        match (← callValue h [.file fid]) with
+        | .bool true => return .int np
+        | _ => rtErr "the file has ended"
+      | none => rtErr "the file has ended"
+    setFile fid { fs with pos := np.toNat }
+    return .int np
+  | "puts", [s, row] | "string", [s, row] | "putsf", [s, row] | "stringf", [s, row] =>
+    let (_, _, es) ← expectRow row
+    if es.size > 0 then
+      let text ← withStringFile fun fid => do
+        if name == "puts" || name == "string" then
+          for e in es do
+            match e with
+            | .union m v => printValue fid m v
+            | _ => rtErr "internal: put argument"
+        else printf fid es.toList
+      writeRef s (Value.ofString text)
+    return (if name == "string" || name == "stringf" then s else .void)
+  | "gets", [s, row] | "getsf", [s, row] =>
+    let (_, _, es) ← expectRow row
+    let fid ← (← read).files.modifyGet fun fs => (fs.size, fs.push { assoc := some s, channel := 4 })
+    if name == "gets" then getItems fid es else getfItems fid es
+    (← read).files.modify fun fs => if fs.size == fid + 1 then fs.pop else fs
+    return .void
+  | "readline", [] => do let s ← readLineStr 1; skipLine 1; return Value.ofString s
+  | "getbin", [f, row] | "putbin", [f, row] =>
+    let fid ← fileIdOf f
+    let (_, _, es) ← expectRow row
+    for e in es do
+      match e with
+      | .union m v => if name == "getbin" then readBin fid m v else writeBin fid m v
+      | _ => rtErr "internal: binary transput argument"
+    return .void
+  | "readbin", [row] => callBuiltin "getbin" [.file 3, row]
+  | "printbin", [row] | "writebin", [row] => callBuiltin "putbin" [.file 3, row]
+  | "onopenerror", [_, _] => return .void
   | fn, [x] =>
     if ["sqrt","exp","ln","log","log10","log2","exp2","sin","cos","tan","arcsin","arccos","arctan",
         "asin","acos","atan","sinh","cosh","tanh","arcsinh","arccosh","arctanh","cbrt","curt",
         "longsqrt","longexp","longln","longlog","longsin","longcos","longtan","longarcsin","longarccos",
         "longarctan","longlongsqrt","longlongexp","longlongln","longlongsin","longlongcos","longlongtan",
-        "longlongarctan","longlongarcsin","longlongarccos"].contains fn then
+        "longlongarctan","longlongarcsin","longlongarccos","gamma","lngamma","erf","erfc","ln1p"].contains fn then
       Value.real <$> mathFn fn (← expectReal x)
     else rtErr s!"unsupported standard procedure {fn}/1"
   | _, _ => rtErr s!"unsupported standard procedure {name}/{args.length}"
+
+/-- The channel of a file (0 stand out, 1 stand in, 2 stand error, 3 stand back, 4 associate). -/
+partial def fileChannel (f : Value) : M Nat := do
+  let fid ← fileIdOf f
+  let fs ← getFile fid
+  return if fid ≤ 2 then fid else fs.channel
+
+/-- Run some transput on a fresh string file and give what it wrote (a68g's `puts` and
+    `string`); the column of the current formatted line is left as it was. -/
+partial def withStringFile (act : Nat → M Unit) : M String := do
+  let col ← (← read).col.get
+  let cut ← nulCut.get
+  nulCut.set false
+  let fid ← (← read).files.modifyGet fun fs => (fs.size, fs.push { loaded := true, channel := 4 })
+  act fid
+  let f ← getFile fid
+  (← read).files.modify fun fs => if fs.size == fid + 1 then fs.pop else fs
+  (← read).col.set col
+  nulCut.set cut
+  return bytesStr f.buf
+
+/-- `n` bytes of a file for binary transput. -/
+partial def readBinBytes (fid : Nat) (n : Nat) : M ByteArray := do
+  let mut b := ByteArray.empty
+  for _ in [0:n] do
+    match (← readChar fid) with
+    | some c => b := b.push c.toUInt8
+    | none => logicalEnd fid
+  return b
+
+/-- `get bin`: a value laid out as a68g's C object is (INT, BOOL, CHAR and BITS in four bytes,
+    REAL in eight, a STRING as its length and its characters). -/
+partial def readBin (fid : Nat) (m : Mode) (r : Value) : M Unit := do
+  match (← resolveM m) with
+  | .ref t =>
+    match (← resolveM t), r with
+    | .int 0, _ => writeRef r (.int (int32At (← readBinBytes fid 4) 0))
+    | .bits 0, _ => writeRef r (.bits (uint32At (← readBinBytes fid 4) 0))
+    | .bool, _ => writeRef r (.bool (uint32At (← readBinBytes fid 4) 0 != 0))
+    | .char, _ => writeRef r (.char ((← readBinBytes fid 4).get! 0).toNat)
+    | .real 0, _ =>
+      let b ← readBinBytes fid 8
+      writeRef r (.real (Float.ofBits (b.toList.foldr (fun x acc => acc * 256 + x.toUInt64) 0)))
+    | .row 1 _ .char, _ =>
+      let n := int32At (← readBinBytes fid 4) 0
+      writeRef r (Value.ofString (bytesStr (← readBinBytes fid n.toNat)))
+    | .struct fs, .ref c path =>
+      for i in [0:fs.length] do
+        readBin fid (.ref (fs[i]!).2) (.ref c (path ++ [.field i]))
+    | .row 1 _ em, _ =>
+      let (_, _, es) ← expectRow (← readRef r)
+      for i in [0:es.size] do
+        readBin fid (.ref em) (← refElem r i)
+    | tt, _ => rtErr s!"cannot read a value of mode {modeName tt} in binary"
+  | .proc [.ref .file] .void => readInto fid m r
+  | _ => rtErr s!"cannot read into a value of mode {modeName m}"
+
+/-- `put bin`, the converse of `readBin`. -/
+partial def writeBin (fid : Nat) (m : Mode) (v : Value) : M Unit := do
+  match (← resolveM m), v with
+  | _, .union m' v' => writeBin fid m' v'
+  | .int 0, .int i => fileOut fid (bytesStr (leBytes (i % 4294967296).toNat 4))
+  | .bits 0, .bits b => fileOut fid (bytesStr (leBytes b 4))
+  | .bool, .bool b => fileOut fid (bytesStr (leBytes (if b then 1 else 0) 4))
+  | .char, .char c => fileOut fid (bytesStr (leBytes c 4))
+  | .real 0, .real x => fileOut fid (bytesStr (leBytes x.toBits.toNat 8))
+  | .row 1 _ .char, .row _ _ _ =>
+    let s ← strOf v
+    fileOut fid (bytesStr (leBytes s.length 4) ++ s)
+  | .struct fs, .struct vs =>
+    for (f, x) in fs.zip vs.toList do writeBin fid f.2 x
+  | .row _ _ em, .row _ _ es =>
+    for e in es do writeBin fid em e
+  | .proc [.ref .file] .void, f => printValue fid (.proc [.ref .file] .void) f
+  | _, .undef => rtErr s!"attempt to use an uninitialised {modeName m} value"
+  | mm, _ => rtErr s!"cannot write a value of mode {modeName mm} in binary"
+
+/-- `evaluate`: parse and elaborate the text in the environment of the call, whose names
+    arrive as a format text (`Elab.evaluateScope`), run it, and give its value as `print`
+    would write it.  A text that does not parse or elaborate gets a68g's monitor error on
+    standard output, and is itself the result. -/
+partial def evaluateCall (src : String) (env : Env) (items : List CoreFmt) : M Value := do
+  let mut names : List (String × Binding) := []
+  let mut ops : List OpBinding := []
+  let mut frame : Array Nat := #[]
+  let mut tag : String := ""
+  for it in items do
+    match it with
+    | .literal s => tag := s
+    | .general [e] =>
+      match (← evalFmtExpr env e) with
+      | .union m (.ref c []) =>
+        let slot := frame.size
+        frame := frame.push c
+        let n := String.ofList (tag.toList.drop 1)
+        let inner := match m with | .ref x => x | x => x
+        match tag.toList.head? with
+        | some 'o' => ops := ops ++ [{ name := n, mode := inner, depth := 1, slot := slot }]
+        | some 'v' => names := names ++ [(n, { mode := m, depth := 1, slot := slot, kind := .var })]
+        | _ => names := names ++ [(n, { mode := inner, depth := 1, slot := slot, kind := .ident })]
+      | _ => pure ()
+    | _ => pure ()
+  let failed (msg : String) : M Value := do
+    fileOut 0 s!"\na68g: monitor error: {msg}."
+    return Value.ofString src
+  match A68.parse src with
+  | .error e => failed e.msg
+  | .ok s =>
+    match Elab.elabEvaluate s names ops (← read).modes (← llDigits) with
+    | .error e => failed e.msg
+    | .ok (core, mode) =>
+      let v ← eval [frame, #[]] core
+      if (← resolveM mode) == .void then return Value.ofString ""
+      return Value.ofString (← withStringFile fun fid => printValue fid mode v)
 
 -- ### Formatted output
 
@@ -2446,7 +2878,11 @@ partial def nextPattern (fid : Nat) (st : FmtState) (want : Bool) (restarts : Na
     let mut i := fr.cursor
     while i < fr.pics.size do
       match fr.pics[i]! with
-      | .ins s => fileOut fid s; i := i + 1
+      | .ins s =>
+        fileOut fid s
+        -- a new line or page purges a68g's buffer (see `nulCut`)
+        if s.any (fun c => c == '\n' || c == '\x0c') then nulCut.set false
+        i := i + 1
       | .col k =>
         let pos ← (← read).col.get
         if k > pos + 1 then fileOut fid (String.ofList (List.replicate (k - pos - 1) ' '))
@@ -2710,6 +3146,7 @@ partial def printf (fid : Nat) (items : List Value) : M Unit := do
     let (leftover, _) ← nextPattern fid s false
     if leftover.isSome then rtErr "format has unused patterns"
   | none => pure ()
+  nulCut.set false
 
 end
 

@@ -166,7 +166,12 @@ def widenStep : Mode → List Mode
 /-- Is `to` reachable from `from` by widening (bounded search)? -/
 partial def widenable (src dst : Mode) (fuel : Nat := 6) : Bool :=
   if fuel = 0 then false
-  else (widenStep src).any fun m => m == dst || widenable m dst (fuel - 1)
+  else (widenStep src).any fun m => m == dst || sameRow m dst || widenable m dst (fuel - 1)
+where
+  -- `BITS` and `BYTES` widen to a row whether or not the row is flexible (`STRING (bytes)`)
+  sameRow : Mode → Mode → Bool
+    | .row d _ e, .row d' _ e' => d == d' && e == e'
+    | _, _ => false
 
 /-- Dereference and deprocedure fully ("meek" coercion with unknown target). -/
 partial def meekCoerce (c : Core) (m : Mode) : Elab (Core × Mode) := do
@@ -400,6 +405,10 @@ def builtinDyadic (op : String) (l : Core) (ml : Mode) (r : Core) (mr : Mode) : 
     return some (.dyop op (.int 0) mr l r, .int 0)
   | "=", .row _ _ _, .row _ _ _ | "/=", .row _ _ _, .row _ _ _ =>
     return some (.dyop op ml mr l r, .bool)
+  | "ELEM", .int _, .bytes a => return some (.dyop "ELEM" (.int 0) (.bytes a) l r, .char)
+  | "=", .bytes a, .bytes b | "/=", .bytes a, .bytes b | "<", .bytes a, .bytes b
+  | "<=", .bytes a, .bytes b | ">", .bytes a, .bytes b | ">=", .bytes a, .bytes b =>
+    if a == b then return some (.dyop op (.bytes a) (.bytes b) l r, .bool) else return none
   | _, _, _ => return none
 
 /-- Resolve a builtin monadic operator on a meek-coerced operand. -/
@@ -463,6 +472,13 @@ def constValue (name : String) (ll : Nat := Numfmt.defaultLLDigits) (fileName : 
   | "nullcharacter" | "nullchar" => .char 0 | "blank" => .char 32 | "flip" => .char 84 | "flop" => .char 70
   | "maxbits" => .bits 4294967295 | "bitsshorths" => .int 1
   | "errorchar" => .char 42
+  | "bytesshorths" => .int 1 | "longbyteswidth" => .int 256 | "standerrorchannel" => .int 2
+  | "blankcharacter" | "blankchar" => .char 32
+  | "formfeedcharacter" | "formfeedchar" => .char 12
+  | "newlinecharacter" | "newlinechar" => .char 10
+  | "tabcharacter" | "tabchar" => .char 9
+  | "eofcharacter" | "eofchar" => .char 255   -- a68g's EOF_CHAR is C's EOF, -1, as a char
+  | "expchar" => .char 101
   | "standout" => .file 0 | "standin" => .file 1 | "standerror" => .file 2 | "standback" => .file 3
   | "standoutchannel" => .int 0 | "standinchannel" => .int 1 | "standbackchannel" => .int 3
   | "nil" => .nil
@@ -488,6 +504,32 @@ def routineMode (e : Expr) : Elab Mode := do
     | some b => return b.mode
     | none => err s!"identifier {n} has not been declared"
   | _ => err "routine text expected"
+
+/-- The names a call of `evaluate` can see, passed to it as a format text.  For each name
+    there is a literal holding its kind (`v` variable, `i` identity, `o` operator) and the
+    name, then a general pattern holding a name of its cell, united with the mode of that
+    name.  The evaluator reaches the cells through the environment a format value
+    captures, and a compiled program keeps a cell for every slot a format text names, so
+    the text given to `evaluate` sees the objects of its caller in both. -/
+def evaluateScope : Elab Core := do
+  let s ← get
+  let d ← depth
+  let mut seen : List String := []
+  let mut items : List CoreFmt := []
+  let capture (tag : String) (m : Mode) (dp sl : Nat) : List CoreFmt :=
+    [.literal tag, .general [.unite (.ref m) (.refCell (d - 1 - dp) sl)]]
+  for sc in s.scopes do
+    for (n, b) in sc.names do
+      if b.depth != 0 && !seen.contains n then
+        seen := n :: seen
+        match b.kind with
+        | .var => items := items ++ capture ("v" ++ n) (match b.mode with | .ref m => m | m => m) b.depth b.slot
+        | .ident => items := items ++ capture ("i" ++ n) b.mode b.depth b.slot
+        | _ => pure ()
+  -- operators in the order `lookupOps` finds them
+  for ob in s.scopes.foldr (fun sc acc => acc ++ sc.ops.filter (·.depth != 0)) [] do
+    items := items ++ capture ("o" ++ ob.name) ob.mode ob.depth ob.slot
+  return .fmt items
 
 mutual
 
@@ -882,6 +924,8 @@ partial def elabCall (f : Expr) (args : List Expr) : Elab (Core × Mode) := do
     for (a, p) in args.zip ps do
       let (c, _) ← elabUnit a (.strong p)
       cs := cs ++ [c]
+    -- `evaluate` elaborates its text in the environment of the call
+    if let .lit (.builtin "evaluate") := fc then cs := cs ++ [← evaluateScope]
     return (.call fc cs, r)
   | _ => err s!"call of a non-procedure of mode {fm}"
 
@@ -1220,6 +1264,23 @@ def elabProgramWithModes (s : Serial) (ll : Nat := Numfmt.defaultLLDigits) (file
   let st : ElabState := { scopes := [base], llDigits := ll }
   match (elabSerial s (.strong .void)).run st with
   | .ok ((c, _), st') => .ok (c, st'.modes)
+  | .error e => .error e
+
+/-- Elaborate the text given to `evaluate`: the standard prelude, then one scope holding the
+    names the call could see (`evaluateScope`), whose cells the evaluator supplies as the
+    frame below the text's own.  Its labels are numbered far from the program's. -/
+def elabEvaluate (s : Serial) (names : List (String × Binding)) (ops : List OpBinding)
+    (modes : Mode.Table) (ll : Nat) : Except ElabError (Core × Mode) :=
+  let base : Scope := {
+    names := (Builtins.consts.map fun (n, m) =>
+                (n, { mode := m, depth := 0, slot := 0, kind := .builtinConst (constValue n ll "") }))
+             ++ (Builtins.procs.map fun (n, m) =>
+                (n, { mode := m, depth := 0, slot := 0, kind := .builtinProc n })),
+    ops := [], size := 0 }
+  let captured : Scope := { names := names, ops := ops, size := names.length + ops.length }
+  let st : ElabState := { scopes := [captured, base], modes := modes, llDigits := ll, labelCount := 1000000000 }
+  match (elabSerial s .meekAny).run st with
+  | .ok ((c, m), _) => .ok (c, m)
   | .error e => .error e
 
 end Elab
