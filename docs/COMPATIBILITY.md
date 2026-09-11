@@ -87,6 +87,18 @@ restarts. Details reproduced from a68g:
 * `n k` aligns to column `n` of the current `printf` line.
 * `f(fmt)` enters an embedded format that is left when exhausted.
 * Strings are one value each (not straightened into characters).
+* A `COMPL` is written and read as two `REAL` values, each taking a pattern of its
+  own, so `$gl$` puts its parts on two lines.
+* Bits patterns `16r8d`, `n(base)r4z` write and read `BITS` through a mould in any
+  radix from 2 to 16; `z` frames blank leading zeros and read a blank as a zero.
+* `h`, `h(a)`, `h(a,m)`, `h(w,a,m)`, `h(w,a,e,m)` write a number with a68g's `real`,
+  whose exponent is a multiple of `m` (3 by default); `h` alone writes other modes as
+  `g` does.
+* C-style patterns `%[-][+][w][.a]d i f e g b o x s c` follow a68g's
+  `write_c_pattern`: the conversion's leading blanks are dropped and the text aligned
+  right in the width, or left for `-`; `%g` chooses fixed notation when the exponent is
+  from -3 to the number of decimals.  On input a width reads exactly that many
+  characters.  `%c` cannot write, as in a68g.
 
 ## Reading
 
@@ -94,16 +106,48 @@ restarts. Details reproduced from a68g:
 (so `1-3` yields 1 and leaves `-3`), `REAL` also a fraction and exponent,
 `STRING` reads to the end of the line or a `make term` terminator, a fixed
 `[n]CHAR` reads exactly `n` characters, structs and rows are read element
-by element. End of file calls the `on logical file end` mender; if it returns
+by element, and a `UNION` is read with the mode of the value it currently holds. End
+of file calls the `on logical file end` mender; if it returns
 `TRUE` the rest of the transput call is abandoned.
 
 ## Files
 
-`open` succeeds only on an existing file and returns non-zero otherwise;
-`establish` creates a file; `associate` connects a file with a `STRING`
-variable (reads see the current value of the string, writes update it
-immediately); `close` writes disk files; `reset` rewinds. Standard files are
-`stand in`, `stand out`, `stand error`.
+`open` returns 0 for an existing regular file and otherwise the error number `stat`
+gives (`ENOENT` for a directory), and sets the file up either way, as a68g opens files
+when they are first used; `establish` creates a file; `associate` connects a file with
+a `STRING` variable.  The string is emptied when the file turns to writing, and each
+write appends to what the string then holds; reading continues at the position reached,
+in the string's current value.  `close` writes disk files; `reset` and `rewind` rewind,
+and like `set` are refused unless the channel allows them (`stand back channel` and
+associated files do, `stand in channel` and `stand out channel` do not, which is also
+what `reset possible` and its relatives say). `scratch` and `erase` remove a file
+that has been used. Standard files are `stand in`, `stand out`, `stand error`.
+
+a68g collects transput in C strings, so a NUL character ends the text that reaches
+standard output until the buffer is next purged: after each item of `print`, and at a
+new line, a new page or the end of a `printf`.  `print (("a" + REPR 0 + "b", "c"))`
+writes `ac`.
+
+`BYTES` and `LONG BYTES` are rows of 32 and 256 characters, padded with NUL; `bytes pack`,
+`ELEM`, the comparisons and the widening to `[] CHAR` and `STRING` are provided.
+
+## Operating-system procedures
+
+`system`, `fork`, `wait pid`, `execve`, `execve child`, `execve child pipe`,
+`execve output`, `get directory` (in `readdir` order), the `file is ...` enquiries and
+`file mode` (from `stat`, so `file is link` is never true, as in a68g), `grep in string`,
+`grep in substring` and `sub in string` (POSIX extended regular expressions, taking the
+widest of the first `re_nsub` matches as a68g does), `getenv`, `local time`, `utc time`,
+`strerror`, `errno`, `get pwd`, `set pwd`, `realpath` and `sleep` call the C library
+routines a68g calls (`csrc/sys.c`), and so do `gamma`, `ln gamma`, `erf`, `erfc` and
+`ln1p`.  Standard output is flushed before a process is forked or a command run, so the
+child's output follows what the program printed before.  `rows` and `columns` are 24 and
+500, a68g's values when standard output is not a terminal.
+
+`evaluate` parses and elaborates its text in the environment of the call, sees the
+names visible there, and gives the value as `print` writes it.  The names reach it as a
+format text holding a name of each cell (`Elab.evaluateScope`), which both back ends
+keep alive.
 
 ## Random numbers
 
@@ -135,11 +179,17 @@ reported separately by the test scripts.
   than about 15 significant digits differ.
 * **`LONG INT` printed through `fixed`/`float`** uses the double conversion
   above for `INT` but exact conversion for `LONG INT`, as a68g does.
-* **Unsupported a68g extensions**: refinements, `evaluate`, `DOUBLE`, C-style
-  `%` formats, partial parametrisation (`f (x, )`), semaphores and `PAR`,
-  `sound`, curses, plotutils, GSL, MPFR, R mathlib, sockets, `system`,
-  `execve`, environment and date/time enquiries (`local time`, `getenv`,
-  `file is directory`).
+* **Unsupported a68g extensions**: refinements, `DOUBLE`, partial parametrisation
+  (`f (x, )`), semaphores and `PAR`, `sound`, curses, plotutils, GSL, MPFR, R mathlib,
+  sockets, `http content`, and the `PIPE` mode indicant (the values `execve child pipe`
+  yields can be used, but `PIPE` cannot be written as a declarer).
+* **`evaluate`** accepts any unit here.  a68g evaluates the text with its monitor, which
+  only knows expressions over the standard environment: it refuses calls of the
+  program's own procedures and operands that need widening (`1.5 * 2`), prints a
+  monitor error and returns the text.  Programs a68g evaluates successfully get the
+  same result; where a68g reports a monitor error the texts of the errors differ.
+* **`open` followed by writing** appends to the file's contents here; a68g writes over
+  them from the start without truncating.
 * **Output already written when formatted transput fails.** When a `printf`
   picture cannot accept the value it is given, a68g discards the characters it
   had produced for that item and this implementation keeps them. Both fail on

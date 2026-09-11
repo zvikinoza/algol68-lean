@@ -10,11 +10,14 @@ Small programs covering every construct area (formats, loops and cases,
 procedures and operators, modes, names into rows). Their expected outputs were
 recorded from a68g (`tests/run-cases.sh --record`) and are checked with
 `tests/run-cases.sh` through the evaluator and `tests/run-cases-compiled.sh`
-through the C back end. All 13 pass on both. Six of them are regression cases for
+through the C back end. All 16 pass on both. Six of them are regression cases for
 defects the external corpus and the fuzzer found in compiled programs: a
 `GO TO` out of a routine that hung, values of declared modes that could not be
 printed, subscripts through a `REF` row parameter, an event routine that leaves
-with a `GO TO`, the evaluation order of direct calls, and `REAL` division.
+with a `GO TO`, the evaluation order of direct calls, and `REAL` division.  Three
+cover a68g's library extensions: `format-items` (bits, `h` and C-style patterns),
+`stdenv-strings` (regular expressions, string transput, `evaluate`, `BYTES`, associated
+strings) and `stdenv-processes` (`system`, `fork`, the `execve` family).
 
 ## 2. Number-formatting differential test (`tests/fmt`)
 
