@@ -1,0 +1,33 @@
+# Direct calls observe the evaluator's order.  Each callee here has a primitive       #
+# signature, so it compiles to a plain C call, and each line checks that operands and #
+# arguments are evaluated left to right, that a value read to the left of a call is  #
+# read before the call changes it, and that a jump out of a call made inside an       #
+# expression lands where it should.                                                    #
+BEGIN
+  INT x := 1;
+  [3] INT a := (10, 20, 30);
+  PROC show = (INT v) INT: (print((v, newline)); v);
+  PROC bump = (INT v) INT: (x := x + v; x);
+  PROC poke = (INT i) INT: (a[i] := a[i] * 2; i);
+  PROC say = (INT v) VOID: print(("say", v, newline));
+  PROC fib = (INT n) INT: IF n < 2 THEN n ELSE fib(n - 1) + fib(n - 2) FI;
+  PROC even = (INT n) BOOL: IF n = 0 THEN TRUE ELSE odd(n - 1) FI,
+       odd = (INT n) BOOL: IF n = 0 THEN FALSE ELSE even(n - 1) FI;
+  PROC add3 = (INT p, INT q, INT r) INT: p * 100 + q * 10 + r;
+  PROC escape = (INT v) INT: IF v > 2 THEN GO TO out ELSE v FI;
+  print((show(1) + show(2), newline));
+  print((add3(show(3), show(4), show(5)), newline));
+  print((add3(show(6), 7, show(8)), newline));
+  print((x + bump(5), newline));
+  print((x, newline));
+  print((a[2] + poke(2), newline));
+  print((a[2], newline));
+  say(9);
+  print((fib(15), newline));
+  print((even(10), odd(7), newline));
+  INT total := 0;
+  FOR i TO 5 DO total := total + escape(i) * 10 OD;
+  print(("not reached", newline));
+out:
+  print((total, newline))
+END
