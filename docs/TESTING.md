@@ -77,6 +77,21 @@ jump had the top of its caller's operand stack taken as its result, which emptie
 stack when the label was in a loop body; and compiled programs saw their own path as
 `argv (1)` where a68g gives `a68g` and the source file.
 
+## 3b. The collector
+
+Compiled programs collect their heap (docs/GC-DESIGN.md). `A68LEAN_GC=stress` makes the
+collector run at every safe point, so any value the runtime failed to keep in a root
+is freed while still in use; `A68LEAN_GC=verify` never reuses freed memory and, after
+every collection, walks everything reachable and stops the program if it finds a freed
+object. The compiled case suite is run under `stress,verify` as well as plainly, and
+the fuzzer too. Two cases exercise the collector directly: `gc-churn` allocates
+tens of megabytes of short-lived lists, rows and strings while keeping a small live
+set, and `gc-roots` uses values that are reachable only through roots the collector
+must know — a routine's frame, a file's associated string and event routine, a name
+of a sub-row, a united row, a procedure parameter — after heavy allocation.
+`A68LEAN_GC=stats` reports the collections, the bytes freed, the peak live size and
+the time spent.
+
 ## 4. Differential fuzzing (`fuzz/`)
 
 `fuzz/gen.py` is a grammar-based generator of random Algol 68 programs over

@@ -292,3 +292,14 @@ transcription itself and the C runtime's adherence to R2, which `stress` and
 * **M5 — Native code for the new representation.** Field access and link
   following in C (`data_list`), descriptor-based slicing in C (`data_slice`).
 * **M6 — Documentation and hardening.**
+
+## 7. Status
+
+* M1 (C runtime) and M2 (collector) are implemented in `csrc/rt.c`; the Lean services
+  are `A68/Runtime.lean` and the codec `A68/Blob.lean`. The collector is eager
+  mark–sweep over a linked list of `malloc`ed objects; size-classed free lists and
+  lazy sweeping (§4.1) are performance work still to do, as is the generational
+  collector (M3).
+* M4: `A68/Verified/GC.lean` proves the four theorems of §5 on the model.
+* The operators of the primitive modes, strings and row bounds run natively; `LONG`,
+  `COMPL`, `BYTES` and rows compared as values still cross to the Lean side (§3.8).

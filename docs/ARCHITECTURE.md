@@ -237,37 +237,28 @@ program rather than a plugin loaded back into an interpreter:
   `rtDepthOf` translates the syntactic depths that `loadCell` and `refCell`
   carry into the run-time depths that remain. A `FOR` counter becomes the C
   induction variable itself, and `x +:= e` on such a variable is a C update.
-* **Everything else goes through the runtime.** `A68.Runtime` exposes the
-  evaluator's operations as a C-callable API that is deliberately integer-only,
-  so the generated C never touches a Lean object: an environment stack of frames
-  of cells (`a68rt_enter` / `a68rt_leave`) and an operand stack of values
-  (`a68rt_push_*`, `a68rt_dyop`, …), which is the discipline the verified stack
-  machine models. Rows and structures have short cuts: an element of a row held
-  directly in a cell, or a chain of field selections rooted at one, is read and
-  written by one call that carries a native value, `s +:= c` appends to a string
-  in place, and anything else falls back to the general machinery.
-* **Rows, strings and unions in C memory.** A fixed row of primitive elements used only
-  through subscripts, bounds enquiries and element updates in statement position is a
-  C array with a defined-flag per element, so a read is a bounds check and a load. A
-  row of structures of primitive fields is one C array per field; a row of a union of
-  primitive modes is a tag array and a payload array, and a conformity clause on an
-  element is a `switch` on the tag. A `STRING` variable declared with a denotation and
-  used through reads, subscripts, comparisons, assignments and `+:=` is a growable C
-  buffer, made a runtime value again only where a whole-string value is needed. Each
-  has its own escape analysis (`rowEscapes`, `srowEscapes`, `urowEscapes`,
-  `strEscapes`), and anything it does not recognise keeps the cell.
-* **Choices and jumps stay in C.** Conditional and case clauses of primitive mode are C
-  conditional expressions and `switch`es, written into a C variable when assigned;
-  `ANDF` and `OREL` are `&&` and `||`. In a block with labels, a unit followed by
-  another before any `EXIT` is a statement, so its variables are still promoted.
-* **Calls through procedure parameters.** A routine with a plain entry point and no
-  captured environment is recorded in a table indexed by its boxed function; a call
-  through a procedure parameter looks the entry point up once per invocation of the
-  caller (a parameter is an identity, so it cannot change) and calls it directly,
-  falling back to the boxed call for anything else.
-* **Heap cells are given back.** A routine whose result mode holds no names and whose
-  body lets no reference escape marks the heap on entry and releases it on return, so
-  boxed calls do not grow the heap without bound.
+* **Everything else goes through the C runtime.** `csrc/rt.c` keeps the program's
+  values in C memory — a 16-byte tagged slot per value, objects for structures,
+  unions, frames and rows (a descriptor over a store, with copy-on-write for the
+  stores that values share) — and implements the entry points the generated code
+  calls: an environment of frames (`a68rt_enter` / `a68rt_leave`) and an operand
+  stack of slots (`a68rt_push_*`, `a68rt_dyop`, …), which is the discipline the
+  verified stack machine models. The operators of the primitive modes, strings and
+  row bounds are computed there; what is computed on copies — transput, formatting,
+  `LONG` arithmetic, the standard prelude — is asked of the Lean services
+  (`A68.Runtime`), with values crossing in the `A68.Blob` encoding and names,
+  closures and format texts crossing as C addresses the evaluator reaches back
+  through (`Value.cref`, `cclos`, `cfmt`). Rows and structures have short cuts: an
+  element of a row held directly in a cell, or a chain of field selections rooted at
+  one, is read and written by one call that carries a native value, `s +:= c`
+  appends to a string in place, and anything else falls back to the general
+  machinery.
+* **The heap is collected.** A mark–sweep collector in the same file marks from the
+  operand stack, the frame chain, the saved environments and the objects handed to
+  the Lean side, and sweeps the rest; allocation is the only safe point, taken at the
+  start of every entry point that allocates, so the generated C never holds a heap
+  pointer across a collection. The design, its invariants and the proof of the
+  collector's model are in docs/GC-DESIGN.md and `A68/Verified/GC.lean`.
 * **Reaching a statement is a store, not a call.** The current line lives in a C
   variable that the error reporters read when a compiled program is running.
 * **Tables are rebuilt at start-up.** Modes tag united values and drive the
@@ -314,6 +305,6 @@ Promotion depends on the optimiser having flattened the block structure: at
 block rather than a statement, and the escape analysis rightly refuses. `-O1`
 and `-O2` flatten first, and that is where the native code appears.
 
-A compiled program links the Lean runtime and this compiler's library, so the
+A compiled program links the C runtime, the Lean services and the Lean runtime, so the
 binaries are large (about 18 MB) and need the Lean toolchain at link time, not
 at run time.

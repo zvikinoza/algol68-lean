@@ -103,6 +103,32 @@ digit value itself, with one radix digit equal to seven decimal digits. The roun
 that follows (`round_internal_mp`) is deliberately not "proved correct": it is
 a68g's, including its unusual half-way rule, and is tested instead.
 
+### The collector of compiled programs (`A68/Verified/GC.lean`)
+
+A compiled program keeps its values in C memory and collects them with a mark–sweep
+collector (`csrc/rt.c`, docs/GC-DESIGN.md). The collector is modelled as a worklist
+over a heap of identifiers — each object is the list of identifiers it points at, the
+roots are a list of identifiers — and the C functions transcribe the model's:
+
+```lean
+theorem mark_sound    : ∀ i ∈ (markN h roots n).marked, Reach h roots i
+theorem mark_complete : (markN h roots n).work = [] → ∀ i, Reach h roots i → i ∈ (markN h roots n).marked
+theorem collect_correct : (markN h roots n).work = [] →
+    ∀ i, Reach (sweep h (markN h roots n).marked) roots i ↔ Reach h roots i
+theorem sweep_frees_unreachable : -- every object the sweep removes was unreachable
+theorem alloc_fresh   : i ∉ h.dom → i ∉ roots → (closed h) → ¬ Reach h roots i
+```
+
+That is: whatever the marker marks is reachable; once the worklist is empty everything
+reachable is marked; sweeping the unmarked objects changes reachability of nothing and
+frees only garbage; and an identifier outside the heap aliases nothing live. The
+invariant the proof rests on — everything marked is reachable, everything on the
+worklist is marked, and an identifier that has left the worklist has all its pointers
+marked — is the loop invariant of `gc_mark`. What the theorems do not cover is the
+transcription itself and the runtime's discipline that every live value is in a root
+at a safe point; the `stress` and `verify` modes of the collector test those
+(docs/TESTING.md).
+
 ### Totality
 
 Apart from the parser (`partial def`, backtracking recursive descent), the
