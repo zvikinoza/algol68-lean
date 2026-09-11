@@ -211,19 +211,25 @@ program rather than a plugin loaded back into an interpreter:
   lengths keep the runtime's arbitrary-precision representation.
 * **Locals that cannot escape become C variables.** A slot qualifies when its
   declared mode is primitive, nothing takes a reference to it, and no routine
-  text or format text inside the frame could reach it from another C function.
-  When every slot of a frame qualifies, no run-time frame is pushed for it, and
+  text or format text inside the frame reads or names it. Those are compiled
+  into C functions of their own and reach the frame through the run-time
+  environment, so a slot they can see keeps its cell; the analysis asks exactly
+  that (`seenByOtherFn`, on a traversal that covers every constructor and counts
+  the frames entered on the way down), so declaring a procedure in a block no
+  longer costs the block its C variables. When every slot of a frame qualifies
+  and no such text is present, no run-time frame is pushed for it, and
   `rtDepthOf` translates the syntactic depths that `loadCell` and `refCell`
   carry into the run-time depths that remain. A `FOR` counter becomes the C
-  induction variable itself.
+  induction variable itself, and `x +:= e` on such a variable is a C update.
 * **Everything else goes through the runtime.** `A68.Runtime` exposes the
   evaluator's operations as a C-callable API that is deliberately integer-only,
   so the generated C never touches a Lean object: an environment stack of frames
   of cells (`a68rt_enter` / `a68rt_leave`) and an operand stack of values
   (`a68rt_push_*`, `a68rt_dyop`, …), which is the discipline the verified stack
-  machine models. Rows are the one composite with a short cut: an element of a
-  row held directly in a cell is read and written by one call that carries a
-  native value, and anything else falls back to the general slicing machinery.
+  machine models. Rows and structures have short cuts: an element of a row held
+  directly in a cell, or a chain of field selections rooted at one, is read and
+  written by one call that carries a native value, `s +:= c` appends to a string
+  in place, and anything else falls back to the general machinery.
 * **Reaching a statement is a store, not a call.** The current line lives in a C
   variable that the error reporters read when a compiled program is running.
 * **Tables are rebuilt at start-up.** Modes tag united values and drive the
@@ -235,12 +241,35 @@ program rather than a plugin loaded back into an interpreter:
   format text are `Core.hole` nodes. When the runtime needs either, it calls
   `a68_dispatch_proc` / `a68_dispatch_hole`, which the generated program
   defines. The `a68lean` binary itself links stubs for them (`csrc/stubs.c`).
+* **Direct calls.** A routine whose frame is exactly its parameters, all of
+  primitive mode, whose result is primitive or `VOID`, and which contains no
+  further routine or format text, is compiled a second time as a plain C
+  function `a68_nf{k}`: parameters are C arguments, the result is the C return
+  value, and no run-time frame is pushed (`natSigOf`, `genNative`). A call goes
+  there only when that is certainly the same thing: the callee is a slot declared
+  by a routine text, which as an identity declaration holds nothing else, and the
+  frame the slot lives in is the innermost run-time frame, so the environment the
+  routine captured is already in effect (`staticNat`). A block's units see a
+  routine once its declaration has been passed; a routine body also sees those
+  declared with it in the same run of routine declarations, which makes
+  recursion and mutual recursion direct. Everything else — a `PROC` variable, a
+  procedure parameter, a call from somewhere an environment switch is needed —
+  keeps the boxed entry point and the operand-stack call.
+* **Calls inside expressions keep their order.** An expression containing a
+  direct call is emitted in A-normal form (`anf`): each call is a statement
+  followed by the jump check, and the left operand of an operator whose right
+  operand calls is hoisted first, unless it is a literal or a C variable that
+  needs no undefined test, which no callee can reach and whose reading can
+  neither fail nor act. C's unspecified order of evaluating operands therefore
+  never decides the order of an Algol program's side effects.
 * **Jumps.** A jump to a label of the enclosing C function is a C `goto`. A jump
-  out of a routine sets a pending label and returns; each call site checks it and
-  either lands on one of its own labels or returns in turn, so the C stack
-  unwinds without `longjmp`. Landing restores the environment and operand stack
-  to the depths recorded at block entry, which is what the evaluator does when it
-  re-enters a block at a label.
+  out of a routine sets a pending label — a plain C variable, `a68_jump_flag`,
+  since every call site tests it — and returns, with a dummy value from a plain C
+  entry point; each call site checks it and either lands on one of its own labels
+  or returns in turn, so the C stack unwinds without `longjmp`. Landing clears the
+  pending label and restores the environment and operand stack to the depths
+  recorded at block entry, which is what the evaluator does when it re-enters a
+  block at a label.
 
 Promotion depends on the optimiser having flattened the block structure: at
 `-O0` each unit sits in its own block, so an assignment is the value of its
