@@ -145,6 +145,11 @@ def cellCore (b : Binding) : Elab Core := do
   match b.kind with
   | .var => return .refCell rel b.slot
   | .ident => return .loadCell rel b.slot
+  | .builtinConst (.builtin n) =>
+    -- a constant that is not a procedure but has no literal value: evaluate it by name
+    match b.mode with
+    | .proc _ _ => return .lit (.builtin n)
+    | _ => return .call (.lit (.builtin n)) []
   | .builtinConst v => return .lit v
   | .builtinProc n => return .lit (.builtin n)
   | .label id => return .goto id
@@ -366,9 +371,11 @@ def builtinDyadic (op : String) (l : Core) (ml : Mode) (r : Core) (mr : Mode) : 
       | _ => return none
     | "**" =>
       match ml, mr with
-      | .int a, .int _ => return some (.dyop "**" (.int a) (.int 0) l r, .int a)
-      | .real a, .int _ => return some (.dyop "**" (.real a) (.int 0) l r, .real a)
-      | .compl a, .int _ => return some (.dyop "**" (.compl a) (.int 0) l r, .compl a)
+      -- the exponent of `M ** INT` is a plain INT; a longer integral exponent makes a68g
+      -- widen both operands (`LONG 2 ** LONG 3` is a LONG REAL)
+      | .int a, .int 0 => return some (.dyop "**" (.int a) (.int 0) l r, .int a)
+      | .real a, .int 0 => return some (.dyop "**" (.real a) (.int 0) l r, .real a)
+      | .compl a, .int 0 => return some (.dyop "**" (.compl a) (.int 0) l r, .compl a)
       | _, _ =>
         let j' := match j with | .int n => .real n | m => m
         return some (.dyop "**" j' j' (widenTo l ml j') (widenTo r mr j'), j')
@@ -447,12 +454,10 @@ def constValue (name : String) (ll : Nat := Numfmt.defaultLLDigits) (fileName : 
   | "minreal" => .real 2.2250738585072014e-308
   | "smallreal" => .real 2.220446049250313e-16
   | "pi" => .real 3.141592653589793
-  | "longpi" | "longlongpi" => .real 3.141592653589793
+  -- `long pi`, `long max real` and the other LONG REAL constants are computed at run time
+  -- by the builtin of that name (see `Interp.mpConst`): π comes from a68g's cache
   | "longmaxint" => .int Numfmt.longMaxInt
   | "longlongmaxint" => .int (Numfmt.maxIntOf 2 ll)
-  | "longmaxreal" | "longlongmaxreal" => .real 1.7976931348623157e308
-  | "longsmallreal" => .real 1e-42
-  | "longlongsmallreal" => .real 1e-70
   | "intwidth" => .int 10 | "realwidth" => .int 15 | "expwidth" => .int 3
   | "longintwidth" => .int 50 | "longrealwidth" => .int 42 | "longexpwidth" => .int 3
   | "longlongintwidth" => .int (Numfmt.intWidthOf 2 ll) | "longlongrealwidth" => .int (Numfmt.realWidthOf 2 ll)
@@ -758,7 +763,11 @@ partial def elabUnit (e : Expr) (ctx : Ctx) : Elab (Core × Mode) := do
 partial def elabPrimary (e : Expr) : Elab (Core × Mode) := do
   match e with
   | .intLit v long _ => return (.lit (.int v), .int long)
-  | .realLit t long _ => return (.lit (.real (Numfmt.parseFloat t)), .real long)
+  | .realLit t long _ =>
+    -- a LONG denotation keeps its text: a68g converts it with `string_to_mp` at the
+    -- precision of its length, which a double cannot carry
+    if long ≥ 1 then return (.monop "DENOT" (.real long) (.lit (Value.ofString t)), .real long)
+    else return (.lit (.real (Numfmt.parseFloat t)), .real long)
   | .bitsLit r d long _ => return (.lit (.bits (bitsValue r d)), .bits long)
   | .strLit s _ =>
     if s.length == 1 then return (.lit (.char s.front.toNat), .char)

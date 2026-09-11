@@ -1,6 +1,8 @@
 import A68.Core
 import A68.Elab
 import A68.Numfmt
+import A68.MPMath
+import A68.MPFmt
 
 /-!
 # A68.Interp — evaluator for the elaborated `Core` representation
@@ -387,6 +389,230 @@ def checkReal (x : Float) : M Float := do
   if x.isInf then rtErr "infinite REAL value"
   return x
 
+-- ## Multi-precision values (`LONG` and `LONG LONG` modes)
+
+/-- a68g's caches of π, ln 10⁷ and ln 10 (`mp-pi.c`, `mp-math.c`): one per run. -/
+builtin_initialize mpCacheRef : IO.Ref MP.Cache ← IO.mkRef {}
+
+/-- Digits of the multi-precision representation of a mode of length `n ≥ 1`. -/
+def mpDigitsOf (n : Int) : M Nat := do
+  if n ≤ 1 then return MP.longDigits else return (← llDigits)
+
+/-- `A68G_LONG_LONG_REAL_WIDTH`, the digit limit of MP formatting. -/
+def llRealWidth : M Nat := do return ((← llDigits) - MP.guards) * MP.logR
+
+/-- Run an MP computation; a68g's run-time errors become ours. -/
+def liftMP (x : MP.MPE α) : M α :=
+  match x with
+  | .ok v => pure v
+  | .error e => rtErr e
+
+/-- Run an MP computation that uses a68g's caches. -/
+def runMM (x : MP.MM α) : M α := do
+  let c ← mpCacheRef.get
+  match x.run c with
+  | .ok (v, c') => mpCacheRef.set c'; pure v
+  | .error e => rtErr e
+
+def expectMP : Value → M MP.MP
+  | .mp x => pure x
+  | .undef => rtErr "attempt to use an uninitialised LONG REAL value"
+  | _ => rtErr "internal: LONG REAL expected"
+
+/-- A `LONG INT` / `LONG LONG INT` value (an `Int`) as a number of `digs` digits. -/
+def intToMP (k : Int) (digs : Nat) : M MP.MP := liftMP (MP.ofInt k digs)
+
+/-- An integral MP result back to an `Int`, after a68g's `test_mp_int_range`. -/
+def mpToLongInt (z : MP.MP) (long : Int) : M Int := do
+  let digs ← mpDigitsOf long
+  if !MP.isIntOfDigits z digs then rtErr s!"{Mode.toString (.int long)} value out of bounds"
+  return MP.toIntTrunc z
+
+/-- A `REAL` lengthened to `LONG REAL` (`real_to_mp` at `LONG` precision) and, for
+    `LONG LONG REAL`, zero-extended as `genie_lengthen_mp_to_long_mp` does. -/
+def realToLongReal (x : Float) (n : Int) : M MP.MP := do
+  let z ← liftMP (MP.realToMp (MP.nil MP.longDigits) x MP.longDigits)
+  if n ≥ 2 then return MP.lenMp z MP.longDigits (← llDigits) else return z
+
+/-- `LONG REAL` / `LONG LONG REAL` dyadic operators, with the checks `genie_*_mp` make. -/
+def mpDyadic (op : String) (n : Int) (x y : MP.MP) : M Value := do
+  let digs ← mpDigitsOf n
+  let mn := Mode.toString (.real n)
+  match op with
+  | "+" => return .mp (← liftMP (MP.addMp x x y digs))
+  | "-" => return .mp (← liftMP (MP.subMp x x y digs))
+  | "*" =>
+    let r ← liftMP (MP.mulMp x x y digs)
+    if !r.isFinite then rtErr s!"{mn} value is not finite"
+    return .mp r
+  | "/" =>
+    let r ← liftMP (MP.divMp x x y digs)
+    if r.isNaN then rtErr s!"{mn} value is not a number"
+    return .mp r
+  | "**" => return .mp (← runMM (MP.powMp x x y digs))
+  | "=" => return .bool (← liftMP (MP.eqMp x y digs))
+  | "/=" => return .bool (← liftMP (MP.neMp x y digs))
+  | "<" => return .bool (← liftMP (MP.ltMp x y digs))
+  | "<=" => return .bool (← liftMP (MP.leMp x y digs))
+  | ">" => return .bool (← liftMP (MP.gtMp x y digs))
+  | ">=" => return .bool (← liftMP (MP.geMp x y digs))
+  | _ => rtErr s!"internal: {mn} operator {op}"
+
+/-- `LONG INT` / `LONG LONG INT` dyadic operators.  Sums, differences and products of
+    in-range integers are exact in a68g's arithmetic and checked by `test_mp_int_range`;
+    `OVER` and `MOD` go through the real division, so they are done with `A68.MP`. -/
+def longIntDyadic (op : String) (n : Int) (x y : Int) : M Value := do
+  let digs ← mpDigitsOf n
+  let lim := Numfmt.maxIntOf n (← llDigits)
+  let mn := Mode.toString (.int n)
+  let chk (r : Int) : M Value := do
+    if r.natAbs > lim.natAbs then rtErr s!"{mn} value out of bounds"
+    return .int r
+  match op with
+  | "+" => chk (x + y)
+  | "-" => chk (x - y)
+  | "*" => chk (x * y)
+  | "%" =>
+    let xm ← intToMP x digs
+    let ym ← intToMP y digs
+    let r ← liftMP (MP.overMp xm xm ym digs)
+    if r.isNaN then rtErr s!"{mn} value is not a number"
+    if r.isInf then rtErr s!"{mn} division by zero"
+    return .int (MP.toIntTrunc r)
+  | "%*" =>
+    let xm ← intToMP x digs
+    let ym ← intToMP y digs
+    let r ← liftMP (MP.modMp xm xm ym digs)
+    if r.isNaN then rtErr s!"{mn} value is not a number"
+    let r ← if r.dig 1 < 0 then liftMP (MP.addMp r r (ym.setDig 1 (ym.dig 1).natAbs) digs) else pure r
+    return .int (MP.toIntTrunc r)
+  | "=" => return .bool (x == y)
+  | "/=" => return .bool (x != y)
+  | "<" => return .bool (x < y)
+  | "<=" => return .bool (x ≤ y)
+  | ">" => return .bool (x > y)
+  | ">=" => return .bool (x ≥ y)
+  | _ => rtErr s!"internal: {mn} operator {op}"
+
+/-- `LONG INT ** INT` (`genie_pow_mp_int_int`). -/
+def longIntPow (n : Int) (x : Int) (k : Int) : M Value := do
+  let digs ← mpDigitsOf n
+  let xm ← intToMP x digs
+  let r ← liftMP (MP.powMpInt xm xm k digs)
+  return .int (← mpToLongInt r n)
+
+/-- Monadic operators on `LONG REAL` / `LONG LONG REAL`. -/
+def mpMonadic (op : String) (n : Int) (x : MP.MP) : M Value := do
+  let digs ← mpDigitsOf n
+  match op with
+  | "-" => return .mp (← liftMP (MP.minusMp x))
+  | "+" => return .mp x
+  | "ABS" => return .mp (← liftMP (MP.absMp x))
+  | "SIGN" => let d := x.dig 1; return .int (if d > 0 then 1 else if d < 0 then -1 else 0)
+  | "ENTIER" => return .int (MP.toIntTrunc (← liftMP (MP.entierMp x x digs)))
+  | "ROUND" => return .int (MP.toIntTrunc (← liftMP (MP.roundMp x x digs)))
+  | "SHORTEN" =>
+    if n ≤ 1 then return .real (← liftMP (MP.mpToReal x digs))
+    else return .mp (← liftMP (MP.shortenMp (MP.nil MP.longDigits) MP.longDigits x digs))
+  | _ => rtErr s!"internal: monadic operator {op} on {Mode.toString (.real n)}"
+
+/-- The standard layout of a `LONG` / `LONG LONG REAL` in `print`: `float (x, rw + ew + 4,
+    rw - 1, ew + 1)` with the widths of the length. -/
+def mpFloatStd (x : MP.MP) (n : Int) : M String := do
+  let ll ← llDigits
+  let rw : Int := Numfmt.realWidthOf n ll
+  let ew : Int := Numfmt.expWidthOf n
+  liftMP (MPFmt.float x (← mpDigitsOf n) (rw + ew + 4) (rw - 1) (ew + 1) 1 (← llRealWidth))
+
+/-- Split `long…` / `longlong…` off a prelude name: `(length, base name)`. -/
+def splitLong (fn : String) : Option (Int × String) :=
+  if fn.startsWith "longlong" then some (2, String.ofList (fn.toList.drop 8))
+  else if fn.startsWith "long" then some (1, String.ofList (fn.toList.drop 4))
+  else none
+
+/-- The `LONG` and `LONG LONG` versions of the functions of one real argument
+    (`genie_*_mp`, wrapped in `C_L_FUNCTION`: a NaN or infinite result is an error). -/
+def mpMathFn (fn : String) (arg : Value) : M (Option Value) := do
+  let some (n, base) := splitLong fn | return none
+  let digs ← mpDigitsOf n
+  let asMM (f : MP.MP → MP.MP → Nat → MP.MPE MP.MP) : MP.MP → MP.MP → Nat → MP.MM MP.MP :=
+    fun z x d => MP.lift (f z x d)
+  let f? : Option (MP.MP → MP.MP → Nat → MP.MM MP.MP) := match base with
+    | "sqrt" => some (asMM MP.sqrtMp)
+    | "curt" | "cbrt" => some (asMM MP.curtMp)
+    | "exp" => some (asMM MP.expMp)
+    | "ln" => some MP.lnMp
+    | "log" => some MP.logMp
+    | "sinh" => some (asMM MP.sinhMp)
+    | "cosh" => some (asMM MP.coshMp)
+    | "tanh" => some (asMM MP.tanhMp)
+    | "arcsinh" => some MP.asinhMp
+    | "arccosh" => some MP.acoshMp
+    | "arctanh" => some MP.atanhMp
+    | "sin" => some MP.sinMp
+    | "cos" => some MP.cosMp
+    | "tan" => some MP.tanMp
+    | "cot" => some MP.cotMp
+    | "arcsin" => some MP.asinMp
+    | "arccos" => some MP.acosMp
+    | "arctan" => some MP.atanMp
+    | "csc" => some (MP.recOf MP.sinMp)
+    | "sec" => some (MP.recOf MP.cosMp)
+    | "arccsc" => some fun z x d => do let r ← MP.lift (MP.recMp z x d); MP.asinMp r r d
+    | "arcsec" => some fun z x d => do let r ← MP.lift (MP.recMp z x d); MP.acosMp r r d
+    | "arccot" => some fun z x d => do
+        MP.lift (MP.catchNaN x)
+        let f ← MP.lift (MP.recMp (MP.nil d) x d)
+        MP.atanMp z f d
+    | "sindg" => some (MP.viaPiOver180 MP.sinMp)
+    | "cosdg" => some (MP.viaPiOver180 MP.cosMp)
+    | "tandg" => some (MP.viaPiOver180 MP.tanMp)
+    | "cotdg" => some (MP.viaPiOver180 MP.cotMp)
+    | "cscdg" => some (MP.recOf (MP.viaPiOver180 MP.sinMp))
+    | "secdg" => some (MP.viaPiOver180 MP.cosMp)          -- a68g does not take the reciprocal
+    | "arcsindg" => some (MP.times180OverPi MP.asinMp)
+    | "arccosdg" => some (MP.times180OverPi MP.acosMp)
+    | "arctandg" => some (MP.times180OverPi MP.atanMp)
+    | "arccotdg" => some (MP.times180OverPi fun z x d => do
+        MP.lift (MP.catchNaN x)
+        let f ← MP.lift (MP.recMp (MP.nil d) x d)
+        MP.atanMp z f d)
+    | "arccscdg" => some fun z x d => do
+        let r ← MP.lift (MP.recMp z x d)
+        MP.times180OverPi MP.asinMp r r d
+    | "arcsecdg" => some fun z x d => do
+        let r ← MP.lift (MP.recMp z x d)
+        MP.times180OverPi MP.acosMp r r d
+    | "cas" => some fun z x d => do
+        if !x.isFinite then return MP.setNaN z
+        let c ← MP.cosMp (MP.nil d) x d
+        let s ← MP.sinMp (MP.nil d) x d
+        MP.lift (MP.addMp z c s d)
+    | _ => none
+  let some f := f? | return none
+  let x ← expectMP arg
+  let r ← runMM (f x x digs)
+  let mn := Mode.toString (.real n)
+  if r.isNaN then rtErr s!"{mn} value is not a number"
+  if !r.isFinite then rtErr s!"{mn} value is not finite"
+  return some (.mp r)
+
+/-- The `LONG` / `LONG LONG` constants and generators of the prelude. -/
+def mpConst (fn : String) : M (Option Value) := do
+  let some (n, base) := splitLong fn | return none
+  let digs ← mpDigitsOf n
+  match base with
+  | "pi" => return some (.mp (← runMM (MP.piMp (MP.nil digs) .pi digs)))
+  | "maxreal" =>
+    let z := (List.range digs).foldl (fun z k => z.setDig (k + 1) (MP.R - 1)) (MP.lit digs 0 (MP.maxExpo - 1))
+    return some (.mp z)
+  | "minreal" => return some (.mp (MP.lit digs 1 (-MP.maxExpo)))
+  | "smallreal" => return some (.mp (MP.lit digs 1 (1 - (digs : Int))))
+  | "infinity" | "inf" | "plusinfinity" | "plusinf" => return some (.mp (MP.setPInf (MP.nil digs)))
+  | "minusinfinity" | "minusinf" => return some (.mp (MP.setMInf (MP.nil digs)))
+  | "nan" => return some (.mp (MP.setNaN (MP.nil digs)))
+  | _ => return none
+
 /-- a68g `a68g_x_up_n_real`: square-and-multiply in a fixed order. -/
 def powRealIntPos (x : Float) (nn : Nat) : M Float := do
   if x == 0.0 && nn == 0 then return 1.0
@@ -450,6 +676,8 @@ partial def printValue (fid : Nat) (m : Mode) (v : Value) : M Unit := do
   | _, .union m' v' => printValue fid m' v'
   | .int n, .int i => fileOut fid (Numfmt.printInt i n (← llDigits))
   | .int _, .real x => fileOut fid (Numfmt.printReal x 0)
+  | .real n, .mp x => fileOut fid (← mpFloatStd x n)
+  | .compl n, .struct #[.mp re, .mp im] => fileOut fid ((← mpFloatStd re n) ++ (← mpFloatStd im n))
   | .real n, .real x => do let _ ← checkReal x; fileOut fid (Numfmt.printReal x n (← llDigits))
   | .real n, .int i => fileOut fid (Numfmt.printReal (Float.ofInt i) n (← llDigits))
   | .bool, .bool b => fileOut fid (if b then "T" else "F")
@@ -922,10 +1150,33 @@ partial def widenValue (src dst : Mode) (v : Value) : M Value := do
   let d ← resolveM dst
   match s, d, v with
   | .int _, .int _, _ => return v
-  | .int _, .real _, .int n => return .real (Float.ofInt n)
+  | .int _, .real b, .int n =>
+    if b ≥ 1 then return .mp (← intToMP n (← mpDigitsOf b)) else return .real (Float.ofInt n)
+  | .real a, .real b, .real x =>
+    if a ≤ 0 && b ≥ 1 then return .mp (← realToLongReal x b) else return v
+  | .real a, .real b, .mp x =>
+    if a == 1 && b ≥ 2 then return .mp (MP.lenMp x MP.longDigits (← llDigits)) else return v
   | .real _, .real _, _ => return v
-  | .int _, .compl _, .int n => return mkCompl (Float.ofInt n) 0.0
-  | .real _, .compl _, .real x => return mkCompl x 0.0
+  | .int _, .compl b, .int n =>
+    if b ≥ 1 then
+      let digs ← mpDigitsOf b
+      return .struct #[.mp (← intToMP n digs), .mp (MP.nil digs)]
+    return mkCompl (Float.ofInt n) 0.0
+  | .real _, .compl b, .real x =>
+    if b ≥ 1 then return .struct #[.mp (← realToLongReal x b), .mp (MP.nil (← mpDigitsOf b))]
+    return mkCompl x 0.0
+  | .real a, .compl b, .mp x =>
+    let ll ← llDigits
+    let x' := if a == 1 && b ≥ 2 then MP.lenMp x MP.longDigits ll else x
+    return .struct #[.mp x', .mp (MP.nil (← mpDigitsOf b))]
+  | .compl _, .compl b, .struct #[.real re, .real im] =>
+    if b ≥ 1 then return .struct #[.mp (← realToLongReal re b), .mp (← realToLongReal im b)]
+    return v
+  | .compl a, .compl b, .struct #[.mp re, .mp im] =>
+    if a == 1 && b ≥ 2 then
+      let ll ← llDigits
+      return .struct #[.mp (MP.lenMp re MP.longDigits ll), .mp (MP.lenMp im MP.longDigits ll)]
+    return v
   | .compl _, .compl _, _ => return v
   | .bits _, .bits _, _ => return v
   | .bits n, .row _ _ .bool, .bits b =>
@@ -1000,6 +1251,19 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     -- assigning operators: a is a REF
     let cur ← readRef a
     let mr := Mode.resolve tb m
+    -- LONG modes: the operator of the same name, then the assignment (`genie_f_and_becomes`)
+    let base := match op with
+      | "+:=" => "+" | "-:=" => "-" | "*:=" => "*" | "/:=" => "/" | "%:=" => "%" | "%*:=" => "%*" | o => o
+    match mr with
+    | .int n =>
+      if n ≥ 1 then
+        writeRef a (← longIntDyadic base n (← expectInt cur) (← expectInt b))
+        return a
+    | .real n =>
+      if n ≥ 1 then
+        writeRef a (← mpDyadic base n (← expectMP cur) (← expectMP b))
+        return a
+    | _ => pure ()
     let res : Value ← match mr with
       | .int n => do
         let x ← expectInt cur
@@ -1069,6 +1333,9 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
   | .int n, .int _ =>
     let x ← expectInt a
     let y ← expectInt b
+    if n ≥ 1 then
+      if op == "**" then return ← longIntPow n x y
+      return ← longIntDyadic op n x y
     match op with
     | "+" => Value.int <$> checkIntRange (x + y) n
     | "-" => Value.int <$> checkIntRange (x - y) n
@@ -1083,7 +1350,10 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     | ">" => return .bool (x > y)
     | ">=" => return .bool (x ≥ y)
     | _ => rtErr s!"internal: INT operator {op}"
-  | .real _, .real _ =>
+  | .real n, .real _ =>
+    if n ≥ 1 then
+      if op == "I" then return .struct #[a, b]
+      return ← mpDyadic op n (← expectMP a) (← expectMP b)
     let x ← expectReal a
     let y ← expectReal b
     match op with
@@ -1108,6 +1378,12 @@ partial def dyadic (op : String) (m1 m2 : Mode) (a b : Value) : M Value := do
     | ">=" => return .bool (x ≥ y)
     | _ => rtErr s!"internal: REAL operator {op}"
   | .real n, .int _ =>
+    if n ≥ 1 then
+      let x ← expectMP a
+      let k ← expectInt b
+      match op with
+      | "**" => return .mp (← liftMP (MP.powMpInt x x k (← mpDigitsOf n)))
+      | _ => rtErr s!"internal: {Mode.toString (.real n)}/INT operator {op}"
     -- REAL ** INT
     let x ← expectReal a
     let y ← expectInt b
@@ -1300,6 +1576,17 @@ partial def valuesEqual (a b : Value) : M Bool := do
 
 partial def monadic (op : String) (m : Mode) (v : Value) : M Value := do
   let mr ← resolveM m
+  match mr with
+  | .real n =>
+    if op == "DENOT" then
+      -- a [LONG] LONG REAL denotation, converted as `genie_denotation` converts it
+      let text ← strOf v
+      match (← liftMP (MP.stringToMp text (← mpDigitsOf n))) with
+      | some z => return .mp z
+      | none => rtErr s!"error in {Mode.toString (.real n)} denotation"
+    if n ≥ 1 && ["-", "+", "ABS", "SIGN", "ENTIER", "ROUND", "SHORTEN"].contains op then
+      return ← mpMonadic op n (← expectMP v)
+  | _ => pure ()
   match op, mr with
   | "-", .int n => do let x ← expectInt v; Value.int <$> checkIntRange (-x) n
   | "+", .int _ => do let _ ← expectInt v; return v
@@ -1341,7 +1628,12 @@ partial def monadic (op : String) (m : Mode) (v : Value) : M Value := do
     return .bits x.toNat
   | "NOT", .bool => do let b ← expectBool v; return .bool (!b)
   | "NOT", .bits n => do let b ← expectBits v; return .bits (bitsMask n ^^^ b)
-  | "SHORTEN", .int n => do let x ← expectInt v; Value.int <$> checkIntRange x (n - 1)
+  | "SHORTEN", .int n => do
+    let x ← expectInt v
+    if n == 1 then
+      -- `mp_to_int`: its 32-bit weights wrap past two digits, as in a68g
+      return .int (← liftMP (MP.toInt32 (← intToMP x MP.longDigits) MP.longDigits))
+    Value.int <$> checkIntRange x (n - 1)
   | "SHORTEN", .real _ => do let _ ← expectReal v; return v
   | "SHORTEN", .bits n => do let b ← expectBits v; return .bits (b &&& bitsMask (n - 1))
   | "SHORTEN", .compl _ => return v
@@ -1928,6 +2220,8 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let x ← resolveUnion x
     match x with
     | .union (.int n) (.int i) => return Value.ofString (Numfmt.whole i width) |> fun s => (let _ := n; s)
+    | .union (.real n) (.mp z) =>
+      return Value.ofString (← liftMP (MPFmt.whole z (← mpDigitsOf n) width (← llRealWidth)))
     | .union (.real _) (.real r) => do let _ ← checkReal r; return Value.ofString (Numfmt.wholeReal r width)
     | .union _ .undef => rtErr "attempt to use an uninitialised value"
     | _ => rtErr "internal: whole argument"
@@ -1937,7 +2231,12 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let x ← resolveUnion x
     match x with
     | .union (.int n) (.int i) =>
-      return Value.ofString (if n ≤ 0 then Numfmt.fixedInt i width after else Numfmt.fixedLongInt i width after)
+      if n ≤ 0 then return Value.ofString (Numfmt.fixedInt i width after)
+      -- a68g relabels the LONG INT as a LONG REAL of the same digits
+      let digs ← mpDigitsOf n
+      return Value.ofString (← liftMP (MPFmt.fixed (← intToMP i digs) digs width after (← llRealWidth)))
+    | .union (.real n) (.mp z) =>
+      return Value.ofString (← liftMP (MPFmt.fixed z (← mpDigitsOf n) width after (← llRealWidth)))
     | .union (.real _) (.real r) => do let _ ← checkReal r; return Value.ofString (Numfmt.fixedReal r width after)
     | .union _ .undef => rtErr "attempt to use an uninitialised value"
     | _ => rtErr "internal: fixed argument"
@@ -1947,7 +2246,12 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let expo ← expectInt e
     let x ← resolveUnion x
     match x with
-    | .union (.int _) (.int i) => return Value.ofString (Numfmt.floatInt i width after expo)
+    | .union (.int n) (.int i) =>
+      if n ≤ 0 then return Value.ofString (Numfmt.floatInt i width after expo)
+      let digs ← mpDigitsOf n
+      return Value.ofString (← liftMP (MPFmt.float (← intToMP i digs) digs width after expo 1 (← llRealWidth)))
+    | .union (.real n) (.mp z) =>
+      return Value.ofString (← liftMP (MPFmt.float z (← mpDigitsOf n) width after expo 1 (← llRealWidth)))
     | .union (.real _) (.real r) => do let _ ← checkReal r; return Value.ofString (Numfmt.floatReal r width after expo)
     | .union _ .undef => rtErr "attempt to use an uninitialised value"
     | _ => rtErr "internal: float argument"
@@ -1958,7 +2262,12 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
     let frmt ← expectInt f
     let x ← resolveUnion x
     match x with
-    | .union (.int _) (.int i) => return Value.ofString (Numfmt.floatInt i width after expo frmt)
+    | .union (.int n) (.int i) =>
+      if n ≤ 0 then return Value.ofString (Numfmt.floatInt i width after expo frmt)
+      let digs ← mpDigitsOf n
+      return Value.ofString (← liftMP (MPFmt.float (← intToMP i digs) digs width after expo frmt (← llRealWidth)))
+    | .union (.real n) (.mp z) =>
+      return Value.ofString (← liftMP (MPFmt.float z (← mpDigitsOf n) width after expo frmt (← llRealWidth)))
     | .union (.real _) (.real r) => do let _ ← checkReal r; return Value.ofString (Numfmt.floatReal r width after expo frmt)
     | _ => rtErr "internal: real argument"
   | "charinstring", [c, i, s] =>
@@ -2045,7 +2354,21 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
       | "complexcos" | "ccos" => return mkCompl (Float.cos re * Float.cosh im) (-(Float.sin re * Float.sinh im))
       | _ => rtErr s!"unsupported complex function {name}"
     | _ => rtErr "COMPL expected"
-  | "arctan2", [y, x] | "atan2", [y, x] | "longarctan2", [y, x] => do
+  | "longarctan2", [a, b] | "longlongarctan2", [a, b] | "longarctan2dg", [a, b] | "longlongarctan2dg", [a, b] => do
+    -- `genie_atan2_mp`: `atan2_mp (p, x, y, x, digs)` with `x` the first argument
+    let some (n, base) := splitLong name | rtErr "internal: arctan2"
+    let digs ← mpDigitsOf n
+    let x ← expectMP a
+    let y ← expectMP b
+    let r ← runMM (do
+      let t ← MP.atan2Mp x y x digs
+      if base == "arctan2dg" && !t.isNaN then
+        let g ← MP.piMp (MP.nil digs) .d180OverPi digs
+        MP.lift (MP.mulMp t t g digs)
+      else pure t)
+    if r.isNaN then rtErr s!"{Mode.toString (.real n)} invalid argument"
+    return .mp r
+  | "arctan2", [y, x] | "atan2", [y, x] => do
     let a ← expectReal y
     let b ← expectReal x
     Value.real <$> checkReal (Float.atan2 a b)
@@ -2081,7 +2404,19 @@ partial def callBuiltin (name : String) (args : List Value) : M Value := do
       v := v * 2 + (if (← expectBool e) then 1 else 0)
     return .bits v
   | "system", [_] => rtErr "system is not supported"
+  | fn, [] =>
+    match (← mpConst fn) with
+    | some v => return v
+    | none =>
+      match fn with
+      | "longnextrandom" | "longlongnextrandom" | "longrandom" | "longlongrandom" =>
+        -- `genie_long_next_random`: a REAL random number lengthened
+        let r ← nextRandom
+        let n : Int := if fn.startsWith "longlong" then 2 else 1
+        return .mp (← realToLongReal r n)
+      | _ => rtErr s!"unsupported standard procedure {fn}/0"
   | fn, [x] =>
+    if let some v ← mpMathFn fn x then return v
     if ["sqrt","exp","ln","log","log10","log2","exp2","sin","cos","tan","arcsin","arccos","arctan",
         "asin","acos","atan","sinh","cosh","tanh","arcsinh","arccosh","arctanh","cbrt","curt",
         "longsqrt","longexp","longln","longlog","longsin","longcos","longtan","longarcsin","longarccos",
@@ -2281,6 +2616,10 @@ partial def toDec (m : Mode) (v : Value) : M (Bool × Numfmt.Dec) := do
   match (← resolveM m), v with
   | .int _, .int n => return (n < 0, Numfmt.Dec.ofInt n.natAbs)
   | .real _, .real x => do let _ ← checkReal x; return Numfmt.realToDec x
+  | .real n, .mp z => do
+    liftMP (MPFmt.checkFinite z)
+    let (m, e) := MP.toDecParts z (← mpDigitsOf n)
+    return (m < 0, ⟨(m.natAbs : Int), e⟩)
   | _, .undef => rtErr "attempt to use an uninitialised value"
   | _, _ => rtErr "cannot transput this value with a numeric pattern"
 
@@ -2317,8 +2656,21 @@ partial def writeScalarFormatted (fid : Nat) (st : FmtState) (m : Mode) (v : Val
       match mr, v, args with
       | .int n, .int i, [] => fileOut fid (Numfmt.printInt i n (← llDigits))
       | .int _, .int i, [w] => fileOut fid (Numfmt.whole i w)
-      | .int n, .int i, [w, a] => fileOut fid (if n ≤ 0 then Numfmt.fixedInt i w a else Numfmt.fixedLongInt i w a)
-      | .int _, .int i, [w, a, e] => fileOut fid (Numfmt.floatInt i w a e)
+      | .int n, .int i, [w, a] =>
+        if n ≤ 0 then fileOut fid (Numfmt.fixedInt i w a)
+        else
+          let digs ← mpDigitsOf n
+          fileOut fid (← liftMP (MPFmt.fixed (← intToMP i digs) digs w a (← llRealWidth)))
+      | .int n, .int i, [w, a, e] =>
+        if n ≤ 0 then fileOut fid (Numfmt.floatInt i w a e)
+        else
+          let digs ← mpDigitsOf n
+          fileOut fid (← liftMP (MPFmt.float (← intToMP i digs) digs w a e 1 (← llRealWidth)))
+      | .real n, .mp z, [] => fileOut fid (← mpFloatStd z n)
+      | .real n, .mp z, [w] => fileOut fid (← liftMP (MPFmt.whole z (← mpDigitsOf n) w (← llRealWidth)))
+      | .real n, .mp z, [w, a] => fileOut fid (← liftMP (MPFmt.fixed z (← mpDigitsOf n) w a (← llRealWidth)))
+      | .real n, .mp z, [w, a, e] => fileOut fid (← liftMP (MPFmt.float z (← mpDigitsOf n) w a e 1 (← llRealWidth)))
+      | .compl n, .struct #[.mp re, .mp im], [] => fileOut fid ((← mpFloatStd re n) ++ (← mpFloatStd im n))
       | .real n, .real x, [] => do let _ ← checkReal x; fileOut fid (Numfmt.printReal x n (← llDigits))
       | .real _, .real x, [w] => do let _ ← checkReal x; fileOut fid (Numfmt.wholeReal x w)
       | .real _, .real x, [w, a] => do let _ ← checkReal x; fileOut fid (Numfmt.fixedReal x w a)
