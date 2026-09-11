@@ -166,6 +166,9 @@ structure Frame where
   /-- per slot: its mode, where known; a procedure-valued slot's mode gives the C signature
       of a plain entry point for whatever routine it holds -/
   modes  : Array (Option Mode) := #[]
+  /-- per slot of a routine's parameters: the C variable of the current C function that keeps
+      the plain entry point of the routine a procedure parameter holds, once looked up -/
+  pcache : Array (Option String) := #[]
   pushed : Bool := true
   deriving Inhabited
 
@@ -1556,7 +1559,13 @@ partial def dynCall (sg : NatSig) (f : Core) (args : List Core) (dest : Option S
     let rtyName := match sg.rty with | some t => t.name | none => "void"
     let plist := if sg.ptys.isEmpty then "void" else ", ".intercalate (sg.ptys.toList.map CTy.name)
     let ptrTy := rtyName ++ " (*)(" ++ plist ++ ")"
-    emit s!"void* f{k} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({← rtd d}, {s}, W))];"
+    let ev ← env
+    match (ev[d]?).bind (fun fr => (fr.pcache[s]?).join) with
+    | some pc =>
+      let dd ← rtd d
+      emit s!"if (__builtin_expect({pc} == (void*) 1, 0)) {pc} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({dd}, {s}, W))];"
+      emit s!"void* f{k} = {pc};"
+    | none => emit s!"void* f{k} = a68_nf_of_fn[a68_u32(a68rt_cell_cproc({← rtd d}, {s}, W))];"
     emit ("if (f" ++ toString k ++ ") {")
     indent do
       let as ← natArgs sg.ptys args
@@ -1650,7 +1659,7 @@ partial def genNative (k : Nat) (sg : NatSig) (body : Core) (outer : List Frame)
     vars := (List.range sg.ptys.size).toArray.map fun i => some (s!"a{k}_{i}", sg.ptys[i]!, false),
     pushed := false }
   let ret := match sg.rty with | some _ => "return 0;" | none => "return;"
-  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := pf :: outer, ret := ret }
+  modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := pf :: outer.map (fun f => { f with pcache := #[] }), ret := ret }
   match sg.rty with
   | some t =>
     emit s!"{t.name} rv{k} = 0;"
@@ -2526,7 +2535,18 @@ partial def genFunction (nparams frameSize : Nat) (body : Core) : M Nat := do
   modify fun st => { st with cur := #[], labels := labelsOf body, depth := 1, frames := [], ret := "return;", procMode := none }
   if reclaim then emit "uint32_t a68_hm = a68_u32(a68rt_heap_mark(W));"
   emit s!"a68_v(a68rt_enter_args({frameSize}, {nparams}, W));"
-  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pushed := true }] }
+  -- A parameter is an identity, so the routine a procedure parameter holds cannot change
+  -- during the call: the plain entry point is looked up at the first call through it and
+  -- kept for the rest of this invocation.  `(void*) 1` is not yet looked up.
+  let pcache : Array (Option String) := (Array.range frameSize).map fun i =>
+    if i < nparams then
+      match pmodes[i]?.join with
+      | some (.proc _ _) => some s!"a68_pc{i}"
+      | _ => none
+    else none
+  for pc in pcache do
+    if let some v := pc then emit s!"void* {v} = (void*) 1;"
+  modify fun st => { st with frames := [{ vars := Array.replicate frameSize none, modes := pmodes, pcache := pcache, pushed := true }] }
   gen body
   emit "a68_v(a68rt_leave(W));"
   if reclaim then emit "a68_v(a68rt_heap_release(a68_hm, W));"

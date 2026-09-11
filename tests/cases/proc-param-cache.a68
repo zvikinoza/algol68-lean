@@ -1,0 +1,29 @@
+# Calls through procedure parameters: plain routines, routines that need their #
+# environment, routines nested inside the callee, and recursion passing them on. #
+BEGIN
+  PROC apply = (PROC (INT) INT f, INT n) INT:
+    BEGIN
+      INT acc := 0;
+      FOR i TO n DO acc +:= f(i) OD;
+      PROC inner = (INT k) INT: f(k) * 2;
+      acc + inner(n) + (n > 1 | apply(f, n - 1) | 0)
+    END;
+  PROC sq = (INT x) INT: x * x;
+  INT base := 10;
+  PROC shifted = (INT x) INT: x + base;
+  print((apply(sq, 5), apply(shifted, 4), newline));
+  base := 100;
+  print((apply(shifted, 3), newline));
+  PROC twice = (PROC (INT) INT g, INT x) INT: g(g(x));
+  print((twice(sq, 3), twice((INT x) INT: x - 1, 3), twice(shifted, 1), newline));
+  PROC choose = (BOOL b) PROC (INT) INT: (b | sq | shifted);
+  FOR i TO 4 DO print(apply(choose(ODD i), i)) OD;
+  print(newline);
+  PROC both = (PROC (INT) INT p, q, INT n) INT:
+    BEGIN
+      INT t := 0;
+      FOR i TO n DO t +:= p(i) - q(i) OD;
+      t
+    END;
+  print((both(sq, shifted, 6), both(shifted, sq, 6), newline))
+END
