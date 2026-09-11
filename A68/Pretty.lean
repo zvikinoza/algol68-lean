@@ -18,6 +18,9 @@ def valueStr : Value → String
   | .undef => "undef"
   | .int n => toString n
   | .real x => toString x
+  | .mp x =>
+    let (m, e) := MP.toDecParts x x.size
+    s!"long {m}e{e}"
   | .bool b => if b then "TRUE" else "FALSE"
   | .char c => s!"'{Char.ofNat c}'"
   | .bits b => s!"bits {b}"

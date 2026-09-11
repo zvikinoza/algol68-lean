@@ -5,6 +5,7 @@ import A68.Mode
 import A68.Core
 import A68.Builtins
 import A68.Numfmt
+import A68.MP
 import A68.Elab
 import A68.Interp
 import A68.Pretty
