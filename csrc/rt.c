@@ -72,7 +72,9 @@ struct a68_obj {
 typedef struct { a68_obj h; a68_val s[]; } a68_slots;
 typedef struct { a68_obj h; uint8_t d[]; } a68_leaf;     /* elements, then a bitmap of defined ones */
 typedef struct { int64_t l, u, stride; } a68_dim;
-typedef struct { a68_obj h; a68_obj* base; int64_t off; a68_dim dim[]; } a68_rowd;
+/* `field`: one plus the field a multiple selection through a name picks in every element,
+   0 for a plain row (`Interp.readPath` with `.field` on a row) */
+typedef struct { a68_obj h; a68_obj* base; int64_t off; uint32_t field; uint32_t pad2; a68_dim dim[]; } a68_rowd;
 typedef struct a68_frame { a68_obj h; struct a68_frame* parent; uint32_t depth; uint32_t pad; a68_val c[]; } a68_frame;
 
 #define VIEW_OFF 0xffffffffu        /* a REF whose target is the row a view describes */
@@ -408,6 +410,40 @@ static a68_obj* store_alloc_for(uint32_t n, const a68_val* sample) {
 
 static a68_obj* store_alloc_slots(uint32_t n) { return (a68_obj*) slots_alloc(n); }
 
+/* The element at a store index of the row a descriptor describes, through its field
+   selection when it has one. */
+static a68_val rowd_get(const a68_rowd* r, int64_t idx) {
+  a68_val e = store_get(rowd_store(r), idx);
+  if (r->field) {
+    if (e.tag != T_STRUCT) die("internal: field selection on non-struct element");
+    a68_slots* st = (a68_slots*) e.v.p;
+    if (r->field - 1 >= st->h.n) die("internal: field index out of range");
+    return st->s[r->field - 1];
+  }
+  return e;
+}
+
+/* The slot to write for that element, or NULL when the store is a leaf. */
+static a68_val* rowd_slot(a68_rowd* r, int64_t idx) {
+  a68_obj* st = rowd_store(r);
+  if (st->kind != K_SLOTS) return NULL;
+  a68_val* e = &((a68_slots*) st)->s[idx];
+  if (r->field) {
+    if (e->tag != T_STRUCT) die("internal: field selection on non-struct element");
+    a68_slots* fs = (a68_slots*) e->v.p;
+    if (r->field - 1 >= fs->h.n) die("internal: field index out of range");
+    return &fs->s[r->field - 1];
+  }
+  return e;
+}
+
+static void assign_slot(a68_val* s, a68_val v, int flex, int checked);
+static void rowd_put(a68_rowd* r, int64_t idx, a68_val v) {
+  a68_val* sl = rowd_slot(r, idx);
+  if (sl) assign_slot(sl, v, 1, 0);
+  else store_set(rowd_store(r), idx, v);
+}
+
 /* a copy of a store, same layout (copy on write) */
 static a68_obj* store_copy(a68_obj* st) {
   if (st->kind == K_SLOTS) {
@@ -440,6 +476,7 @@ static a68_rowd* rowd_share(const a68_rowd* r) {
   n->base = st;
   st->rc++;
   n->off = r->off;
+  n->field = r->field;
   memcpy(n->dim, r->dim, (size_t) r->h.n * sizeof(a68_dim));
   return n;
 }
@@ -462,10 +499,10 @@ static a68_rowd* row_canonical_copy(const a68_rowd* r) {
   a68_obj* ns;
   if (st->kind == K_LEAF) {
     ns = (a68_obj*) leaf_alloc(st->ek, (uint32_t) n);
-    for (int64_t i = 0; i < n; i++) store_set(ns, i, store_get(st, row_store_index(r, i)));
+    for (int64_t i = 0; i < n; i++) store_set(ns, i, rowd_get(r, row_store_index(r, i)));
   } else {
     ns = store_alloc_slots((uint32_t) n);
-    for (int64_t i = 0; i < n; i++) store_set(ns, i, copy_value(store_get(st, row_store_index(r, i))));
+    for (int64_t i = 0; i < n; i++) store_set(ns, i, copy_value(rowd_get(r, row_store_index(r, i))));
   }
   ns->rc = 1;
   c->base = ns;
@@ -506,7 +543,7 @@ static a68_val ref_load(a68_val r) {
   if (b->kind == K_ROWD) {
     a68_rowd* d = (a68_rowd*) b;
     if (r.aux == VIEW_OFF) return mk_ptr(T_ROW, (a68_obj*) rowd_share(d), 0);
-    return copy_value(store_get(rowd_store(d), (int64_t) r.aux));
+    return copy_value(rowd_get(d, (int64_t) r.aux));
   }
   a68_val* s = ref_slot(r);
   return copy_value(*s);
@@ -528,7 +565,7 @@ static a68_rowd* ref_rowd(a68_val r) {
   a68_obj* b = r.v.p;
   if (b->kind == K_ROWD) {
     if (r.aux == VIEW_OFF) return (a68_rowd*) b;
-    a68_val e = store_get(rowd_store((a68_rowd*) b), (int64_t) r.aux);
+    a68_val e = rowd_get((a68_rowd*) b, (int64_t) r.aux);
     if (e.tag == T_ROW) return (a68_rowd*) e.v.p;   /* an element that is itself a row */
     return NULL;
   }
@@ -556,11 +593,11 @@ static void row_copy_into(a68_rowd* dst, const a68_rowd* src) {
   int64_t n = row_count(dst);
   if (ds->kind == K_LEAF && ss->kind == K_LEAF && ds->ek == ss->ek) {
     for (int64_t i = 0; i < n; i++)
-      store_set(ds, row_store_index(dst, i), store_get(ss, row_store_index(src, i)));
+      rowd_put(dst, row_store_index(dst, i), rowd_get(src, row_store_index(src, i)));
     return;
   }
   for (int64_t i = 0; i < n; i++) {
-    a68_val e = store_get(ss, row_store_index(src, i));
+    a68_val e = rowd_get(src, row_store_index(src, i));
     if (ds->kind == K_LEAF && !leaf_accepts(ds->ek, &e)) {
       /* the destination leaf cannot hold this element: widen the store to slots */
       a68_slots* ns = slots_alloc(ds->n);
@@ -569,7 +606,7 @@ static void row_copy_into(a68_rowd* dst, const a68_rowd* src) {
       owner->base = (a68_obj*) ns;
       ds = (a68_obj*) ns;
     }
-    store_set(ds, row_store_index(dst, i), ds->kind == K_LEAF ? e : copy_value(e));
+    rowd_put(dst, row_store_index(dst, i), ds->kind == K_LEAF ? e : copy_value(e));
   }
 }
 
@@ -667,7 +704,7 @@ static void assign_ref(a68_val d, a68_val v, int flex) {
     }
     own_store(rowd_owner(r));
     st = rowd_store(r);
-    assign_slot(&((a68_slots*) st)->s[d.aux], v, flex, 1);
+    assign_slot(rowd_slot(r, (int64_t) d.aux), v, flex, 1);
     return;
   }
   assign_slot(ref_slot(d), v, flex, 1);
@@ -702,7 +739,7 @@ static void store_ref(a68_val d, a68_val v) {
       st = (a68_obj*) ns;
     }
     if (st->kind == K_LEAF) store_set(st, (int64_t) d.aux, v);
-    else assign_slot(&((a68_slots*) st)->s[d.aux], v, 1, 0);
+    else assign_slot(rowd_slot(r, (int64_t) d.aux), v, 1, 0);
     return;
   }
   assign_slot(ref_slot(d), v, 1, 0);
@@ -714,10 +751,23 @@ static a68_val ref_field(a68_val r, uint32_t f) {
   if (r.tag != T_REF) die("internal: select via non-REF");
   a68_obj* b = r.v.p;
   a68_val target;
-  if (b->kind == K_ROWD) {
-    if (r.aux == VIEW_OFF) die("internal: unsupported multiple selection through a name");
-    target = store_get(rowd_store((a68_rowd*) b), (int64_t) r.aux);
-  } else target = *ref_slot(r);
+  if (b->kind == K_ROWD && r.aux == VIEW_OFF) target = mk_ptr(T_ROW, b, 0);
+  else if (b->kind == K_ROWD) target = rowd_get((a68_rowd*) b, (int64_t) r.aux);
+  else target = *ref_slot(r);
+  if (target.tag == T_ROW) {
+    /* `f OF a` where `a` names a row of structures: a name of the row of that field of
+       every element, which reads and writes through the elements (`Interp.readPath`,
+       `Interp.updatePath` with `.field` on a row) */
+    a68_rowd* rw = ref_rowd(r);
+    if (!rw) die("internal: field selection on non-struct");
+    if (rw->field) die("internal: nested multiple selection");
+    a68_rowd* v = rowd_alloc(rw->h.n);
+    v->base = (a68_obj*) rowd_owner(rw);
+    v->off = rw->off;
+    v->field = f + 1;
+    memcpy(v->dim, rw->dim, (size_t) rw->h.n * sizeof(a68_dim));
+    return mk_ptr(T_REF, (a68_obj*) v, VIEW_OFF);
+  }
   if (target.tag != T_STRUCT) die("internal: field selection on non-struct");
   a68_slots* s = (a68_slots*) target.v.p;
   if (f >= s->h.n) die("internal: field index out of range");
@@ -760,7 +810,7 @@ static void slice_into(a68_rowd* r, int is_name, const indexer* ixs, uint32_t ni
   }
   if (!ntrim) {
     if (is_name) { *out = mk_ptr(T_REF, (a68_obj*) r, (uint32_t) off); return; }
-    *out = copy_value(store_get(rowd_store(r), off));
+    *out = copy_value(rowd_get(r, off));
     return;
   }
   nr->off = off;
@@ -975,8 +1025,8 @@ static void encode_val(buf* b, a68_val v) {
       for (uint32_t k = 0; k < r->h.n; k++) { put64(b, (uint64_t) r->dim[k].l); put64(b, (uint64_t) r->dim[k].u); }
       int64_t n = row_count(r);
       put32(b, (uint32_t) n);
-      a68_obj* st = rowd_store(r);
-      for (int64_t i = 0; i < n; i++) encode_val(b, store_get(st, row_store_index(r, i)));
+
+      for (int64_t i = 0; i < n; i++) encode_val(b, rowd_get(r, row_store_index(r, i)));
       break;
     }
     default: put8(b, B_UNDEF); break;
@@ -1284,9 +1334,9 @@ int64_t a68rt_pop_bytes(uint8_t** out, int64_t* lwb, int w) {
   if (d->h.n != 1) die("internal: STRING expected");
   int64_t n = row_count(d);
   uint8_t* b = (uint8_t*) xmalloc((size_t) n + 1);
-  a68_obj* st = rowd_store(d);
+
   for (int64_t i = 0; i < n; i++) {
-    a68_val e = store_get(st, row_store_index(d, i));
+    a68_val e = rowd_get(d, row_store_index(d, i));
     if (e.tag == T_UNDEF) die("attempt to use an uninitialised CHAR value");
     if (e.tag != T_CHAR) die("internal: CHAR expected");
     b[i] = (uint8_t) e.v.u;
@@ -1411,7 +1461,7 @@ static int64_t elem_index(a68_rowd* r, uint32_t rank, int64_t i, int64_t j) {
 
 static a68_val row_elem(uint32_t d, uint32_t s, uint32_t rank, int64_t i, int64_t j) {
   a68_rowd* r = cell_rowd(cell_of(d, s));
-  return store_get(rowd_store(r), elem_index(r, rank, i, j));
+  return rowd_get(r, elem_index(r, rank, i, j));
 }
 
 static void row_set_elem(uint32_t d, uint32_t s, uint32_t rank, int64_t i, int64_t j, a68_val v) {
@@ -1437,6 +1487,27 @@ void a68rt_set_row_bits(uint32_t d, uint32_t s, uint32_t rank, int64_t i, int64_
 /* `spec`: bits 0-1 the rank of a subscript (0 = none), bit 2 whether the cell holds a name
    of the structure rather than the structure, bits 8-11 how many fields follow; `fields`
    packs the field indices one byte each, innermost first (`Runtime.selRead`). */
+/* `f OF r` on a row value: the row of that field of every element (`Interp.readPath`). */
+static a68_val row_field_select(a68_val v, uint32_t idx) {
+  a68_rowd* r = (a68_rowd*) v.v.p;
+  int64_t n = row_count(r);
+  a68_rowd* d = rowd_alloc(r->h.n);
+  memcpy(d->dim, r->dim, (size_t) r->h.n * sizeof(a68_dim));
+  int64_t stride = 1;
+  for (uint32_t k = r->h.n; k > 0; k--) { d->dim[k - 1].stride = stride; int64_t ext = d->dim[k - 1].u - d->dim[k - 1].l + 1; stride *= ext > 0 ? ext : 0; }
+  d->off = 0;
+  a68_slots* st = slots_alloc((uint32_t) n);
+  a68_obj* src = rowd_store(r);
+  for (int64_t i = 0; i < n; i++) {
+    a68_val e = rowd_get(r, row_store_index(r, i));
+    if (e.tag != T_STRUCT) die("internal: field selection on non-struct element");
+    st->s[i] = copy_value(((a68_slots*) e.v.p)->s[idx]);
+  }
+  st->h.rc = 1;
+  d->base = (a68_obj*) st;
+  return mk_ptr(T_ROW, (a68_obj*) d, 0);
+}
+
 static a68_val sel_read(uint32_t d, uint32_t s, uint32_t spec, int64_t i, int64_t j, uint32_t fields) {
   a68_val v = *cell_of(d, s);
   if (spec & 4) {
@@ -1448,11 +1519,12 @@ static a68_val sel_read(uint32_t d, uint32_t s, uint32_t spec, int64_t i, int64_
   if (rank) {
     if (v.tag != T_ROW) die("internal: row expected");
     a68_rowd* r = (a68_rowd*) v.v.p;
-    v = store_get(rowd_store(r), elem_index(r, rank, i, j));
+    v = rowd_get(r, elem_index(r, rank, i, j));
   }
   uint32_t nf = (spec >> 8) & 15;
   for (uint32_t k = 0; k < nf; k++) {
     uint32_t f = (fields >> (8 * k)) & 255;
+    if (v.tag == T_ROW) { v = row_field_select(v, f); continue; }
     if (v.tag != T_STRUCT) die("internal: field selection on non-struct");
     a68_slots* st = (a68_slots*) v.v.p;
     if (f >= st->h.n) die("internal: field index out of range");
@@ -1586,8 +1658,8 @@ void a68rt_append(uint32_t d, uint32_t s, int w) {
   a68_rowd* src = (a68_rowd*) v.v.p;
   int64_t n = row_count(src);
   a68_val* tmp = (a68_val*) xmalloc((size_t) (n ? n : 1) * sizeof(a68_val));
-  a68_obj* st = rowd_store(src);
-  for (int64_t i = 0; i < n; i++) tmp[i] = store_get(st, row_store_index(src, i));
+
+  for (int64_t i = 0; i < n; i++) tmp[i] = rowd_get(src, row_store_index(src, i));
   int ok = append_in_place(c, tmp, n);
   free(tmp);
   if (!ok) die("internal: append to a value that is not a string variable");
@@ -1834,9 +1906,9 @@ static uint8_t* string_bytes(a68_val v, int64_t* n) {
   a68_rowd* d = (a68_rowd*) v.v.p;
   *n = row_count(d);
   uint8_t* b = (uint8_t*) xmalloc((size_t) *n + 1);
-  a68_obj* st = rowd_store(d);
+
   for (int64_t i = 0; i < *n; i++) {
-    a68_val e = store_get(st, row_store_index(d, i));
+    a68_val e = rowd_get(d, row_store_index(d, i));
     if (e.tag == T_UNDEF) { free(b); die("attempt to use an uninitialised CHAR value"); }
     if (e.tag != T_CHAR) { free(b); die("internal: [] CHAR expected"); }
     b[i] = (uint8_t) e.v.u;
@@ -1997,7 +2069,7 @@ static int native_assign_op(const char* op, uint32_t m1, uint32_t m2, a68_val a,
       int64_t n = row_count(src);
       a68_val* tmp = (a68_val*) xmalloc((size_t) (n ? n : 1) * sizeof(a68_val));
       a68_obj* st = rowd_store(src);
-      for (int64_t i = 0; i < n; i++) tmp[i] = store_get(st, row_store_index(src, i));
+      for (int64_t i = 0; i < n; i++) tmp[i] = rowd_get(src, row_store_index(src, i));
       int ok = append_in_place(slot, tmp, n);
       free(tmp);
       if (ok) { *out = a; return 1; }
@@ -2141,27 +2213,7 @@ void a68rt_select(uint32_t idx, uint8_t via_ref, int w) {
     push(copy_value(s->s[idx]));
     return;
   }
-  if (v.tag == T_ROW) {
-    /* multiple selection: the field of every element */
-    a68_rowd* r = (a68_rowd*) v.v.p;
-    int64_t n = row_count(r);
-    a68_rowd* d = rowd_alloc(r->h.n);
-    memcpy(d->dim, r->dim, (size_t) r->h.n * sizeof(a68_dim));
-    int64_t stride = 1;
-    for (uint32_t k = r->h.n; k > 0; k--) { d->dim[k - 1].stride = stride; int64_t ext = d->dim[k - 1].u - d->dim[k - 1].l + 1; stride *= ext > 0 ? ext : 0; }
-    d->off = 0;
-    a68_slots* st = slots_alloc((uint32_t) n);
-    a68_obj* src = rowd_store(r);
-    for (int64_t i = 0; i < n; i++) {
-      a68_val e = store_get(src, row_store_index(r, i));
-      if (e.tag != T_STRUCT) die("internal: field selection on non-struct element");
-      st->s[i] = copy_value(((a68_slots*) e.v.p)->s[idx]);
-    }
-    st->h.rc = 1;
-    d->base = (a68_obj*) st;
-    push(mk_ptr(T_ROW, (a68_obj*) d, 0));
-    return;
-  }
+  if (v.tag == T_ROW) { push(row_field_select(v, idx)); return; }
   die("internal: select from non-struct");
 }
 
@@ -2330,7 +2382,7 @@ void a68rt_collateral(uint32_t n, uint8_t is_struct, uint32_t dims, int w) {
   for (uint32_t i = 0; i < n; i++) {
     a68_rowd* r = (a68_rowd*) vs[i].v.p;
     a68_obj* s = rowd_store(r);
-    for (int64_t j = 0; j < per; j++) store_set(st, (int64_t) i * per + j, store_get(s, row_store_index(r, j)));
+    for (int64_t j = 0; j < per; j++) store_set(st, (int64_t) i * per + j, rowd_get(r, row_store_index(r, j)));
   }
   st->rc = 1;
   d->base = st;
