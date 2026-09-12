@@ -17,6 +17,13 @@ scalar operand.  Consumers ask for the form they need (`toStack`, `toScalar`).
 namespace A68.Lower
 open A68.MIR
 
+/-- Where a lowered value goes. -/
+inductive Dest where
+  | void                       -- nowhere: the value is not wanted
+  | stack                      -- the operand stack
+  | var (t : Ty) (v : Var) (m : Mode)   -- a scalar variable
+  deriving Inhabited
+
 /-- What a lowered expression left behind. -/
 inductive Res where
   | stack             -- on top of the operand stack
@@ -601,20 +608,20 @@ partial def lower (c : Core) : L Res := do
       match tyOf (← resolve m) with
       | some ty =>
         let v ← newVar ty
-        lowerCondInto (some (ty, v, m)) cc t e
+        lowerCondInto (.var ty v m) cc t e
         return .sc (.v v)
-      | none => lowerCondInto none cc t e; return .stack
-    | none => lowerCondInto none cc t e; return .stack
+      | none => lowerCondInto .stack cc t e; return .stack
+    | none => lowerCondInto .stack cc t e; return .stack
   | .caseInt sel alts out =>
     match ← modeOf c with
     | some m =>
       match tyOf (← resolve m) with
       | some ty =>
         let v ← newVar ty
-        lowerCaseInto (some (ty, v, m)) sel alts out
+        lowerCaseInto (.var ty v m) sel alts out
         return .sc (.v v)
-      | none => lowerCaseInto none sel alts out; return .stack
-    | none => lowerCaseInto none sel alts out; return .stack
+      | none => lowerCaseInto .stack sel alts out; return .stack
+    | none => lowerCaseInto .stack sel alts out; return .stack
   | .caseConf sel alts out => lowerConformity sel alts out; return .stack
   | .loop slot f b t w body => lowerLoop slot f b t w body; rt "a68rt_push_void"; return .stack
   | .goto l => lowerGoto l; return .stack
@@ -923,7 +930,7 @@ partial def storeScalar (dd ss : Nat) (src : Core) : L Bool := do
     let ty := pv.v.ty
     let mr ← resolve pv.m
     let v ← newVar ty
-    lowerInto (some (ty, v, mr)) src
+    lowerInto (.var ty v mr) src
     writePVar pv (.v v)
     return true
   | none =>
@@ -1031,6 +1038,29 @@ partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
     let v ← newVar .f64
     emit (.set v (.bin .powFI a b))
     return .sc (.v v)
+  -- INT ** constant: the square-and-multiply loop of `Sem.powI`, unrolled, so that every
+  -- product the loop range-checks is a checked `mulI` here and nothing else is
+  if op == "**" && r1 == .int 0 && r2 == .int 0 then
+    match CodeGen.strip r with
+    | .lit (.int k) =>
+      if 0 ≤ k && k ≤ 64 then
+        let a ← toScalar (← lower l) r1
+        if k == 0 then return .sc (ki 1)
+        let nn := k.toNat
+        let mut mm : Opnd := a
+        let mut p : Option Opnd := none      -- `none` is the initial 1
+        let mut bit := 1
+        while true do
+          if nn &&& bit != 0 then
+            match p with
+            | none => p := some mm
+            | some pv => let v ← newVar .i64; emit (.set v (.bin .mulI pv mm)); p := some (.v v)
+          bit := bit <<< 1
+          if bit ≤ nn then
+            let v ← newVar .i64; emit (.set v (.bin .mulI mm mm)); mm := .v v
+          else break
+        return .sc (p.getD a)
+    | _ => pure ()
   if r1 != r2 then general else
   match tyOf r1, binOf op r1, dyopResult op r1 with
   | some _, some bop, some res =>
@@ -1080,10 +1110,10 @@ partial def lowerVoid (c : Core) : L Unit := do
       match ← lower c with
       | .stack => rt "a68rt_pop"
       | .sc _ => pure ()
-  | .cond cc t e => lowerCondInto none cc t e |> lowerVoidOf
+  | .cond cc t e => lowerCondInto .void cc t e
   | .block size stmts _ _ => let _ ← lowerBlock size stmts false
   | .loop slot f b t w body => lowerLoop slot f b t w body
-  | .caseInt sel alts out => lowerVoidOf (lowerCaseInto none sel alts out)
+  | .caseInt sel alts out => lowerCaseInto .void sel alts out
   | .caseConf sel alts out => lowerConformity sel alts out; rt "a68rt_pop"
   | .goto l => lowerGoto l
   | .stop => rt "a68rt_stop"
@@ -1104,7 +1134,7 @@ partial def lowerVoidOf (act : L Unit) : L Unit := do act; rt "a68rt_pop"
 
 /-- A conditional whose branches either assign a scalar variable or leave a value on
     the stack. -/
-partial def lowerCondInto (dest : Option (Ty × Var × Mode)) (cc t e : Core) : L Unit := do
+partial def lowerCondInto (dest : Dest) (cc t e : Core) : L Unit := do
   let cond ← toScalar (← lower cc) .bool
   let tb ← newBlock; let eb ← newBlock; let done ← newBlock
   terminate (.condBr cond tb eb)
@@ -1113,10 +1143,11 @@ partial def lowerCondInto (dest : Option (Ty × Var × Mode)) (cc t e : Core) : 
   switchTo done
 
 /-- Compute `c` into the destination: a scalar variable, or the stack. -/
-partial def lowerInto (dest : Option (Ty × Var × Mode)) (c : Core) : L Unit := do
+partial def lowerInto (dest : Dest) (c : Core) : L Unit := do
   match dest with
-  | none => lowerStack c
-  | some (_, v, m) =>
+  | .void => lowerVoid c
+  | .stack => lowerStack c
+  | .var _ v m =>
     match c with
     | .at p e => emit (.line p.line); lowerInto dest e
     | .seq a b => lowerVoid a; lowerInto dest b
@@ -1126,7 +1157,7 @@ partial def lowerInto (dest : Option (Ty × Var × Mode)) (c : Core) : L Unit :=
       let o ← toScalar (← lower c) m
       emit (.set v (.opnd o))
 
-partial def lowerCaseInto (dest : Option (Ty × Var × Mode)) (sel : Core) (alts : List Core) (out : Core) : L Unit := do
+partial def lowerCaseInto (dest : Dest) (sel : Core) (alts : List Core) (out : Core) : L Unit := do
   let n := alts.length
   let k : Opnd ← match ← lower sel with
     | .sc o => pure o
@@ -1260,7 +1291,8 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       | _ => pure ()
     return a
   let hasLabels := stmts.any fun st => match st with | .label _ => true | _ => false
-  let onStack := wantValue && stmts.any fun st => match st with | .label _ | .exit => true | _ => false
+  let hasJumps := stmts.any fun st => match st with | .label _ | .exit => true | _ => false
+  let vp := CodeGen.voidPositions stmts wantValue
   -- which slots become variables: the C back end's escape analysis decides
   let plan := CodeGen.planFrame 0 size modes stmts wantValue (← get).modeTab
   let mut pvars : Array (Option PVar) := #[]
@@ -1318,21 +1350,31 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
   modify fun s => { s with fb := { s.fb with labelBlk := s.fb.labelBlk ++ lbl } }
   if pushed then rt "a68rt_enter" #[ku size]
   pushFrame modes pvars pushed
+  -- the scalar mode every unit that may yield the block's value has, when they agree: the
+  -- value then goes into a variable, so that it survives the frame and needs no stack
+  let varTy : Option (Ty × Mode) ← if wantValue then do
+      let mut r : Option (Option (Ty × Mode × Mode)) := none   -- `some none`: they disagree
+      for i in [0:stmts.size] do
+        if vp[i]! == false then
+          match stmts[i]! with
+          | .unit e =>
+            let this : Option (Ty × Mode × Mode) ← match ← modeOf e with
+              | some m => do let mr ← resolve m; pure ((tyOf mr).map fun ty => (ty, m, mr))
+              | none => pure none
+            match this, r with
+            | some t, none => r := some (some t)
+            | some t, some (some t') => if t.2.2 != t'.2.2 then r := some none
+            | _, _ => r := some none
+          | _ => pure ()
+      pure ((r.bind id).map fun (ty, m, _) => (ty, m))
+    else pure none
+  -- with jumps and no such variable, a placeholder on the stack takes the value
+  let onStack := wantValue && hasJumps && varTy.isNone
   if onStack then rt "a68rt_push_void"
   let endB ← newBlock
-  let vp := CodeGen.voidPositions stmts wantValue
   let mut result : Res := .stack
   let mut produced := false
-  -- the value of a scalar last unit goes into a variable, so that it survives the frame
-  let lastTy : Option (Ty × Mode) ← if wantValue && !onStack then do
-      match stmts.toList.reverse.find? (fun st => match st with | .unit _ => true | _ => false) with
-      | some (.unit e) =>
-        match ← modeOf e with
-        | some m => pure ((tyOf (← resolve m)).map fun ty => (ty, m))
-        | none => pure none
-      | _ => pure none
-    else pure none
-  let dest : Option (Ty × Var × Mode) ← match lastTy with
+  let dest : Option (Ty × Var × Mode) ← match varTy with
     | some (ty, m) => do let v ← newVar ty; pure (some (ty, v, m))
     | none => pure none
   for i in [0:stmts.size] do
@@ -1377,7 +1419,7 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       else if onStack then do let _ ← lowerStack e; rt "a68rt_nip"
       else if wantValue then
         match dest with
-        | some d => lowerInto (some d) e; produced := true; result := .sc (.v d.2.1)
+        | some (ty, v, m) => lowerInto (.var ty v m) e; produced := true; result := .sc (.v v)
         | none => let _ ← lowerStack e; produced := true; result := .stack
       else lowerVoid e
     | .label id =>
@@ -1451,7 +1493,7 @@ partial def lowerNative (k : Nat) (sg : CodeGen.NatSig) (nparams : Nat) (body : 
   match sg.rty with
   | some t =>
     let rv ← newVar (tyOfC t)
-    lowerInto (some (tyOfC t, rv, t.toMode)) body
+    lowerInto (.var (tyOfC t) rv t.toMode) body
     terminate (.retVal (.v rv))
   | none =>
     lowerVoid body
