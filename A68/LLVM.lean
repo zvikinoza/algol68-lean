@@ -157,23 +157,49 @@ def memOp (name : String) (args : Array Opnd) (dst : Option Var) : M Unit := do
   line s!"  {g} = getelementptr i8, ptr {p}, i64 {off}"
   let w := name.drop 7
   let narrow := w == "i8" || w == "i16" || w == "i32"
-  if name.startsWith "mem_ld_" then
+  let isLoad := name.startsWith "mem_ld_"
+  -- the kind of memory accessed, as alias information
+  let kindOpnd : Option Opnd := args[if isLoad then 2 else 3]?
+  let kind : Nat := match kindOpnd with
+    | some (Opnd.k _ (Const.i k)) => k.toNat
+    | _ => 0
+  let md := if kind == 0 then "" else s!", !tbaa !{10 + kind}"
+  if isLoad then
     let some d := dst | return
     if narrow then
-      let t ← fresh; line s!"  {t} = load {w}, ptr {g}"
+      let t ← fresh; line s!"  {t} = load {w}, ptr {g}{md}"
       let z ← fresh; line s!"  {z} = zext {w} {t} to i64"
       store d z
-    else if w == "f64" then do let t ← fresh; line s!"  {t} = load double, ptr {g}"; store d t
-    else if w == "ptr" then do let t ← fresh; line s!"  {t} = load ptr, ptr {g}"; store d t
-    else do let t ← fresh; line s!"  {t} = load i64, ptr {g}"; store d t
+    else if w == "f64" then do let t ← fresh; line s!"  {t} = load double, ptr {g}{md}"; store d t
+    else if w == "ptr" then do let t ← fresh; line s!"  {t} = load ptr, ptr {g}{md}"; store d t
+    else do let t ← fresh; line s!"  {t} = load i64, ptr {g}{md}"; store d t
   else
     let v ← opnd args[2]!
     if narrow then
       let v ← coerce v args[2]!.ty .i64
       let t ← fresh; line s!"  {t} = trunc i64 {v} to {w}"
-      line s!"  store {w} {t}, ptr {g}"
-    else if w == "f64" then line s!"  store double {v}, ptr {g}"
-    else do let v ← coerce v args[2]!.ty .i64; line s!"  store i64 {v}, ptr {g}"
+      line s!"  store {w} {t}, ptr {g}{md}"
+    else if w == "f64" then line s!"  store double {v}, ptr {g}{md}"
+    else do let v ← coerce v args[2]!.ty .i64; line s!"  store i64 {v}, ptr {g}{md}"
+
+/-- The alias information of the module: what the inline memory accesses touch.  Accesses
+    of different kinds never overlap (a frame cell, an object header, the data of a leaf
+    store, a value in a slots store, the line number), and "a cell or a slot" may overlap
+    either; a runtime call may touch anything. -/
+def tbaaLines : List String :=
+  [ "!0 = !{!\"a68 memory\"}",
+    "!1 = !{!\"a cell or a slot\", !0}",
+    "!2 = !{!\"a frame cell\", !1}",
+    "!3 = !{!\"a slot value\", !1}",
+    "!4 = !{!\"an object header\", !0}",
+    "!5 = !{!\"leaf data\", !0}",
+    "!6 = !{!\"the line number\", !0}",
+    "!11 = !{!2, !2, i64 0}",
+    "!12 = !{!4, !4, i64 0}",
+    "!13 = !{!5, !5, i64 0}",
+    "!14 = !{!3, !3, i64 0}",
+    "!15 = !{!1, !1, i64 0}",
+    "!16 = !{!6, !6, i64 0}" ]
 
 /-- A call of a runtime entry point (`a68rt_*`, trailing `i32 0`) or a native helper. -/
 def natCall (name : String) (args : Array Opnd) (dst : Option Var) : M Unit := do
@@ -324,7 +350,7 @@ def un (d : Var) (op : UnOp) (a : Opnd) : M Unit := do
 
 def instr (i : Instr) : M Unit := do
   match i with
-  | .line n => line s!"  store i32 {n}, ptr @a68_line_no"
+  | .line n => line s!"  store i32 {n}, ptr @a68_line_no, !tbaa !16"
   | .call f args => call f args none
   | .set d rhs =>
     match rhs with
@@ -451,6 +477,6 @@ def print (p : Program) : String := Id.run do
       | none =>
         if n.startsWith "a68n_m_" then head := head.push s!"declare double @{n}(double)"
   head := head.push ""
-  return "\n".intercalate (head ++ st.out).toList
+  return "\n".intercalate (head ++ st.out ++ tbaaLines.toArray).toList
 
 end A68.LLVM

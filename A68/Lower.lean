@@ -235,13 +235,21 @@ def finishHoist : L Unit :=
 
 -- ## Memory: the runtime's objects, addressed inline
 
-def ld (w : String) (ty : Ty) (p : Var) (off : Opnd) : L Var := do
+/-- What a memory access touches, for the printer's alias information: accesses of
+    different kinds never overlap, and `KANY` may overlap a cell or a slot. -/
+def KCELL : Nat := 1   -- a frame cell
+def KHDR : Nat := 2    -- an object header, a descriptor's fields included
+def KLEAF : Nat := 3   -- the elements and the defined bitmap of a leaf store
+def KSLOT : Nat := 4   -- a value in a slots store: a row element, a field, a union's content
+def KANY : Nat := 5    -- a cell or a slot
+
+def ld (w : String) (ty : Ty) (p : Var) (off : Opnd) (kind : Nat := 0) : L Var := do
   let v ← newVar ty
-  emit (.set v (.call (.nat s!"mem_ld_{w}") #[.v p, off]))
+  emit (.set v (.call (.nat s!"mem_ld_{w}") #[.v p, off, ki kind]))
   return v
 
-def st (w : String) (p : Var) (off : Opnd) (v : Opnd) : L Unit :=
-  emit (.call (.nat s!"mem_st_{w}") #[.v p, off, v])
+def st (w : String) (p : Var) (off : Opnd) (v : Opnd) (kind : Nat := 0) : L Unit :=
+  emit (.call (.nat s!"mem_st_{w}") #[.v p, off, v, ki kind])
 
 def binv (ty : Ty) (op : BinOp) (a b : Opnd) : L Var := do
   let v ← newVar ty
@@ -286,20 +294,20 @@ def VIEW_OFF : Int := 4294967295
     (a view, `REF [] INT v = a[2:5]`); anything else takes `slow` (`rt.c: cell_rowd`). -/
 def cellRowd (b : Var) (off : Int) (slow : Nat) : L Var := do
   let r ← newVar .ptr
-  let tag ← ld "i32" .i64 b (ki off)
+  let tag ← ld "i32" .i64 b (ki off) KCELL
   let isRow ← binv .i1 .eq (.v tag) (ki T_ROW)
   let rowB ← newBlock; let notRow ← newBlock; let done ← newBlock
   terminate (.condBr (.v isRow) rowB notRow)
   switchTo rowB
-  let p ← ld "ptr" .ptr b (ki (off + 8))
+  let p ← ld "ptr" .ptr b (ki (off + 8)) KCELL
   emit (.set r (.opnd (.v p)))
   terminate (.br done)
   switchTo notRow
   guard (.v (← binv .i1 .eq (.v tag) (ki T_REF))) slow
-  let aux ← ld "i32" .i64 b (ki (off + 4))
+  let aux ← ld "i32" .i64 b (ki (off + 4)) KCELL
   guard (.v (← binv .i1 .eq (.v aux) (ki VIEW_OFF))) slow
-  let p2 ← ld "ptr" .ptr b (ki (off + 8))
-  let pk ← ld "i8" .i64 p2 (ki 0)
+  let p2 ← ld "ptr" .ptr b (ki (off + 8)) KCELL
+  let pk ← ld "i8" .i64 p2 (ki 0) KHDR
   guard (.v (← binv .i1 .eq (.v pk) (ki K_ROWD))) slow
   emit (.set r (.opnd (.v p2)))
   terminate (.br done)
@@ -309,13 +317,13 @@ def cellRowd (b : Var) (off : Int) (slow : Nat) : L Var := do
 /-- The store index of `a[i]` or `a[i, j]` for descriptor `r`, with the evaluator's
     subscript checks (`rt.c: elem_index`); `slow` when the descriptor selects a field. -/
 def rowIndex (r : Var) (dims : Nat) (is : Array Opnd) (slow : Nat) : L Var := do
-  let field ← ld "i32" .i64 r (ki 40)
+  let field ← ld "i32" .i64 r (ki 40) KHDR
   guard (.v (← binv .i1 .eq (.v field) (ki 0))) slow
-  let mut idx : Var ← ld "i64" .i64 r (ki 32)
+  let mut idx : Var ← ld "i64" .i64 r (ki 32) KHDR
   for k in [0:dims] do
-    let l ← ld "i64" .i64 r (ki (48 + 24 * k))
-    let u ← ld "i64" .i64 r (ki (56 + 24 * k))
-    let stride ← ld "i64" .i64 r (ki (64 + 24 * k))
+    let l ← ld "i64" .i64 r (ki (48 + 24 * k)) KHDR
+    let u ← ld "i64" .i64 r (ki (56 + 24 * k)) KHDR
+    let stride ← ld "i64" .i64 r (ki (64 + 24 * k)) KHDR
     let i := is[k]!
     let ge ← binv .i1 .ge i (.v l)
     let le ← binv .i1 .le i (.v u)
@@ -334,15 +342,15 @@ def rowIndex (r : Var) (dims : Nat) (is : Array Opnd) (slow : Nat) : L Var := do
 
 /-- The store of descriptor `r`: through the owner when the descriptor is a view. -/
 def rowStore (r : Var) : L Var := do
-  let base ← ld "ptr" .ptr r (ki 24)
-  let bk ← ld "i8" .i64 base (ki 0)
+  let base ← ld "ptr" .ptr r (ki 24) KHDR
+  let bk ← ld "i8" .i64 base (ki 0) KHDR
   let store ← newVar .ptr
   emit (.set store (.opnd (.v base)))
   let isView ← binv .i1 .eq (.v bk) (ki K_ROWD)
   let viaB ← newBlock; let cont ← newBlock
   terminate (.condBr (.v isView) viaB cont)
   switchTo viaB
-  let inner ← ld "ptr" .ptr base (ki 24)
+  let inner ← ld "ptr" .ptr base (ki 24) KHDR
   emit (.set store (.opnd (.v inner)))
   terminate (.br cont)
   switchTo cont
@@ -356,9 +364,9 @@ def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : Ele
   let r ← cellRowd b off slow
   let idx ← rowIndex r dims is slow
   let store ← rowStore r
-  let sk ← ld "i8" .i64 store (ki 0)
+  let sk ← ld "i8" .i64 store (ki 0) KHDR
   guard (.v (← binv .i1 .eq (.v sk) (ki K_LEAF))) slow
-  let ek ← ld "i16" .i64 store (ki 2)
+  let ek ← ld "i16" .i64 store (ki 2) KHDR
   guard (.v (← binv .i1 .eq (.v ek) (ki info.ek))) slow
   return (r, store, idx)
 
@@ -372,11 +380,11 @@ def K_FRAME : Int := 4
     object or a cell of a frame (`rt.c: ref_slot`); `slow` for NIL, an undefined name, or
     a name into a row (which the runtime resolves). -/
 def refTarget (b : Var) (off : Int) (slow : Nat) : L (Var × Opnd) := do
-  let tag ← ld "i32" .i64 b (ki off)
+  let tag ← ld "i32" .i64 b (ki off) KCELL
   guard (.v (← binv .i1 .eq (.v tag) (ki T_REF))) slow
-  let aux ← ld "i32" .i64 b (ki (off + 4))
-  let obj ← ld "ptr" .ptr b (ki (off + 8))
-  let kind ← ld "i8" .i64 obj (ki 0)
+  let aux ← ld "i32" .i64 b (ki (off + 4)) KCELL
+  let obj ← ld "ptr" .ptr b (ki (off + 8)) KCELL
+  let kind ← ld "i8" .i64 obj (ki 0) KHDR
   let base ← newVar .i64
   let isSlots ← binv .i1 .eq (.v kind) (ki K_SLOTS)
   let slotsB ← newBlock; let notSlots ← newBlock; let cont ← newBlock
@@ -392,55 +400,57 @@ def refTarget (b : Var) (off : Int) (slow : Nat) : L (Var × Opnd) := do
   let o ← binv .i64 .addW (.v base) (.v aux)
   return (obj, .v o)
 
-def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) (via : Bool := false) : L (Var × Opnd) := do
-  let mut cur : Var × Opnd := (b, ki off)
-  if via then cur ← refTarget b off slow
+def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) (via : Bool := false) : L (Var × Opnd × Nat) := do
+  let mut cur : Var × Opnd × Nat := (b, ki off, KCELL)
+  if via then
+    let (p, o) ← refTarget b off slow
+    cur := (p, o, KANY)
   if rank > 0 then
     let r ← cellRowd b off slow
     let idx ← rowIndex r rank is slow
     let store ← rowStore r
-    let sk ← ld "i8" .i64 store (ki 0)
+    let sk ← ld "i8" .i64 store (ki 0) KHDR
     guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
     let eo ← binv .i64 .mulW (.v idx) (ki 16)
     let eo ← binv .i64 .addW (.v eo) (ki 24)
-    cur := (store, .v eo)
+    cur := (store, .v eo, KSLOT)
   for f in fields do
-    let tag ← ld "i32" .i64 cur.1 cur.2
+    let tag ← ld "i32" .i64 cur.1 cur.2.1 cur.2.2
     guard (.v (← binv .i1 .eq (.v tag) (ki T_STRUCT))) slow
-    let po ← binv .i64 .addW cur.2 (ki 8)
-    let sp ← ld "ptr" .ptr cur.1 (.v po)
-    cur := (sp, ki (24 + 16 * f))
+    let po ← binv .i64 .addW cur.2.1 (ki 8)
+    let sp ← ld "ptr" .ptr cur.1 (.v po) cur.2.2
+    cur := (sp, ki (24 + 16 * f), KSLOT)
   return cur
 
 /-- Read the primitive value at `(p, off)` as `ty`; `slow` when its tag is not `info.ek`
     (an undefined value included: the runtime reports it). -/
-def valGet (p : Var) (off : Opnd) (info : ElemInfo) (ty : Ty) (slow : Nat) : L Var := do
-  let tag ← ld "i32" .i64 p off
+def valGet (p : Var) (off : Opnd) (info : ElemInfo) (ty : Ty) (slow : Nat) (kind : Nat := 0) : L Var := do
+  let tag ← ld "i32" .i64 p off kind
   guard (.v (← binv .i1 .eq (.v tag) (ki info.ek))) slow
   let vo ← binv .i64 .addW off (ki 8)
-  let raw ← ld (if info.w == "f64" then "f64" else "i64") (if info.w == "f64" then .f64 else .i64) p (.v vo)
+  let raw ← ld (if info.w == "f64" then "f64" else "i64") (if info.w == "f64" then .f64 else .i64) p (.v vo) kind
   match ty with
   | .i1 => binv .i1 .ne (.v raw) (ki 0)
   | .i32 => do let v ← newVar .i32; emit (.set v (.opnd (.v raw))); return v
   | _ => return raw
 
 /-- Write the primitive value `v` at `(p, off)`: tag, aux 0, payload (`rt.c: mk_int`). -/
-def valSet (p : Var) (off : Opnd) (info : ElemInfo) (v : Opnd) : L Unit := do
-  st "i32" p off (ki info.ek)
+def valSet (p : Var) (off : Opnd) (info : ElemInfo) (v : Opnd) (kind : Nat := 0) : L Unit := do
+  st "i32" p off (ki info.ek) kind
   let ao ← binv .i64 .addW off (ki 4)
-  st "i32" p (.v ao) (ki 0)
+  st "i32" p (.v ao) (ki 0) kind
   let vo ← binv .i64 .addW off (ki 8)
-  st (if info.w == "f64" then "f64" else "i64") p (.v vo) v
+  st (if info.w == "f64" then "f64" else "i64") p (.v vo) v kind
 
 /-- The byte of the leaf's defined bitmap for store index `idx`, its offset, and the mask
     of the element's bit. -/
 def leafBit (store idx : Var) (es : Nat) : L (Var × Var × Var) := do
-  let n ← ld "i32" .i64 store (ki 4)
+  let n ← ld "i32" .i64 store (ki 4) KHDR
   let bytes ← binv .i64 .mulW (.v n) (ki es)
   let hi ← binv .i64 .shrW (.v idx) (ki 3)
   let o1 ← binv .i64 .addW (.v bytes) (.v hi)
   let boff ← binv .i64 .addW (.v o1) (ki 24)
-  let byte ← ld "i8" .i64 store (.v boff)
+  let byte ← ld "i8" .i64 store (.v boff) KLEAF
   let lo ← binv .i64 .andW (.v idx) (ki 7)
   let mask ← binv .i64 .shlW (ki 1) (.v lo)
   return (byte, boff, mask)
@@ -459,7 +469,7 @@ def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) : L Var := do
   switchTo cur
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
   let eoff ← binv .i64 .addW (.v eoff) (ki 24)
-  let raw ← ld info.w (if info.w == "f64" then .f64 else .i64) store (.v eoff)
+  let raw ← ld info.w (if info.w == "f64" then .f64 else .i64) store (.v eoff) KLEAF
   match ty with
   | .i1 => binv .i1 .ne (.v raw) (ki 0)
   | .i32 => do let v ← newVar .i32; emit (.set v (.opnd (.v raw))); return v
@@ -469,10 +479,10 @@ def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) : L Var := do
 def leafSet (store idx : Var) (info : ElemInfo) (v : Opnd) : L Unit := do
   let (byte, boff, mask) ← leafBit store idx info.es
   let nb ← binv .i64 .orW (.v byte) (.v mask)
-  st "i8" store (.v boff) (.v nb)
+  st "i8" store (.v boff) (.v nb) KLEAF
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
   let eoff ← binv .i64 .addW (.v eoff) (ki 24)
-  st info.w store (.v eoff) v
+  st info.w store (.v eoff) v KLEAF
 
 /-- `a[i] := v` on the row cell `(d, s)` holds: inline when the cell holds a row value over
     a leaf store of the element's kind that no other kept value shares (`rt.c: store_ref`
@@ -483,7 +493,7 @@ def rowWrite (d s dims : Nat) (is : Array Opnd) (mr : Mode) (v : Opnd) (fn : Str
   | some (b, off), some info =>
     let slow ← newBlock; let done ← newBlock
     let (_, store, idx) ← rowLeafElem b off dims is info slow
-    let rc ← ld "i32" .i64 store (ki 8)
+    let rc ← ld "i32" .i64 store (ki 8) KHDR
     guard (.v (← binv .i1 .le (.v rc) (ki 1))) slow
     if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
     leafSet store idx info v
@@ -859,7 +869,7 @@ partial def lower (c : Core) : L Res := do
         | some (b, off) =>
           -- the cell's tag says: NIL, or a name; anything else the runtime reports
           let slow ← newBlock; let done ← newBlock
-          let tag ← ld "i32" .i64 b (ki off)
+          let tag ← ld "i32" .i64 b (ki off) KCELL
           let isNil ← binv .i1 .eq (.v tag) (ki T_NIL)
           let isRef ← binv .i1 .eq (.v tag) (ki T_REF)
           guard (.v (← binv .i1 .orB (.v isNil) (.v isRef))) slow
@@ -1100,8 +1110,8 @@ partial def selRead (c : Core) : L (Option Res) := do
     -- is as expected, else the runtime
     let res ← newVar ty
     let slow ← newBlock; let done ← newBlock
-    let (p, o) ← selAddr b off rank #[i, j] fields slow via
-    let v ← valGet p o info ty slow
+    let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via
+    let v ← valGet p o info ty slow pk
     emit (.set res (.opnd (.v v)))
     terminate (.br done)
     switchTo slow
@@ -1167,9 +1177,9 @@ partial def storeTyped (dst src : Core) : L Bool := do
     match ← cellAddr d s, elemInfo mr with
     | some (b, off), some info =>
       let slow ← newBlock; let done ← newBlock
-      let (p, o) ← selAddr b off rank #[i, j] fields slow via
+      let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via
       if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
-      valSet p o info v
+      valSet p o info v pk
       terminate (.br done)
       switchTo slow
       slowCall
@@ -1345,7 +1355,7 @@ partial def storeRef (dst : Core) (dd ss : Nat) (src : Core) (flex : Bool) : L B
   let .ref _ ← resolve m | return false
   let some (db, doff) ← cellAddr dd ss | return false
   -- where the source value is
-  let srcAddr : Option (L (Nat × (Var × Opnd))) ← do   -- the slow block, then the address
+  let srcAddr : Option (L (Nat × (Var × Opnd × Nat))) ← do   -- the slow block, then the address
     match CodeGen.strip src with
     | .lit .nil => pure none
     | .loadCell d s | .deref (.refCell d s) =>
@@ -1355,7 +1365,7 @@ partial def storeRef (dst : Core) (dd ss : Nat) (src : Core) (flex : Bool) : L B
         match ← resolve sm with
         | .ref _ =>
           match ← cellAddr d s with
-          | some (b, off) => pure (some (do let slow ← newBlock; pure (slow, (b, ki off))))
+          | some (b, off) => pure (some (do let slow ← newBlock; pure (slow, (b, ki off, KCELL))))
           | none => pure none
         | _ => pure none
       | none => pure none
@@ -1370,8 +1380,8 @@ partial def storeRef (dst : Core) (dd ss : Nat) (src : Core) (flex : Bool) : L B
             match ← cellAddr d s with
             | some (b, off) => pure (some (do
                 let slow ← newBlock
-                let (p, o) ← selAddr b off rank #[i, j] fields slow via
-                pure (slow, (p, o))))
+                let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via
+                pure (slow, (p, o, pk))))
             | none => pure none
           | none => pure none
         | _ => pure none
@@ -1379,21 +1389,21 @@ partial def storeRef (dst : Core) (dd ss : Nat) (src : Core) (flex : Bool) : L B
     | _ => pure none
   match CodeGen.strip src, srcAddr with
   | .lit .nil, _ =>
-    st "i64" db (ki doff) (ki T_NIL)
-    st "i64" db (ki (doff + 8)) (ki 0)
+    st "i64" db (ki doff) (ki T_NIL) KCELL
+    st "i64" db (ki (doff + 8)) (ki 0) KCELL
     return true
   | _, some act =>
-    let (slow, (p, o)) ← act
+    let (slow, (p, o, pk)) ← act
     let done ← newBlock
-    let tag ← ld "i32" .i64 p o
+    let tag ← ld "i32" .i64 p o pk
     let isNil ← binv .i1 .eq (.v tag) (ki T_NIL)
     let isRef ← binv .i1 .eq (.v tag) (ki T_REF)
     guard (.v (← binv .i1 .orB (.v isNil) (.v isRef))) slow
-    let w0 ← ld "i64" .i64 p o
+    let w0 ← ld "i64" .i64 p o pk
     let o8 ← binv .i64 .addW o (ki 8)
-    let w1 ← ld "i64" .i64 p (.v o8)
-    st "i64" db (ki doff) (.v w0)
-    st "i64" db (ki (doff + 8)) (.v w1)
+    let w1 ← ld "i64" .i64 p (.v o8) pk
+    st "i64" db (ki doff) (.v w0) KCELL
+    st "i64" db (ki (doff + 8)) (.v w1) KCELL
     terminate (.br done)
     switchTo slow
     let _ ← lowerAssignGeneral dst src flex
@@ -1488,7 +1498,7 @@ partial def rowBound (isUpb : Bool) (k : Nat) (e : Core) (slowAct : L Unit) : L 
   let res ← newVar .i64
   let slow ← newBlock; let done ← newBlock
   let r ← cellRowd b off slow
-  let v ← ld "i64" .i64 r (ki (48 + 24 * (k - 1) + (if isUpb then 8 else 0)))
+  let v ← ld "i64" .i64 r (ki (48 + 24 * (k - 1) + (if isUpb then 8 else 0))) KHDR
   emit (.set res (.opnd (.v v)))
   terminate (.br done)
   switchTo slow
@@ -1744,24 +1754,24 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
         | none => pure none
       let slow ← newBlock
       -- the address of the united value
-      let (p, o) : Var × Opnd ← match i with
-        | none => pure (b, ki off)
+      let (p, o, pk) : Var × Opnd × Nat ← match i with
+        | none => pure (b, ki off, KCELL)
         | some iv =>
           let r ← cellRowd b off slow
           let ix ← rowIndex r 1 #[iv] slow
           let store ← rowStore r
-          let sk ← ld "i8" .i64 store (ki 0)
+          let sk ← ld "i8" .i64 store (ki 0) KHDR
           guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
           let eo ← binv .i64 .mulW (.v ix) (ki 16)
           let eo ← binv .i64 .addW (.v eo) (ki 24)
-          pure (store, .v eo)
-      let tag ← ld "i32" .i64 p o
+          pure (store, .v eo, KSLOT)
+      let tag ← ld "i32" .i64 p o pk
       guard (.v (← binv .i1 .eq (.v tag) (ki T_UNION))) slow
       let ao ← binv .i64 .addW o (ki 4)
-      let vm ← ld "i32" .i64 p (.v ao)
+      let vm ← ld "i32" .i64 p (.v ao) pk
       let bo ← binv .i64 .addW o (ki 8)
-      let box ← ld "ptr" .ptr p (.v bo)
-      let itag ← ld "i32" .i64 box (ki 24)
+      let box ← ld "ptr" .ptr p (.v bo) pk
+      let itag ← ld "i32" .i64 box (ki 24) KSLOT
       guard (.v (← binv .i1 .ne (.v itag) (ki T_UNION))) slow
       let mut k := 0
       for (m, slot, body) in alts do
@@ -1777,7 +1787,7 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
         switchTo yes
         match slot with
         | some _ =>
-          let v ← valGet box (ki 24) info ty slow
+          let v ← valGet box (ki 24) info ty slow KSLOT
           pushFrame #[some m] #[some { v := v, m := m }] false none
           lowerInto dest body
           popFrame

@@ -196,10 +196,13 @@ def natSigs : List (String × RtSig) :=
     ("a68n_entier", ⟨#[.f64], .i64⟩), ("a68n_round", ⟨#[.f64], .i64⟩), ("a68n_echo", ⟨#[u32], .none⟩),
     -- memory access, printed inline: a load or store of the given width at a byte offset from
     -- a pointer; the narrow loads zero-extend to i64, the narrow stores truncate
-    ("mem_ld_i8", ⟨#[.ptr, .i64], .i64⟩), ("mem_ld_i16", ⟨#[.ptr, .i64], .i64⟩), ("mem_ld_i32", ⟨#[.ptr, .i64], .i64⟩),
-    ("mem_ld_i64", ⟨#[.ptr, .i64], .i64⟩), ("mem_ld_f64", ⟨#[.ptr, .i64], .f64⟩), ("mem_ld_ptr", ⟨#[.ptr, .i64], .ptr⟩),
-    ("mem_st_i8", ⟨#[.ptr, .i64, .i64], .none⟩), ("mem_st_i32", ⟨#[.ptr, .i64, .i64], .none⟩),
-    ("mem_st_i64", ⟨#[.ptr, .i64, .i64], .none⟩), ("mem_st_f64", ⟨#[.ptr, .i64, .f64], .none⟩) ]
+    -- a pointer; the last argument is a constant naming what is accessed (the printer's
+    -- alias information: 0 unknown, 1 a frame cell, 2 an object header, 3 leaf data,
+    -- 4 a slot value, 5 a cell or a slot)
+    ("mem_ld_i8", ⟨#[.ptr, .i64, .i64], .i64⟩), ("mem_ld_i16", ⟨#[.ptr, .i64, .i64], .i64⟩), ("mem_ld_i32", ⟨#[.ptr, .i64, .i64], .i64⟩),
+    ("mem_ld_i64", ⟨#[.ptr, .i64, .i64], .i64⟩), ("mem_ld_f64", ⟨#[.ptr, .i64, .i64], .f64⟩), ("mem_ld_ptr", ⟨#[.ptr, .i64, .i64], .ptr⟩),
+    ("mem_st_i8", ⟨#[.ptr, .i64, .i64, .i64], .none⟩), ("mem_st_i32", ⟨#[.ptr, .i64, .i64, .i64], .none⟩),
+    ("mem_st_i64", ⟨#[.ptr, .i64, .i64, .i64], .none⟩), ("mem_st_f64", ⟨#[.ptr, .i64, .f64, .i64], .none⟩) ]
 where u32 := Ty.i32
 
 /-- The result type of a runtime call as MIR sees it. -/
