@@ -1,83 +1,22 @@
-/* State holder and default hooks for the a68lean runtime.
+/* The evaluator's side of the hooks compiled programs supply.
 
-   The runtime state is created by `a68rt_boot` at run time and held here, in a C
-   variable: state kept in a Lean global would be marked shared between threads, and
-   then every push onto the operand stack would copy it.
-
-   `a68_dispatch_proc` and `a68_dispatch_hole` are supplied by compiled programs; the
-   interpreter never reaches them, since `Value.cproc` and `Core.hole` only occur in
-   code produced by `a68lean compile`. */
-#include <lean/lean.h>
-#include <stdlib.h>
+   `a68_dispatch_proc` and `a68_dispatch_hole` are defined by every compiled program; the
+   `a68lean` executable links the runtime archive too (for the services the evaluator
+   shares with compiled programs), so it needs definitions that are never reached. */
+#include <stddef.h>
 #include <stdio.h>
-
-/* The source line a compiled program last reached.  Compiled code records it with a
-   plain store to this variable rather than a call into the runtime, so that reaching a
-   statement costs nothing at all when the statement does not fail.  It stays zero while
-   the evaluator runs, which is how the error reporter knows to use its own position. */
-extern uint32_t a68_line_no;   /* defined in rt.c */
-
-uint32_t a68_get_line(lean_object* w) {
-  (void) w;
-  return a68_line_no;
-}
-
-/* Holds `some state`, so that the accessor need not allocate. */
-static lean_object* a68_state = NULL;
-
-void a68_set_state(lean_object* s) {
-  lean_object* opt = lean_alloc_ctor(1, 1, 0);
-  lean_ctor_set(opt, 0, s);
-  a68_state = opt;
-}
-
-lean_object* a68_get_state(lean_object* a) {
-  (void) a;
-  if (a68_state == NULL) return lean_box(0);   /* none */
-  lean_inc(a68_state);
-  return a68_state;                            /* some state */
-}
+#include <stdlib.h>
 
 __attribute__((weak))
-lean_object* a68_dispatch_proc(size_t fn, lean_object* env, lean_object* args, lean_object* w) {
-  (void) fn; (void) env; (void) args; (void) w;
+void a68_dispatch_proc(size_t fn) {
+  (void) fn;
   fprintf(stderr, "a68lean: internal: compiled procedure called in interpreted mode\n");
   exit(1);
 }
 
 __attribute__((weak))
-lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_object* w) {
-  (void) fn; (void) idx; (void) env; (void) w;
+void a68_dispatch_hole(size_t idx) {
+  (void) idx;
   fprintf(stderr, "a68lean: internal: compiled format hole reached in interpreted mode\n");
   exit(1);
 }
-
-/* The label a compiled program is jumping to, plus one; zero when no jump is pending.
-   Every call site in compiled code tests this, so it lives here as a plain variable that
-   the generated C reads directly, rather than behind a runtime entry point that would
-   allocate an IO result for each test. */
-extern uint32_t a68_jump_flag;   /* defined in rt.c */
-
-uint32_t a68_get_jump(lean_object* u) {
-  (void) u;
-  return a68_jump_flag;
-}
-
-uint32_t a68_set_jump(uint32_t v) {
-  a68_jump_flag = v;
-  return v;
-}
-
-/* The C memory of a compiled program (`csrc/rt.c`).  The evaluator never makes a value
-   that lives there, so `a68lean run` never reaches these; they exist so that the
-   interpreter binary links. */
-#define A68_NO_C_MEMORY(name) \
-  fprintf(stderr, "a68lean: internal: " name " reached in interpreted mode\n"); exit(1);
-__attribute__((weak)) lean_object* a68c_load(uint64_t a, uint32_t o, lean_object* w) { (void) a; (void) o; (void) w; A68_NO_C_MEMORY("a68c_load") }
-__attribute__((weak)) lean_object* a68c_store(uint64_t a, uint32_t o, lean_object* b, lean_object* w) { (void) a; (void) o; (void) b; (void) w; A68_NO_C_MEMORY("a68c_store") }
-__attribute__((weak)) lean_object* a68c_assign(uint64_t a, uint32_t o, lean_object* b, uint8_t f, lean_object* w) { (void) a; (void) o; (void) b; (void) f; (void) w; A68_NO_C_MEMORY("a68c_assign") }
-__attribute__((weak)) lean_object* a68c_field(uint64_t a, uint32_t o, uint32_t i, lean_object* w) { (void) a; (void) o; (void) i; (void) w; A68_NO_C_MEMORY("a68c_field") }
-__attribute__((weak)) lean_object* a68c_elem(uint64_t a, uint32_t o, uint32_t i, lean_object* w) { (void) a; (void) o; (void) i; (void) w; A68_NO_C_MEMORY("a68c_elem") }
-__attribute__((weak)) lean_object* a68c_call(uint32_t fn, uint32_t np, uint64_t fr, lean_object* b, uint32_t n, lean_object* w) { (void) fn; (void) np; (void) fr; (void) b; (void) n; (void) w; A68_NO_C_MEMORY("a68c_call") }
-__attribute__((weak)) lean_object* a68c_hole(uint32_t fn, uint32_t idx, uint64_t fr, lean_object* w) { (void) fn; (void) idx; (void) fr; (void) w; A68_NO_C_MEMORY("a68c_hole") }
-__attribute__((weak)) lean_object* a68c_gc(uint32_t what, lean_object* w) { (void) what; (void) w; return lean_io_result_mk_ok(lean_box_float(0.0)); }

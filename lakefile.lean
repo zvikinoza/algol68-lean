@@ -22,7 +22,7 @@ extern_lib liba68rt pkg := do
   buildStaticLib (pkg.staticLibDir / name) jobs
 
 /-- The evaluator's side of the C code: the `@[extern]` wrappers of the operating-system
-    services (sys.c) and the hooks compiled programs override (stubs.c).  Linked into
+    services (sys.c) and the hooks compiled programs supply (stubs.c).  Linked into
     `a68lean` only. -/
 def stubSources : Array String := #["stubs", "sys"]
 
