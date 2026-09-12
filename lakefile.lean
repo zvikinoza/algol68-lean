@@ -18,7 +18,11 @@ extern_lib liba68rt pkg := do
   for n in rtSources do
     let oFile := pkg.buildDir / "csrc" / (n ++ ".o")
     let srcJob ← inputTextFile <| pkg.dir / "csrc" / (n ++ ".c")
-    jobs := jobs.push (← buildO oFile srcJob #["-fPIC", "-O2", "-ffp-contract=off"])
+    -- the multi-precision code must not have its multiply-adds fused, since a68g's
+    -- quotient estimates rely on plain double rounding; the COMPL arithmetic in os.c
+    -- relies on the opposite, the fusion the compiler a68g was built with performs
+    let flags := if n.startsWith "mp" then #["-fPIC", "-O2", "-ffp-contract=off"] else #["-fPIC", "-O2"]
+    jobs := jobs.push (← buildO oFile srcJob flags)
   buildStaticLib (pkg.staticLibDir / name) jobs
 
 /-- The evaluator's side of the C code: the `@[extern]` wrappers of the operating-system
