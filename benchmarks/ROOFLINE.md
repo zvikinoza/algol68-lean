@@ -32,38 +32,38 @@ then freed them.
 ## Where it is now
 
 Every benchmark against its C twin and against a68g's interpreter. The C twin and
-the compiled program are each the best of three interleaved runs, a68g one run.
+the compiled program are each the best of five interleaved runs, a68g one run.
 
 | benchmark | what it is | C twin | a68g | a68lean `-O2` | vs C | faster than a68g |
 |---|---|---:|---:|---:|---:|---:|
-| `intloop` | integer arithmetic in a loop | 0.06 s | 1.44 s | 0.09 s | 1.5x | 16x |
-| `arraysum` | fill and sum a row, 40 million accesses | 0.06 s | 2.79 s | 0.09 s | 1.5x | 31x |
-| `sieve` | sieve of Eratosthenes on a `[] BOOL` | 0.01 s | 1.85 s | 0.02 s | 2.0x | 92x |
-| `data_matmul` | matrix multiplication on `[,] REAL` | 0.05 s | 2.89 s | 0.09 s | 1.8x | 32x |
-| `data_struct` | a row of structures, field by field | <0.01 s | 2.06 s | 0.02 s | ~4x | 103x |
-| `data_union` | a row of a union, dispatched by conformity | 0.02 s | 1.29 s | 0.04 s | 2.0x | 32x |
-| `data_string` | building and comparing strings | <0.01 s | 1.44 s | 0.01 s | ~2x | 144x |
-| `calls` | five million calls of a two-parameter procedure | 0.01 s | 0.57 s | 0.02 s | ~2x | 28x |
-| `ctl_fib` | naive Fibonacci, 18 million recursive calls | 0.01 s | 2.09 s | 0.03 s | ~3x | 70x |
-| `ctl_mutual` | three-way mutual recursion | 0.04 s | 2.31 s | 0.07 s | 1.8x | 33x |
-| `ctl_ops` | user-defined operators | 0.07 s | 2.53 s | 0.09 s | 1.3x | 28x |
-| `ctl_case` | a twelve-way case clause in a hot loop | 0.02 s | 1.32 s | 0.04 s | 2.0x | 33x |
-| `ctl_goto` | Collatz steps with `ANDF`, `OREL` and a `GO TO` out | 0.01 s | 4.12 s | 0.07 s | ~7x | 59x |
-| `ctl_hof` | a procedure passed as a parameter | 0.06 s | 2.92 s | 0.30 s | 5.0x | 10x |
-| `num_divmod` | `OVER` and `MOD` | 0.02 s | 1.12 s | 0.05 s | 2.5x | 22x |
-| `num_horner` | polynomial evaluation in `REAL` | <0.01 s | 1.03 s | 0.01 s | ~2x | 103x |
-| `num_mandel` | Mandelbrot iteration | 0.01 s | 2.11 s | 0.03 s | ~3x | 70x |
+| `intloop` | integer arithmetic in a loop | 0.07 s | 1.45 s | 0.09 s | 1.3x | 16x |
+| `arraysum` | fill and sum a row, 40 million accesses | 0.06 s | 2.66 s | 0.09 s | 1.5x | 30x |
+| `sieve` | sieve of Eratosthenes on a `[] BOOL` | <0.01 s | 1.55 s | 0.01 s | ~2x | 155x |
+| `data_matmul` | matrix multiplication on `[,] REAL` | 0.04 s | 2.18 s | 0.07 s | 1.8x | 31x |
+| `data_struct` | a row of structures, field by field | <0.01 s | 2.06 s | 0.01 s | ~2x | 206x |
+| `data_union` | a row of a union, dispatched by conformity | 0.02 s | 1.30 s | 0.03 s | 1.5x | 43x |
+| `data_string` | building and comparing strings | <0.01 s | 1.46 s | 0.01 s | ~2x | 146x |
+| `calls` | five million calls of a two-parameter procedure | 0.01 s | 0.55 s | 0.02 s | 2.0x | 28x |
+| `ctl_fib` | naive Fibonacci, 18 million recursive calls | 0.01 s | 1.63 s | 0.02 s | 2.0x | 82x |
+| `ctl_mutual` | three-way mutual recursion | 0.03 s | 1.76 s | 0.05 s | 1.7x | 35x |
+| `ctl_ops` | user-defined operators | 0.07 s | 2.11 s | 0.08 s | 1.1x | 26x |
+| `ctl_case` | a twelve-way case clause in a hot loop | 0.02 s | 1.25 s | 0.04 s | 2.0x | 31x |
+| `ctl_goto` | Collatz steps with `ANDF`, `OREL` and a `GO TO` out | 0.01 s | 2.25 s | 0.02 s | 2.0x | 112x |
+| `ctl_hof` | a procedure passed as a parameter | 0.04 s | 1.51 s | 0.06 s | 1.5x | 25x |
+| `num_divmod` | `OVER` and `MOD` | 0.03 s | 1.13 s | 0.04 s | 1.3x | 28x |
+| `num_horner` | polynomial evaluation in `REAL` | <0.01 s | 1.04 s | 0.01 s | ~2x | 104x |
+| `num_mandel` | Mandelbrot iteration | 0.01 s | 2.13 s | 0.03 s | 3.0x | 71x |
 | `num_math` | `sqrt`, `exp`, `ln`, `sin` in a loop | 0.04 s | 1.20 s | 0.06 s | 1.5x | 20x |
-| `num_power` | `**` on `INT` and `REAL` | 0.02 s | 1.10 s | 0.07 s | 3.5x | 16x |
-| `num_real` | `REAL` arithmetic | 0.01 s | 1.30 s | 0.02 s | 2.0x | 65x |
-| `data_slice` | a sliding window taken with a slice | 0.07 s | 2.02 s | 1.53 s | 22x | 1.3x |
-| `data_list` | walking a linked list of `HEAP` nodes | 0.03 s | 1.84 s | 2.84 s | 95x | 0.6x |
+| `num_power` | `**` on `INT` and `REAL` | 0.02 s | 1.10 s | 0.03 s | 1.5x | 37x |
+| `num_real` | `REAL` arithmetic | 0.01 s | 1.20 s | 0.02 s | 2.0x | 60x |
+| `data_slice` | a sliding window taken with a slice | 0.06 s | 1.79 s | 0.16 s | 2.7x | 11x |
+| `data_list` | walking a linked list of `HEAP` nodes | 0.03 s | 1.51 s | 0.72 s | 24x | 2x |
 
 Several C twins run close to the timer's 10 ms resolution, so ratios marked `~`
 are approximate.
 
-Twenty of the twenty-two benchmarks are within about 1.3x to 7x of hand-written C
-and 10 to 144 times faster than a68g. Two are not: heap structures reached
+Twenty-one of the twenty-two benchmarks are within about 1.1x to 3x of hand-written C
+and 11 to 200 times faster than a68g. One is not: heap structures reached
 through `REF`, and slices. Both are discussed at the end.
 
 ## How it got there
@@ -123,22 +123,19 @@ own block. The optimiser earns the native code.
 
 1. **Heap structures.** `data_list` walks 40,000 `HEAP` nodes 250 times. Testing a
    `REF` against `NIL`, reading a field through it and moving along a link are one
-   runtime call each now (they were nine), but each call still resolves a frame,
-   reads a cell of the Lean heap and matches a `Value`, about 150 ns, where C loads a
-   pointer. Closing this gap means keeping structures that are reached through names
-   in memory the emitted C can address, with the runtime's heap as the fallback.
-2. **Slices.** `data_slice` takes a 500-element window of a row 40,000 times. Building
-   the slice is done by the runtime in Lean and costs about 30 ns an element, and so
-   does each read of the window. Copying the window into a C array was tried and made
-   the benchmark slower, because converting the row out of Lean cost more than the
-   reads it saved; the real fix is slicing C arrays natively, which needs the analysis
-   to reason about a `REF` slice aliasing the row it came from.
-3. **Boxed callers.** In `ctl_hof` the procedure taking the parameter is itself boxed,
-   because its signature contains a `PROC`; each of its 120,000 invocations enters and
-   leaves a run-time frame.
+   runtime call each, and the runtime is now C over C objects (`csrc/rt.c`), which
+   took the benchmark from 2.84 s to 0.72 s; what remains is the call itself and the
+   tag dispatch on the cell, about 40 ns where C loads a pointer. Closing the rest of
+   the gap means emitting the field access and the link following inline.
+2. **Slices.** `data_slice` takes a 500-element window of a row 40,000 times. A slice
+   is a descriptor over the row's store, built in C, and each read of the window goes
+   through it: 1.53 s to 0.16 s with the C runtime, 2.7x from the C twin. Slicing C
+   arrays natively needs the analysis to reason about a `REF` slice aliasing the row
+   it came from.
 
-One thing that was tried and abandoned early: making the hot accessors return their
-value directly instead of an `IO` result. Converting the action out of `IO`
-allocates an `Except` in its place, and an A/B on the sieve made it slower, 4.46 s
-to 6.04 s. Avoiding that allocation means changing the monad the runtime is written
-in, not the signature of its entry points.
+The runtime these numbers were measured against is the C one: every entry point the
+emitted code calls is C over C memory, and a compiled program links the C library
+only. The earlier runtime, Lean values behind the same entry points, allocated a
+Lean `IO` result per call and a `Value` per intermediate, which is where the
+remaining factor of 2 to 8 on the runtime-bound benchmarks (`data_slice`,
+`data_list`, `ctl_hof`, `num_power`, `ctl_goto`) went.

@@ -38,23 +38,24 @@ the same answer, which is the ceiling the emitted code is measured against.
 
 | benchmark | vs hand-written C | faster than a68g |
 |---|---:|---:|
-| `intloop`, integer arithmetic in a loop | 1.5x | 16x |
-| `arraysum`, 40 million row element accesses | 1.5x | 31x |
-| `data_matmul`, matrix multiplication | 1.8x | 32x |
-| `data_union`, a row of a union dispatched by conformity | 2.0x | 32x |
-| `data_string`, building and comparing strings | ~2x | 144x |
-| `ctl_fib`, 18 million recursive calls | ~3x | 70x |
-| `ctl_case`, a twelve-way case clause | 2.0x | 33x |
-| `ctl_hof`, a procedure passed as a parameter | 5.0x | 10x |
-| `data_slice`, a sliding window taken by slicing | 22x | 1.3x |
-| `data_list`, walking a linked list of `HEAP` nodes | 95x | 0.6x |
+| `intloop`, integer arithmetic in a loop | 1.3x | 16x |
+| `arraysum`, 40 million row element accesses | 1.5x | 30x |
+| `data_matmul`, matrix multiplication | 1.8x | 31x |
+| `data_union`, a row of a union dispatched by conformity | 1.5x | 43x |
+| `data_string`, building and comparing strings | ~2x | 146x |
+| `ctl_fib`, 18 million recursive calls | 2.0x | 82x |
+| `ctl_case`, a twelve-way case clause | 2.0x | 31x |
+| `ctl_hof`, a procedure passed as a parameter | 1.5x | 25x |
+| `data_slice`, a sliding window taken by slicing | 2.7x | 11x |
+| `data_list`, walking a linked list of `HEAP` nodes | 24x | 2x |
 
 Values of primitive mode are computed in native C types, locals that cannot
 escape become C variables, rows, rows of structures and rows of unions become C
 arrays, strings become C buffers, choices become C conditionals and switches, and
-routines with primitive signatures are plain C functions called directly. Twenty
-of the twenty-two benchmarks are within about 1.3x to 7x of C; structures reached
-through `REF` and slices still go through the runtime. See
+routines with primitive signatures are plain C functions called directly; everything
+else goes through a C runtime over C memory with a mark–sweep collector. Twenty-one
+of the twenty-two benchmarks are within about 1.1x to 3x of C; structures reached
+through `REF` still go through the runtime. See
 [benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for all 22 and for what is left.
 
 ## Quick start
