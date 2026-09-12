@@ -1,0 +1,20 @@
+# A dense layer with ReLU: y = relu(W x + b) for a 256x256 weight matrix over a     #
+# batch of 1000 inputs; a checksum of the outputs.                                  #
+# ops: 6.5536e7  (one multiply-accumulate per op)                                    #
+BEGIN
+  INT n = 256, batch = 1000;
+  [1:n, 1:n] REAL w; [1:n] REAL b, x, y;
+  FOR i TO n DO FOR j TO n DO w[i, j] := ((i * 3 + j * 7) MOD 31 - 15) / 64 OD OD;
+  FOR i TO n DO b[i] := (i MOD 11 - 5) / 10 OD;
+  REAL check := 0;
+  FOR s TO batch DO
+    FOR j TO n DO x[j] := ((j * s) MOD 37) / 37 OD;
+    FOR i TO n DO
+      REAL acc := b[i];
+      FOR j TO n DO acc +:= w[i, j] * x[j] OD;
+      y[i] := IF acc > 0 THEN acc ELSE 0 FI
+    OD;
+    FOR i TO n DO check +:= y[i] OD
+  OD;
+  print((fixed(check, 16, 4), newline))
+END

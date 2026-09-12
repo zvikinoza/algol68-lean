@@ -1,0 +1,16 @@
+# Dot products: 20000 inner products of two REAL vectors of length 4096, the vectors  #
+# refreshed by an affine rule between rounds so that nothing is hoisted away.       #
+# ops: 8.192e7  (one multiply-accumulate per op)                                    #
+BEGIN
+  INT n = 4096, rounds = 20000;
+  [1:n] REAL x, y;
+  FOR i TO n DO x[i] := (i MOD 17) / 16; y[i] := (i MOD 13) / 12 OD;
+  REAL acc := 0;
+  FOR r TO rounds DO
+    REAL s := 0;
+    FOR i TO n DO s +:= x[i] * y[i] OD;
+    acc +:= s / rounds;
+    x[r MOD n + 1] := (r MOD 7) / 8
+  OD;
+  print((fixed(acc, 14, 6), newline))
+END

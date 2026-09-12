@@ -74,7 +74,7 @@ for name in $progs; do
   # reference output from the native C program
   ref=$DIR/build/$name.ref
   if [ -f "$DIR/native/$name.c" ]; then
-    cc -O2 -w "$DIR/native/$name.c" -o "$DIR/build/$name.native" 2>/dev/null
+    cc -O2 -ffp-contract=off -w "$DIR/native/$name.c" -o "$DIR/build/$name.native" 2>/dev/null
     "$DIR/build/$name.native" > "$ref" 2>/dev/null
     if want native; then
       t=$(timeit "$DIR/build/$name.native")

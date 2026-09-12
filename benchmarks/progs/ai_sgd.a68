@@ -1,0 +1,25 @@
+# Linear regression by stochastic gradient descent: 8 features, 20000 samples,     #
+# 200 epochs, one weight update per sample; the learned weights as a checksum.      #
+# ops: 6.4e7  (one gradient term per feature per sample per op)                      #
+BEGIN
+  INT n = 20000, f = 8, epochs = 200;
+  [1:n, 1:f] REAL xs; [1:n] REAL ys; [1:f] REAL wt, true;
+  FOR j TO f DO true[j] := (j MOD 3 - 1) / 2; wt[j] := 0 OD;
+  FOR i TO n DO
+    REAL y := 0.5;
+    FOR j TO f DO xs[i, j] := ((i * j + 5 * j) MOD 23) / 23 - 0.5; y +:= true[j] * xs[i, j] OD;
+    ys[i] := y
+  OD;
+  REAL lr = 0.01;
+  FOR e TO epochs DO
+    FOR i TO n DO
+      REAL pred := 0;
+      FOR j TO f DO pred +:= wt[j] * xs[i, j] OD;
+      REAL err = pred - ys[i];
+      FOR j TO f DO wt[j] -:= lr * err * xs[i, j] OD
+    OD
+  OD;
+  REAL check := 0;
+  FOR j TO f DO check +:= wt[j] * j OD;
+  print((fixed(check, 14, 8), newline))
+END

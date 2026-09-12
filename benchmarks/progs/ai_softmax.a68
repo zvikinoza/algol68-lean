@@ -1,0 +1,18 @@
+# Softmax over a vector of 512 logits, 40000 times: the maximum, the exponentials   #
+# shifted by it, their sum, the normalisation, and a checksum of the result.       #
+# ops: 2.048e7  (one exponential per op)                                            #
+BEGIN
+  INT n = 512, rounds = 40000;
+  [1:n] REAL z, p;
+  REAL check := 0;
+  FOR r TO rounds DO
+    FOR i TO n DO z[i] := ((i * 31 + r) MOD 101) / 10 - 5 OD;
+    REAL m := z[1];
+    FOR i FROM 2 TO n DO IF z[i] > m THEN m := z[i] FI OD;
+    REAL s := 0;
+    FOR i TO n DO p[i] := exp(z[i] - m); s +:= p[i] OD;
+    FOR i TO n DO p[i] := p[i] / s OD;
+    check +:= p[r MOD n + 1]
+  OD;
+  print((fixed(check, 14, 8), newline))
+END

@@ -1,0 +1,35 @@
+# Scaled dot-product attention for a sequence of 64 positions with 64-wide          #
+# queries, keys and values: scores = Q K^T / 8, a softmax per row, output = P V;   #
+# 150 rounds; a checksum.                                                           #
+# ops: 7.8643e7  (one multiply-accumulate per op)                                   #
+BEGIN
+  INT s = 64, d = 64, rounds = 150;
+  [1:s, 1:d] REAL q, k, v, o; [1:s, 1:s] REAL p;
+  REAL check := 0;
+  FOR r TO rounds DO
+    FOR i TO s DO FOR j TO d DO
+      q[i, j] := ((i * 3 + j * 5 + r) MOD 17) / 17;
+      k[i, j] := ((i * 7 + j + r) MOD 13) / 13;
+      v[i, j] := ((i + j * 11 + r) MOD 19) / 19
+    OD OD;
+    FOR i TO s DO
+      REAL m := -1.0e30;
+      FOR j TO s DO
+        REAL acc := 0;
+        FOR t TO d DO acc +:= q[i, t] * k[j, t] OD;
+        p[i, j] := acc / 8;
+        IF p[i, j] > m THEN m := p[i, j] FI
+      OD;
+      REAL sum := 0;
+      FOR j TO s DO p[i, j] := exp(p[i, j] - m); sum +:= p[i, j] OD;
+      FOR j TO s DO p[i, j] := p[i, j] / sum OD
+    OD;
+    FOR i TO s DO FOR t TO d DO
+      REAL acc := 0;
+      FOR j TO s DO acc +:= p[i, j] * v[j, t] OD;
+      o[i, t] := acc
+    OD OD;
+    FOR i TO s DO check +:= o[i, r MOD d + 1] OD
+  OD;
+  print((fixed(check, 14, 6), newline))
+END

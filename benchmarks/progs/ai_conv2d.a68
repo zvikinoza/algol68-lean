@@ -1,0 +1,20 @@
+# Two-dimensional convolution: a 256x256 image with a 3x3 kernel, 100 passes, each  #
+# pass writing into the other buffer; a checksum at the end.                       #
+# ops: 5.80608e7  (one multiply-accumulate per op)                                   #
+BEGIN
+  INT n = 256, passes = 100;
+  [1:n, 1:n] REAL img, tmp; [-1:1, -1:1] REAL kern;
+  FOR i TO n DO FOR j TO n DO img[i, j] := ((i * 5 + j * 3) MOD 41) / 41 OD OD;
+  FOR a FROM -1 TO 1 DO FOR b FROM -1 TO 1 DO kern[a, b] := IF a = 0 AND b = 0 THEN 0.5 ELSE 0.0625 FI OD OD;
+  FOR pass TO passes DO
+    FOR i FROM 2 TO n - 1 DO FOR j FROM 2 TO n - 1 DO
+      REAL s := 0;
+      FOR a FROM -1 TO 1 DO FOR b FROM -1 TO 1 DO s +:= img[i + a, j + b] * kern[a, b] OD OD;
+      tmp[i, j] := s
+    OD OD;
+    FOR i FROM 2 TO n - 1 DO FOR j FROM 2 TO n - 1 DO img[i, j] := tmp[i, j] OD OD
+  OD;
+  REAL total := 0;
+  FOR i TO n DO FOR j TO n DO total +:= img[i, j] OD OD;
+  print((fixed(total, 20, 6), newline))
+END

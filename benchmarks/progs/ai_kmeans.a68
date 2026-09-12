@@ -1,0 +1,29 @@
+# k-means: 5000 points in 8 dimensions, 8 centroids, 100 iterations of assignment   #
+# by squared distance and centroid update; a checksum of the centroids.            #
+# ops: 3.2e7  (one squared-difference accumulation per op)                          #
+BEGIN
+  INT n = 5000, dim = 8, kk = 8, iters = 100;
+  [1:n, 1:dim] REAL pt; [1:kk, 1:dim] REAL cen, acc; [1:kk] INT cnt; [1:n] INT lab;
+  FOR i TO n DO FOR j TO dim DO pt[i, j] := ((i * (j + 3) + j * 7) MOD 101) / 10 OD OD;
+  FOR c TO kk DO FOR j TO dim DO cen[c, j] := pt[c * 37, j] OD OD;
+  FOR it TO iters DO
+    FOR i TO n DO
+      INT best := 1; REAL bd := 1.0e30;
+      FOR c TO kk DO
+        REAL dd := 0;
+        FOR j TO dim DO REAL df = pt[i, j] - cen[c, j]; dd +:= df * df OD;
+        IF dd < bd THEN bd := dd; best := c FI
+      OD;
+      lab[i] := best
+    OD;
+    FOR c TO kk DO cnt[c] := 0; FOR j TO dim DO acc[c, j] := 0 OD OD;
+    FOR i TO n DO
+      INT c = lab[i]; cnt[c] +:= 1;
+      FOR j TO dim DO acc[c, j] +:= pt[i, j] OD
+    OD;
+    FOR c TO kk DO IF cnt[c] > 0 THEN FOR j TO dim DO cen[c, j] := acc[c, j] / cnt[c] OD FI OD
+  OD;
+  REAL check := 0;
+  FOR c TO kk DO FOR j TO dim DO check +:= cen[c, j] * (c + j) OD OD;
+  print((fixed(check, 14, 6), newline))
+END

@@ -1,0 +1,19 @@
+# Dense REAL matrix multiply, 400x400, the classic i-j-k loop nest with a scalar    #
+# accumulator, followed by a checksum.                                             #
+# ops: 6.4e7 (one multiply-accumulate per op)                                        #
+BEGIN
+  INT n = 400;
+  [1:n, 1:n] REAL a, b, c;
+  FOR i TO n DO FOR j TO n DO
+    a[i, j] := ((i * 7 + j) MOD 23) / 23;
+    b[i, j] := ((i + j * 11) MOD 19) / 19
+  OD OD;
+  FOR i TO n DO FOR j TO n DO
+    REAL s := 0;
+    FOR k TO n DO s +:= a[i, k] * b[k, j] OD;
+    c[i, j] := s
+  OD OD;
+  REAL total := 0;
+  FOR i TO n DO FOR j TO n DO total +:= c[i, j] OD OD;
+  print((fixed(total, 16, 4), newline))
+END

@@ -1,0 +1,20 @@
+# One-dimensional convolution: a signal of 100000 samples with a kernel of 16 taps, #
+# 50 passes, each pass feeding the next; a checksum at the end.                    #
+# ops: 7.9992e7  (one multiply-accumulate per op)                                   #
+BEGIN
+  INT n = 100000, k = 16, passes = 50;
+  [1:n] REAL sig, out; [1:k] REAL w;
+  FOR i TO n DO sig[i] := ((i * 13) MOD 29) / 29 OD;
+  FOR j TO k DO w[j] := (j MOD 5 - 2) / 8 OD;
+  FOR pass TO passes DO
+    FOR i TO n - k + 1 DO
+      REAL s := 0;
+      FOR j TO k DO s +:= sig[i + j - 1] * w[j] OD;
+      out[i] := s
+    OD;
+    FOR i TO n - k + 1 DO sig[i] := out[i] / 2 + sig[i] / 2 OD
+  OD;
+  REAL total := 0;
+  FOR i TO n DO total +:= sig[i] OD;
+  print((fixed(total, 16, 6), newline))
+END

@@ -1,0 +1,22 @@
+# Layer normalisation of 1024-element vectors, 30000 times: mean, variance, the      #
+# normalised vector scaled and shifted; a checksum.                                #
+# ops: 3.072e7  (one element normalised per op)                                     #
+BEGIN
+  INT n = 1024, rounds = 30000;
+  [1:n] REAL v, g, beta, o;
+  FOR i TO n DO g[i] := 1 + (i MOD 7) / 100; beta[i] := (i MOD 5) / 50 OD;
+  REAL check := 0;
+  FOR r TO rounds DO
+    FOR i TO n DO v[i] := ((i * 17 + r * 3) MOD 97) / 10 OD;
+    REAL mean := 0;
+    FOR i TO n DO mean +:= v[i] OD;
+    mean := mean / n;
+    REAL var := 0;
+    FOR i TO n DO var +:= (v[i] - mean) * (v[i] - mean) OD;
+    var := var / n;
+    REAL inv = 1 / sqrt(var + 0.00001);
+    FOR i TO n DO o[i] := (v[i] - mean) * inv * g[i] + beta[i] OD;
+    check +:= o[r MOD n + 1]
+  OD;
+  print((fixed(check, 14, 6), newline))
+END
