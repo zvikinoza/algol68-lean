@@ -5,6 +5,8 @@ import A68.Interp
 import A68.Pretty
 import A68.CodeGen
 import A68.Opt
+import A68.Lower
+import A68.LLVM
 
 open A68
 
@@ -67,9 +69,13 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
       let core ← Opt.run core0 level
       if rest.contains "-v" then
         IO.println s!"core nodes: {Opt.size core0} -> {Opt.size core}"
-      let cCode := CodeGen.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file
-      let cFile := out ++ ".c"
-      IO.FS.writeFile cFile cCode
+      let llvm := rest.contains "--llvm"
+      let cFile := if llvm then out ++ ".ll" else out ++ ".c"
+      if llvm then
+        let mir := Lower.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file
+        IO.FS.writeFile cFile (LLVM.print mir)
+      else
+        IO.FS.writeFile cFile (CodeGen.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file)
       if cOnly then IO.println s!"wrote {cFile}"; return 0
       -- link against this compiler's runtime library (plain C) and the C library
       let libDir ← match (← IO.getEnv "A68LEAN_LIB") with
@@ -81,7 +87,7 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
           | some root => pure (root / "lib").toString
           | none => pure ((← IO.currentDir) / ".lake" / "build" / "lib").toString
       let cc := (← IO.getEnv "CC").getD "cc"
-      let args := #[cFile, libDir ++ "/liba68rt.a", "-lm", "-w", "-O2", "-o", out]
+      let args := #[cFile, libDir ++ "/liba68rt.a", "-lm", "-w", "-O2", "-o", out] ++ (if llvm then #["-Wno-override-module"] else #[])
       let r ← IO.Process.output { cmd := cc, args := args }
       if r.exitCode != 0 then
         IO.eprintln s!"a68lean: C compiler failed:\n{r.stderr}"
@@ -111,6 +117,13 @@ def main (args : List String) : IO UInt32 := do
   | ["dump", file] =>
     match (← compile file) with
     | some (core, _, _) => IO.println (Pretty.program core); return 0
+    | none => return 1
+  | ["dump-mir", file] =>
+    match (← compile file) with
+    | some (core0, modes, ll) =>
+      let core ← Opt.run core0 1
+      IO.println (Lower.program core modes ll false [] file).show
+      return 0
     | none => return 1
   | ["lex", file] =>
     let src ← readSource file

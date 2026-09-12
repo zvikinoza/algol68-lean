@@ -6,6 +6,8 @@
 ROOT=$(cd "$(dirname "$0")" && pwd)
 BIN=${A68LEAN:-$ROOT/../.lake/build/bin/a68lean}
 OPT=${1:--O2}
+# extra options for every compilation, e.g. A68LEAN_OPTS=--llvm
+EXTRA=${A68LEAN_OPTS:-}
 pass=0; fail=0
 work=$(mktemp -d)
 for f in "$ROOT"/cases/*.a68; do
@@ -13,7 +15,7 @@ for f in "$ROOT"/cases/*.a68; do
   # a case marked `evaluator only` uses `evaluate`, which compiled programs do not have
   if head -1 "$f" | grep -q "evaluator only"; then continue; fi
   exe="$work/p"
-  if ! ( cd "$ROOT/cases" && gtimeout 900 "$BIN" compile "$n" "$OPT" -o "$exe" >/dev/null 2>&1 ); then
+  if ! ( cd "$ROOT/cases" && gtimeout 900 "$BIN" compile "$n" "$OPT" $EXTRA -o "$exe" >/dev/null 2>&1 ); then
     # a program a68g rejects is expected not to compile
     if [ "$(cat "$base.rc")" != "0" ] && [ ! -s "$base.expected" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "CCERR $n"; fi
     continue
