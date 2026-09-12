@@ -388,6 +388,12 @@ static a68_val row_concat(a68_val a, a68_val b) {
   return r;
 }
 
+/* `row_concat` for the runtime's appends, when the in-place path does not apply */
+a68_val ops_row_concat(a68_val a, a68_val b) {
+  if (b.tag != T_ROW) b = row_of_values(&b, 1);   /* a rowed element, as the operator sees it */
+  return row_concat(a, b);
+}
+
 /* xs repeated k times */
 static a68_val row_repeat(a68_val a, int64_t k) {
   int64_t nx;

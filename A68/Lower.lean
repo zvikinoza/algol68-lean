@@ -266,6 +266,7 @@ structure ElemInfo where
   es   : Nat
   w    : String
   kind : Nat
+  deriving Inhabited
 
 def elemInfo : Mode → Option ElemInfo
   | .int 0 => some ⟨1, 8, "i64", 0⟩
@@ -277,6 +278,7 @@ def elemInfo : Mode → Option ElemInfo
 
 def T_REF : Int := 8
 def T_STRUCT : Int := 10
+def T_UNION : Int := 11
 def K_SLOTS : Int := 1
 def VIEW_OFF : Int := 4294967295
 
@@ -898,7 +900,7 @@ partial def lower (c : Core) : L Res := do
         return .sc (.v v)
       | none => lowerCaseInto .stack sel alts out; return .stack
     | none => lowerCaseInto .stack sel alts out; return .stack
-  | .caseConf sel alts out => lowerConformity sel alts out; return .stack
+  | .caseConf sel alts out => lowerConformity .stack sel alts out; return .stack
   | .loop slot f b t w body => lowerLoop slot f b t w body; rt "a68rt_push_void"; return .stack
   | .goto l => lowerGoto l; return .stack
   | .skip m => rt "a68rt_push_skip" #[ku (← putMode m)]; return .stack
@@ -1147,6 +1149,25 @@ partial def assignBin (op : String) (m : Mode) : Option BinOp :=
 partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := do
   let .ref tm ← resolve m1 | return false
   let tmr ← resolve tm
+  -- `s +:= t` where `s` is a whole cell holding a row: one call that appends to the row
+  -- in place, instead of a reference, a rowing and an operator that rebuilds the row
+  if op == "+:=" then
+    match tmr, CodeGen.strip l with
+    | .row 1 _ _, .refCell d s =>
+      if (← pvarOf d s).isNone then
+        match CodeGen.strip r with
+        | .rowOf e =>
+          if (← modeOf e) == some .char then
+            let c ← toScalar (← lower e) .char
+            rt "a68rt_append_char" #[ku (← rtd d), ku s, c]
+          else
+            let _ ← lowerStack r
+            rt "a68rt_append" #[ku (← rtd d), ku s]
+        | _ =>
+          let _ ← lowerStack r
+          rt "a68rt_append" #[ku (← rtd d), ku s]
+        return true
+    | _, _ => pure ()
   let some _ := tyOf tmr | return false
   let some bop := assignBin op tmr | return false
   if (tyOf (← resolve m2)).isNone then return false
@@ -1474,7 +1495,7 @@ partial def lowerVoid (c : Core) : L Unit := do
   | .block size stmts _ _ => let _ ← lowerBlock size stmts false
   | .loop slot f b t w body => lowerLoop slot f b t w body
   | .caseInt sel alts out => lowerCaseInto .void sel alts out
-  | .caseConf sel alts out => lowerConformity sel alts out; rt "a68rt_pop"
+  | .caseConf sel alts out => lowerConformity .void sel alts out
   | .goto l => lowerGoto l
   | .stop => rt "a68rt_stop"
   | .call f args =>
@@ -1542,28 +1563,125 @@ partial def lowerCaseInto (dest : Dest) (sel : Core) (alts : List Core) (out : C
   terminate (.br done)
   switchTo done
 
-/-- A conformity clause; the value it yields goes to the stack. -/
-partial def lowerConformity (sel : Core) (alts : List (Mode × Option Nat × Core)) (out : Core) : L Unit := do
-  let _ ← lowerStack sel
+/-- A conformity clause.  When the selector is a union a cell holds, or an element of a
+    row of unions a cell holds, and every alternative is of a primitive mode whose bound
+    identifier can be a variable, the united value's mode and content are read inline: the
+    mode is compared with each alternative's (equal table indices conform; otherwise the
+    runtime's `conforms` decides) and the content goes into the variable.  Anything else
+    — a united value of another shape, an undefined value — takes the general path, which
+    evaluates the selector onto the stack and asks the runtime per alternative. -/
+partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Option Nat × Core)) (out : Core) : L Unit := do
   let done ← newBlock
-  for (m, slot, body) in alts do
-    let mi ← putMode m
-    let ok ← rtv "a68rt_conform" #[ku mi, kb slot.isSome]
-    let yes ← newBlock; let no ← newBlock
-    terminate (.condBr (.v ok) yes no)
-    switchTo yes
-    let cells ← rtv "a68rt_enter" #[ku (if slot.isSome then 1 else 0)]
-    if slot.isSome then rt "a68rt_bind_cell" #[ku 0, ku 0]
-    pushFrame #[if slot.isSome then some m else none] #[] true (some cells)
-    let _ ← lowerStack body
-    popFrame
-    rt "a68rt_nip"
-    rt "a68rt_leave"
+  -- the general path, from the selector on the stack
+  let general : L Unit := do
+    for (m, slot, body) in alts do
+      let mi ← putMode m
+      let ok ← rtv "a68rt_conform" #[ku mi, kb slot.isSome]
+      let yes ← newBlock; let no ← newBlock
+      terminate (.condBr (.v ok) yes no)
+      switchTo yes
+      let cells ← rtv "a68rt_enter" #[ku (if slot.isSome then 1 else 0)]
+      if slot.isSome then rt "a68rt_bind_cell" #[ku 0, ku 0]
+      pushFrame #[if slot.isSome then some m else none] #[] true (some cells)
+      match dest with
+      | .stack => let _ ← lowerStack body; popFrame; rt "a68rt_nip"; rt "a68rt_leave"
+      | _ => lowerInto dest body; popFrame; rt "a68rt_leave"; rt "a68rt_pop"
+      terminate (.br done)
+      switchTo no
+    match dest with
+    | .stack => let _ ← lowerStack out; rt "a68rt_nip"
+    | _ => lowerInto dest out; rt "a68rt_pop"
     terminate (.br done)
-    switchTo no
-  let _ ← lowerStack out
-  rt "a68rt_nip"
-  terminate (.br done)
+  -- can the alternatives be taken inline?
+  let mut infos : Array (ElemInfo × Ty) := #[]
+  let mut inlineOk := true
+  for (m, slot, body) in alts do
+    let mr ← resolve m
+    match elemInfo mr, tyOf mr with
+    | some info, some ty => infos := infos.push (info, ty)
+    | _, _ => inlineOk := false
+    if slot.isSome && (CodeGen.hasOtherFn body || CodeGen.slotEscapes (fun _ => false) 0 0 body) then
+      inlineOk := false
+  -- where the united value is: a cell, or an element of a row of unions in a cell
+  let src : Option (Nat × Nat × Option Core × Bool) ← do   -- depth, slot, index, via a name
+    match CodeGen.strip sel with
+    | .loadCell d s | .deref (.refCell d s) =>
+      match ← slotMode d s with
+      | some m => if (← resolve m) matches .union _ then pure (some (d, s, none, false)) else pure none
+      | none => pure none
+    | .slice base [.index e] viaRef =>
+      match ← cellBase base with
+      | some (d, s, _) =>
+        match ← slotMode d s with
+        | some m =>
+          match ← resolve m with
+          | .row 1 _ em => if (← resolve em) matches .union _ then pure (some (d, s, some e, viaRef)) else pure none
+          | _ => pure none
+        | none => pure none
+      | none => pure none
+    | _ => pure none
+  match inlineOk, src with
+  | true, some (d, s, idx, viaRef) =>
+    match ← cellAddr d s with
+    | none => let _ ← lowerStack sel; general
+    | some (b, off) =>
+      let i : Option Opnd ← match idx with
+        | some e => pure (some (← toScalar (← lower e) (.int 0)))
+        | none => pure none
+      let slow ← newBlock
+      -- the address of the united value
+      let (p, o) : Var × Opnd ← match i with
+        | none => pure (b, ki off)
+        | some iv =>
+          let r ← cellRowd b off slow
+          let ix ← rowIndex r 1 #[iv] slow
+          let store ← rowStore r
+          let sk ← ld "i8" .i64 store (ki 0)
+          guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
+          let eo ← binv .i64 .mulW (.v ix) (ki 16)
+          let eo ← binv .i64 .addW (.v eo) (ki 24)
+          pure (store, .v eo)
+      let tag ← ld "i32" .i64 p o
+      guard (.v (← binv .i1 .eq (.v tag) (ki T_UNION))) slow
+      let ao ← binv .i64 .addW o (ki 4)
+      let vm ← ld "i32" .i64 p (.v ao)
+      let bo ← binv .i64 .addW o (ki 8)
+      let box ← ld "ptr" .ptr p (.v bo)
+      let itag ← ld "i32" .i64 box (ki 24)
+      guard (.v (← binv .i1 .ne (.v itag) (ki T_UNION))) slow
+      let mut k := 0
+      for (m, slot, body) in alts do
+        let (info, ty) := infos[k]!
+        k := k + 1
+        let mi ← putMode m
+        let yes ← newBlock; let no ← newBlock; let ask ← newBlock
+        let eq ← binv .i1 .eq (.v vm) (ki mi)
+        terminate (.condBr (.v eq) yes ask)
+        switchTo ask
+        let ok ← rtv "a68rt_conforms" #[ku mi, .v vm]
+        terminate (.condBr (.v ok) yes no)
+        switchTo yes
+        match slot with
+        | some _ =>
+          let v ← valGet box (ki 24) info ty slow
+          pushFrame #[some m] #[some { v := v, m := m }] false none
+          lowerInto dest body
+          popFrame
+        | none => lowerInto dest body
+        terminate (.br done)
+        switchTo no
+      lowerInto dest out
+      terminate (.br done)
+      switchTo slow
+      -- the general path, with the index already evaluated
+      match i with
+      | none => let _ ← lowerStack sel
+      | some iv =>
+        match CodeGen.strip sel with
+        | .slice base _ _ => let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]
+        | _ => let _ ← lowerStack sel
+      general
+  | _, _ => let _ ← lowerStack sel; general
   switchTo done
 
 partial def lowerGoto (l : Nat) : L Unit := do

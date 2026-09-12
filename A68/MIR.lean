@@ -176,6 +176,7 @@ def rtSigs : List (String × RtSig) :=
     ("a68rt_set_sel_bits", ⟨#[u32, u32, u32, .i64, .i64, u32, .i64], .none⟩),
     ("a68rt_sel_push", ⟨#[u32, u32, u32, .i64, .i64, u32], .none⟩), ("a68rt_sel_store", ⟨#[u32, u32, u32, u32, u32, .i64, .i64, u32], .none⟩),
     ("a68rt_append_char", ⟨#[u32, u32, u32], .none⟩), ("a68rt_append", ⟨#[u32, u32], .none⟩),
+    ("a68rt_conforms", ⟨#[u32, u32], .u8⟩),
     ("a68rt_undef_error", ⟨#[u32], .none⟩), ("a68rt_index_error", ⟨#[.i64, .i64, .i64], .none⟩), ("a68rt_arith_error", ⟨#[u32], .none⟩),
     ("a68rt_deref", ⟨#[], .none⟩), ("a68rt_deproc", ⟨#[], .none⟩), ("a68rt_call", ⟨#[u32], .none⟩),
     ("a68rt_widen", ⟨#[u32, u32], .none⟩), ("a68rt_row_of", ⟨#[], .none⟩), ("a68rt_unite", ⟨#[u32], .none⟩),

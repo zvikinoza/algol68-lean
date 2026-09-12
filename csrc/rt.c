@@ -1309,17 +1309,27 @@ static int append_in_place(a68_val* c, const a68_val* elems, int64_t n) {
   return 1;
 }
 
+a68_val ops_row_concat(a68_val a, a68_val b);
+
+/* `s +:= v` when the row in the cell cannot be extended in place (its lower bound is not
+   1, say): the operator's own way, a concatenation assigned through the cell's name
+   (`ops_assigning` on M_ROW). */
+static void append_fallback(uint32_t d, uint32_t s, a68_val v) {
+  a68_frame* f = env;
+  for (uint32_t k = 0; k < d && f; k++) f = f->parent;
+  if (!f) die("internal: frame depth out of range");
+  a68_val name = mk_ptr(T_REF, (a68_obj*) f, s * (uint32_t) sizeof(a68_val));
+  a68_val cur = *cell_of(d, s);
+  if (cur.tag == T_UNDEF) die("attempt to use an uninitialised value");
+  store_ref(name, ops_row_concat(cur, v));
+}
+
 void a68rt_append_char(uint32_t d, uint32_t s, uint32_t ch, int w) {
   GC_POLL();
   (void) w;
   a68_val* c = cell_of(d, s);
   a68_val e = mk_char(ch);
-  if (!append_in_place(c, &e, 1)) {
-    /* fall back to `+:=` on `REF STRING` and `STRING`, which reports the error */
-    a68_val name = mk_ptr(T_REF, (a68_obj*) NULL, 0);
-    (void) name;
-    die("internal: append to a value that is not a string variable");
-  }
+  if (!append_in_place(c, &e, 1)) append_fallback(d, s, e);
 }
 
 void a68rt_append(uint32_t d, uint32_t s, int w) {
@@ -1335,7 +1345,7 @@ void a68rt_append(uint32_t d, uint32_t s, int w) {
   for (int64_t i = 0; i < n; i++) tmp[i] = rowd_get(src, row_store_index(src, i));
   int ok = append_in_place(c, tmp, n);
   free(tmp);
-  if (!ok) die("internal: append to a value that is not a string variable");
+  if (!ok) append_fallback(d, s, v);
 }
 
 /* append elements in place through a name of a string variable (`Interp.appendInPlace`
@@ -2100,6 +2110,9 @@ static int conforms(uint32_t m, uint32_t vm) {
   nconform++;
   return ok;
 }
+
+/* the conformity test alone, for compiled code that has read the value's mode itself */
+uint8_t a68rt_conforms(uint32_t m, uint32_t vm, int w) { (void) w; return conforms(m, vm) ? 1 : 0; }
 
 uint8_t a68rt_conform(uint32_t m, uint8_t bind, int w) {
   GC_POLL();
