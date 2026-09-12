@@ -904,8 +904,11 @@ void a68rt_raise_jump(uint32_t l, int w) { (void) w; a68_jump_flag = l + 1; }
 
 /* ---------------------------------------------------------------- environments */
 
+static int trace_env = -1;
 void a68rt_enter(uint32_t n, int w) {
-  GC_POLL(); (void) w; env = frame_alloc(n); }
+  GC_POLL(); (void) w; env = frame_alloc(n);
+  if (trace_env < 0) trace_env = getenv("A68LEAN_TRACE") != NULL;
+  if (trace_env) fprintf(stderr, "enter(%u) depth=%u line=%u\n", n, env ? env->depth : 0, a68_line_no); }
 
 void a68rt_enter_args(uint32_t n, uint32_t nargs, int w) {
   GC_POLL();
@@ -920,7 +923,8 @@ void a68rt_enter_args(uint32_t n, uint32_t nargs, int w) {
 
 uint32_t a68rt_heap_mark(int w) { (void) w; return 0; }
 void a68rt_heap_release(uint32_t m, int w) { (void) m; (void) w; }
-void a68rt_leave(int w) { (void) w; if (env) env = env->parent; }
+void a68rt_leave(int w) { (void) w; if (env) env = env->parent;
+  if (trace_env > 0) fprintf(stderr, "leave depth=%u line=%u\n", env ? env->depth : 0, a68_line_no); }
 uint32_t a68rt_env_depth(int w) { (void) w; return env ? env->depth : 0; }
 void a68rt_env_truncate(uint32_t d, int w) { (void) w; while (env && env->depth > d) env = env->parent; }
 
@@ -1025,7 +1029,8 @@ void a68rt_push_ref(uint32_t d, uint32_t s, int w) {
 
 void a68rt_store(uint32_t d, uint32_t s, int w) { (void) w; a68_val v = pop(); slot_put(cell_of(d, s), v); }
 void a68rt_bind_cell(uint32_t d, uint32_t s, int w) { (void) w; a68_val v = pop(); slot_put(cell_of(d, s), v); }
-void a68rt_set_int(uint32_t d, uint32_t s, int64_t v, int w) { (void) w; *cell_of(d, s) = mk_int(v); }
+void a68rt_set_int(uint32_t d, uint32_t s, int64_t v, int w) {
+  if (trace_env > 0) fprintf(stderr, "set_int(%u,%u,%lld) env depth=%u\n", d, s, (long long) v, env ? env->depth : 0); (void) w; *cell_of(d, s) = mk_int(v); }
 
 /* ---------------------------------------------------------------- native scalar access */
 
@@ -1043,31 +1048,33 @@ static const char* undef_msg(uint32_t t) {
 int64_t  as_int(a68_val v) {
   if (v.tag == T_INT) return v.v.i;
   if (v.tag == T_UNDEF) die(undef_msg(T_INT));
-  fprintf(stderr, "uncaught exception: INT expected\n"); exit(1);
+  dief("internal: INT expected, got tag %lld", (int64_t) v.tag, 0, 0);
 }
 double  as_real(a68_val v) {
   if (v.tag == T_REAL) return v.v.r;
   if (v.tag == T_INT) return (double) v.v.i;
   if (v.tag == T_UNDEF) die(undef_msg(T_REAL));
-  fprintf(stderr, "uncaught exception: REAL expected\n"); exit(1);
+  die("internal: REAL expected");
 }
 uint8_t  as_bool(a68_val v) {
   if (v.tag == T_BOOL) return (uint8_t) v.v.u;
   if (v.tag == T_UNDEF) die(undef_msg(T_BOOL));
-  fprintf(stderr, "uncaught exception: BOOL expected\n"); exit(1);
+  die("internal: BOOL expected");
 }
 uint32_t  as_char(a68_val v) {
   if (v.tag == T_CHAR) return (uint32_t) v.v.u;
   if (v.tag == T_UNDEF) die(undef_msg(T_CHAR));
-  fprintf(stderr, "uncaught exception: CHAR expected\n"); exit(1);
+  die("internal: CHAR expected");
 }
 uint64_t  as_bits(a68_val v) {
   if (v.tag == T_BITS) return v.v.u;
   if (v.tag == T_UNDEF) die(undef_msg(T_BITS));
-  fprintf(stderr, "uncaught exception: BITS expected\n"); exit(1);
+  die("internal: BITS expected");
 }
 
-int64_t a68rt_cell_int(uint32_t d, uint32_t s, int w) { (void) w; return as_int(*cell_of(d, s)); }
+int64_t a68rt_cell_int(uint32_t d, uint32_t s, int w) { (void) w;
+  if (trace_env > 0) fprintf(stderr, "cell_int(%u,%u) tag=%u env depth=%u line=%u\n", d, s, cell_of(d, s)->tag, env ? env->depth : 0, a68_line_no);
+  return as_int(*cell_of(d, s)); }
 double a68rt_cell_real(uint32_t d, uint32_t s, int w) { (void) w; return as_real(*cell_of(d, s)); }
 uint8_t a68rt_cell_bool(uint32_t d, uint32_t s, int w) { (void) w; return as_bool(*cell_of(d, s)); }
 uint32_t a68rt_cell_char(uint32_t d, uint32_t s, int w) { (void) w; return as_char(*cell_of(d, s)); }

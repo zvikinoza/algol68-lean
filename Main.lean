@@ -118,10 +118,11 @@ def main (args : List String) : IO UInt32 := do
     match (← compile file) with
     | some (core, _, _) => IO.println (Pretty.program core); return 0
     | none => return 1
-  | ["dump-mir", file] =>
+  | "dump-mir" :: file :: rest =>
     match (← compile file) with
     | some (core0, modes, ll) =>
-      let core ← Opt.run core0 1
+      let level := if rest.contains "-O0" then 0 else if rest.contains "-O2" then 2 else 1
+      let core ← Opt.run core0 level
       IO.println (Lower.program core modes ll false [] file).show
       return 0
     | none => return 1

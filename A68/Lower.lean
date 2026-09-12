@@ -162,7 +162,11 @@ def popFnM : Mode → String
 def toStack (r : Res) (m : Mode) : L Unit := do
   match r with
   | .stack => pure ()
-  | .sc o => rt (pushFnM (← resolve m)) #[o]
+  | .sc o =>
+    let mr ← resolve m
+    -- a mode the optimiser left unknown (`.void` on a shared subexpression): the scalar's
+    -- own type decides, which only conflates INT with BITS
+    rt (if (tyOf mr).isSome then pushFnM mr else pushFn o.ty) #[o]
 
 def toScalar (r : Res) (m : Mode) : L Opnd := do
   match r with
@@ -185,9 +189,14 @@ partial def modeOf (c : Core) : L (Option Mode) := do
   | .loadCell d s => slotMode d s
   | .deref (.refCell d s) => slotMode d s
   | .deref (.at _ e) => modeOf (.deref e)
-  | .dyop op m1 _ _ _ =>
+  | .dyop op m1 m2 _ _ =>
     if op == "LWB" || op == "UPB" || op == "ELEMS" then return some (.int 0)
-    return dyopResult op (← resolve m1)
+    let r1 ← resolve m1
+    let r2 ← resolve m2
+    if op == "**" && r1 == .real 0 && r2 == .int 0 then return some (.real 0)
+    -- the result tables assume operands of one mode; `INT * STRING` is a replication
+    if r1 != r2 then return none
+    return dyopResult op r1
   | .monop op m _ =>
     if op == "LWB" || op == "UPB" || op == "ELEMS" then return some (.int 0)
     return monopResult op (← resolve m)
@@ -461,9 +470,11 @@ partial def lowerStack (c : Core) : L Unit := do
 
 /-- The same, with the mode supplied by the context (needed to tell BITS from INT). -/
 partial def lowerStackM (c : Core) (m : Mode) : L Unit := do
+  let mr ← resolve m
+  if (tyOf mr).isNone then lowerStack c else
   match ← lower c with
   | .stack => pure ()
-  | .sc o => rt (pushFnM (← resolve m)) #[o]
+  | .sc o => rt (pushFnM mr) #[o]
 
 partial def lowerLit (v : Value) : L Res := do
   match v with
