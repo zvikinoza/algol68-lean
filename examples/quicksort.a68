@@ -1,0 +1,26 @@
+# quicksort over a row of records, a recursive procedure, a routine passed as a parameter, a struct, formatted output #
+MODE PERSON = STRUCT (STRING name, INT age);
+[1:8] PERSON people := (("ada", 36), ("brian", 29), ("carol", 52), ("dan", 41), ("eve", 29), ("frank", 63), ("grace", 45), ("heidi", 33));
+
+PROC quicksort = (REF [] PERSON a, INT lo, hi, PROC (PERSON, PERSON) BOOL before) VOID:
+  IF lo < hi THEN
+    PERSON pivot = a[(lo + hi) OVER 2];
+    INT i := lo, j := hi;
+    WHILE i <= j DO
+      WHILE before(a[i], pivot) DO i +:= 1 OD;
+      WHILE before(pivot, a[j]) DO j -:= 1 OD;
+      IF i <= j THEN PERSON t = a[i]; a[i] := a[j]; a[j] := t; i +:= 1; j -:= 1 FI
+    OD;
+    quicksort(a, lo, j, before); quicksort(a, i, hi, before)
+  FI;
+
+PROC by age = (PERSON p, q) BOOL: age OF p < age OF q OR (age OF p = age OF q AND name OF p < name OF q);
+quicksort(people, 1, UPB people, by age);
+
+INT total := 0;
+FOR k TO UPB people DO
+  printf(($2z-d". "g, " age "2z-d$, k, name OF people[k], age OF people[k]));
+  total +:= age OF people[k];
+  print(newline)
+OD;
+printf(($"mean age: "2z-d.dd, l$, total / UPB people))
