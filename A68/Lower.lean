@@ -275,14 +275,38 @@ def elemInfo : Mode → Option ElemInfo
   | .bits 0 => some ⟨5, 8, "i64", 4⟩
   | _ => none
 
-/-- The store and store index of `a[i]` or `a[i, j]` for the row cell `(b, off)` holds,
-    with the evaluator's subscript checks, continuing in the fast block; `slow` is taken
-    when the cell does not hold a row value itself, when its descriptor selects a field,
-    or when the store is not a leaf of the element's kind (`rt.c: row_elem`). -/
-def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : ElemInfo) (slow : Nat) : L (Var × Var × Var) := do
+def T_REF : Int := 8
+def T_STRUCT : Int := 10
+def K_SLOTS : Int := 1
+def VIEW_OFF : Int := 4294967295
+
+/-- The descriptor of the row cell `(b, off)` holds: a row value, or a name of a sub-row
+    (a view, `REF [] INT v = a[2:5]`); anything else takes `slow` (`rt.c: cell_rowd`). -/
+def cellRowd (b : Var) (off : Int) (slow : Nat) : L Var := do
+  let r ← newVar .ptr
   let tag ← ld "i32" .i64 b (ki off)
-  guard (.v (← binv .i1 .eq (.v tag) (ki T_ROW))) slow
-  let r ← ld "ptr" .ptr b (ki (off + 8))
+  let isRow ← binv .i1 .eq (.v tag) (ki T_ROW)
+  let rowB ← newBlock; let notRow ← newBlock; let done ← newBlock
+  terminate (.condBr (.v isRow) rowB notRow)
+  switchTo rowB
+  let p ← ld "ptr" .ptr b (ki (off + 8))
+  emit (.set r (.opnd (.v p)))
+  terminate (.br done)
+  switchTo notRow
+  guard (.v (← binv .i1 .eq (.v tag) (ki T_REF))) slow
+  let aux ← ld "i32" .i64 b (ki (off + 4))
+  guard (.v (← binv .i1 .eq (.v aux) (ki VIEW_OFF))) slow
+  let p2 ← ld "ptr" .ptr b (ki (off + 8))
+  let pk ← ld "i8" .i64 p2 (ki 0)
+  guard (.v (← binv .i1 .eq (.v pk) (ki K_ROWD))) slow
+  emit (.set r (.opnd (.v p2)))
+  terminate (.br done)
+  switchTo done
+  return r
+
+/-- The store index of `a[i]` or `a[i, j]` for descriptor `r`, with the evaluator's
+    subscript checks (`rt.c: elem_index`); `slow` when the descriptor selects a field. -/
+def rowIndex (r : Var) (dims : Nat) (is : Array Opnd) (slow : Nat) : L Var := do
   let field ← ld "i32" .i64 r (ki 40)
   guard (.v (← binv .i1 .eq (.v field) (ki 0))) slow
   let mut idx : Var ← ld "i64" .i64 r (ki 32)
@@ -304,7 +328,10 @@ def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : Ele
     let t ← binv .i64 .subW i (.v l)
     let m ← binv .i64 .mulW (.v t) (.v stride)
     idx ← binv .i64 .addW (.v idx) (.v m)
-  -- the store: through the owner when the descriptor is a view of another
+  return idx
+
+/-- The store of descriptor `r`: through the owner when the descriptor is a view. -/
+def rowStore (r : Var) : L Var := do
   let base ← ld "ptr" .ptr r (ki 24)
   let bk ← ld "i8" .i64 base (ki 0)
   let store ← newVar .ptr
@@ -317,11 +344,63 @@ def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : Ele
   emit (.set store (.opnd (.v inner)))
   terminate (.br cont)
   switchTo cont
+  return store
+
+/-- The store and store index of `a[i]` or `a[i, j]` for the row cell `(b, off)` holds,
+    with the evaluator's subscript checks, continuing in the fast block; `slow` is taken
+    when the cell does not hold a row value itself, when its descriptor selects a field,
+    or when the store is not a leaf of the element's kind (`rt.c: row_elem`). -/
+def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : ElemInfo) (slow : Nat) : L (Var × Var × Var) := do
+  let r ← cellRowd b off slow
+  let idx ← rowIndex r dims is slow
+  let store ← rowStore r
   let sk ← ld "i8" .i64 store (ki 0)
   guard (.v (← binv .i1 .eq (.v sk) (ki K_LEAF))) slow
   let ek ← ld "i16" .i64 store (ki 2)
   guard (.v (← binv .i1 .eq (.v ek) (ki info.ek))) slow
   return (r, store, idx)
+
+/-- The address (object, byte offset) of the value `f OF … OF x[i]` names, for the cell
+    `(b, off)` holding the value itself: the row element, then each field through the
+    structure object (`rt.c: sel_read`); `slow` when a tag is not as expected. -/
+def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) : L (Var × Opnd) := do
+  let mut cur : Var × Opnd := (b, ki off)
+  if rank > 0 then
+    let r ← cellRowd b off slow
+    let idx ← rowIndex r rank is slow
+    let store ← rowStore r
+    let sk ← ld "i8" .i64 store (ki 0)
+    guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
+    let eo ← binv .i64 .mulW (.v idx) (ki 16)
+    let eo ← binv .i64 .addW (.v eo) (ki 24)
+    cur := (store, .v eo)
+  for f in fields do
+    let tag ← ld "i32" .i64 cur.1 cur.2
+    guard (.v (← binv .i1 .eq (.v tag) (ki T_STRUCT))) slow
+    let po ← binv .i64 .addW cur.2 (ki 8)
+    let sp ← ld "ptr" .ptr cur.1 (.v po)
+    cur := (sp, ki (24 + 16 * f))
+  return cur
+
+/-- Read the primitive value at `(p, off)` as `ty`; `slow` when its tag is not `info.ek`
+    (an undefined value included: the runtime reports it). -/
+def valGet (p : Var) (off : Opnd) (info : ElemInfo) (ty : Ty) (slow : Nat) : L Var := do
+  let tag ← ld "i32" .i64 p off
+  guard (.v (← binv .i1 .eq (.v tag) (ki info.ek))) slow
+  let vo ← binv .i64 .addW off (ki 8)
+  let raw ← ld (if info.w == "f64" then "f64" else "i64") (if info.w == "f64" then .f64 else .i64) p (.v vo)
+  match ty with
+  | .i1 => binv .i1 .ne (.v raw) (ki 0)
+  | .i32 => do let v ← newVar .i32; emit (.set v (.opnd (.v raw))); return v
+  | _ => return raw
+
+/-- Write the primitive value `v` at `(p, off)`: tag, aux 0, payload (`rt.c: mk_int`). -/
+def valSet (p : Var) (off : Opnd) (info : ElemInfo) (v : Opnd) : L Unit := do
+  st "i32" p off (ki info.ek)
+  let ao ← binv .i64 .addW off (ki 4)
+  st "i32" p (.v ao) (ki 0)
+  let vo ← binv .i64 .addW off (ki 8)
+  st (if info.w == "f64" then "f64" else "i64") p (.v vo) v
 
 /-- The byte of the leaf's defined bitmap for store index `idx`, its offset, and the mask
     of the element's bit. -/
@@ -887,8 +966,7 @@ partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
   -- a cell holding a name of a row (`REF [] INT` parameter) is not a row the runtime's
   -- element entry points can subscript directly
   let rowM ← match viaName, mr with
-    | false, r@(.row _ _ _) => pure (some r)
-    | true, .row _ _ _ => pure none
+    | _, r@(.row _ _ _) => pure (some r)
     | _, _ => pure none
   let some (.row dims _ em) := rowM | return none
   let emr ← resolve em
@@ -928,10 +1006,10 @@ partial def selChain (c : Core) : L (Option (Nat × Nat × Nat × Opnd × Opnd �
   | .at _ e => selChain e
   | .refCell d s =>
     if (← pvarOf d s).isSome then return none
-    return some (← rtd d, s, 0, ki 0, ki 0, [], false)
+    return some (d, s, 0, ki 0, ki 0, [], false)
   | .loadCell d s | .deref (.refCell d s) =>
     if (← pvarOf d s).isSome then return none
-    return some (← rtd d, s, 0, ki 0, ki 0, [], true)
+    return some (d, s, 0, ki 0, ki 0, [], true)
   | .slice base idx true =>
     let some (d, s, rank, _, _, fields, via) ← selChain base | return none
     if via || rank != 0 || !fields.isEmpty then return none
@@ -967,7 +1045,24 @@ partial def selRead (c : Core) : L (Option Res) := do
   let fn := match ty with
     | .i64 => if mr matches .bits _ then "a68rt_sel_bits" else "a68rt_sel_int"
     | .f64 => "a68rt_sel_real" | .i1 => "a68rt_sel_bool" | .i32 => "a68rt_sel_char" | .ptr => ""
-  return some (.sc (.v (← rtv fn #[ku d, ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields)])))
+  let slowCall : L Var := do rtv fn #[ku (← rtd d), ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields)]
+  match via, ← cellAddr d s, elemInfo mr with
+  | false, some (b, off), some info =>
+    -- inline through the row element and the structure objects when every tag is as
+    -- expected, else the runtime
+    let res ← newVar ty
+    let slow ← newBlock; let done ← newBlock
+    let (p, o) ← selAddr b off rank #[i, j] fields slow
+    let v ← valGet p o info ty slow
+    emit (.set res (.opnd (.v v)))
+    terminate (.br done)
+    switchTo slow
+    let sv ← slowCall
+    emit (.set res (.opnd (.v sv)))
+    terminate (.br done)
+    switchTo done
+    return some (.sc (.v res))
+  | _, _, _ => return some (.sc (.v (← slowCall)))
 
 /-- The general slice: the row and the indexers on the stack, then the runtime. -/
 partial def lowerSlice (arr : Core) (idx : List CoreIdx) (viaRef : Bool) : L Res := do
@@ -1020,7 +1115,19 @@ partial def storeTyped (dst src : Core) : L Bool := do
     let fn := match ty with
       | .i64 => if mr matches .bits _ then "a68rt_set_sel_bits" else "a68rt_set_sel_int"
       | .f64 => "a68rt_set_sel_real" | .i1 => "a68rt_set_sel_bool" | .i32 => "a68rt_set_sel_char" | .ptr => ""
-    rt fn #[ku d, ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields), v]
+    let slowCall : L Unit := do rt fn #[ku (← rtd d), ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields), v]
+    match via, ← cellAddr d s, elemInfo mr with
+    | false, some (b, off), some info =>
+      let slow ← newBlock; let done ← newBlock
+      let (p, o) ← selAddr b off rank #[i, j] fields slow
+      if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
+      valSet p o info v
+      terminate (.br done)
+      switchTo slow
+      slowCall
+      terminate (.br done)
+      switchTo done
+    | _, _, _ => slowCall
     return true
   | _ => return false
 
@@ -1246,9 +1353,7 @@ partial def rowBound (isUpb : Bool) (k : Nat) (e : Core) (slowAct : L Unit) : L 
   let some (b, off) ← cellAddr d s | return none
   let res ← newVar .i64
   let slow ← newBlock; let done ← newBlock
-  let tag ← ld "i32" .i64 b (ki off)
-  guard (.v (← binv .i1 .eq (.v tag) (ki T_ROW))) slow
-  let r ← ld "ptr" .ptr b (ki (off + 8))
+  let r ← cellRowd b off slow
   let v ← ld "i64" .i64 r (ki (48 + 24 * (k - 1) + (if isUpb then 8 else 0)))
   emit (.set res (.opnd (.v v)))
   terminate (.br done)
