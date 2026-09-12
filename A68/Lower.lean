@@ -54,6 +54,9 @@ structure FrameInfo where
   outer  : Bool := false
   /-- a number unique to the frame, for the row caches -/
   fid    : Nat := 0
+  /-- per slot: the literal bounds a non-flexible row variable was declared with, which it
+      keeps for life (an assignment of other bounds is an error) -/
+  bounds : Array (Option (List (Int × Int))) := #[]
   deriving Inhabited
 
 /-- What a loop keeps in variables about a row a cell holds, so that the elements are
@@ -460,6 +463,12 @@ where
           let own := (fb.frames.takeWhile (!·.outer)).length
           cellAddr (own + (c.fid - 1000000)) c.slot
         else pure none
+    -- the bounds the row was declared with, when the variable keeps them for life
+    let known : Option (List (Int × Int)) := match d? with
+      | some d => match fb.frames[d]? with
+        | some f => (f.bounds[c.slot]?).join
+        | none => none
+      | none => none
     match addr with
     | none => terminate (.br done); switchTo done
     | some (b, off) =>
@@ -469,14 +478,32 @@ where
       emit (.set c.r (.opnd (.v r)))
       let field ← ld "i32" .i64 r (ki 40) KHDR
       guard (.v (← binv .i1 .eq (.v field) (ki 0))) done
-      let off0 ← ld "i64" .i64 r (ki 32) KHDR
-      emit (.set c.off (.opnd (.v off0)))
-      for k in [0:c.dims] do
-        let (lv, uv, sv) := c.dim[k]!
-        let l ← ld "i64" .i64 r (ki (48 + 24 * k)) KHDR
-        let u ← ld "i64" .i64 r (ki (56 + 24 * k)) KHDR
-        let stride ← ld "i64" .i64 r (ki (64 + 24 * k)) KHDR
-        emit (.set lv (.opnd (.v l))); emit (.set uv (.opnd (.v u))); emit (.set sv (.opnd (.v stride)))
+      match known with
+      | some bs =>
+        -- a fresh row's descriptor: offset 0, the last dimension's stride 1, each earlier
+        -- one's the extent of the next (`rt.c: a68rt_new_row_of`)
+        emit (.set c.off (.opnd (ki 0)))
+        let mut stride : Int := 1
+        let mut strides : Array Int := Array.replicate c.dims 1
+        for k' in [0:c.dims] do
+          let k := c.dims - 1 - k'
+          strides := strides.set! k stride
+          let (l, u) := bs[k]!
+          let ext := u - l + 1
+          stride := stride * (if ext > 0 then ext else 0)
+        for k in [0:c.dims] do
+          let (lv, uv, sv) := c.dim[k]!
+          let (l, u) := bs[k]!
+          emit (.set lv (.opnd (ki l))); emit (.set uv (.opnd (ki u))); emit (.set sv (.opnd (ki strides[k]!)))
+      | none =>
+        let off0 ← ld "i64" .i64 r (ki 32) KHDR
+        emit (.set c.off (.opnd (.v off0)))
+        for k in [0:c.dims] do
+          let (lv, uv, sv) := c.dim[k]!
+          let l ← ld "i64" .i64 r (ki (48 + 24 * k)) KHDR
+          let u ← ld "i64" .i64 r (ki (56 + 24 * k)) KHDR
+          let stride ← ld "i64" .i64 r (ki (64 + 24 * k)) KHDR
+          emit (.set lv (.opnd (.v l))); emit (.set uv (.opnd (.v u))); emit (.set sv (.opnd (.v stride)))
       let store ← rowStore r
       emit (.set c.store (.opnd (.v store)))
       let sk ← ld "i8" .i64 store (ki 0) KHDR
@@ -960,9 +987,9 @@ def jumpCheck : L Unit := do
   switchTo cont
 
 def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true)
-    (cells : Option Var := none) : L Unit :=
+    (cells : Option Var := none) (bounds : Array (Option (List (Int × Int))) := #[]) : L Unit :=
   modify fun s =>
-    let f : FrameInfo := { modes := modes, vars := vars, pushed := pushed, cells := cells, fid := s.nextFid }
+    let f : FrameInfo := { modes := modes, vars := vars, pushed := pushed, cells := cells, fid := s.nextFid, bounds := bounds }
     { s with nextFid := s.nextFid + 1, fb := { s.fb with frames := f :: s.fb.frames } }
 
 /-- The routines the innermost frame's slots are known to hold. -/
@@ -2250,7 +2277,25 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     | _ => pure ()
   modify fun s => { s with fb := { s.fb with labelBlk := s.fb.labelBlk ++ lbl } }
   let cells : Option Var ← if pushed then some <$> rtv "a68rt_enter" #[ku size] else pure none
-  pushFrame modes pvars pushed cells
+  -- a non-flexible row variable declared by a generator with literal, non-empty bounds
+  -- keeps those bounds for life
+  let mut bounds : Array (Option (List (Int × Int))) := Array.replicate size none
+  for st in stmts do
+    match st with
+    | .decl sl m init =>
+      if sl < size then
+        match ← resolve m, CodeGen.strip init with
+        | .row dims false _, .newRow bs _ false =>
+          let lits : Option (List (Int × Int)) := bs.mapM fun (l, u) =>
+            match CodeGen.strip l, CodeGen.strip u with
+            | .lit (.int lo), .lit (.int hi) => if lo ≤ hi then some (lo, hi) else none
+            | _, _ => none
+          match lits with
+          | some ls => if ls.length == dims then bounds := bounds.set! sl (some ls)
+          | none => pure ()
+        | _, _ => pure ()
+    | _ => pure ()
+  pushFrame modes pvars pushed cells bounds
   -- the scalar mode every unit that may yield the block's value has, when they agree: the
   -- value then goes into a variable, so that it survives the frame and needs no stack
   let varTy : Option (Ty × Mode) ← if wantValue then do
