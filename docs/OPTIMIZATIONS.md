@@ -6,9 +6,24 @@ recognises, never to a benchmark by name. The benchmark ratios are against the
 hand-written C twins in `benchmarks/native/` (LLVM back end, best of five).
 
 The pipeline: `A68/Elab.lean` (elaboration) → `A68/Opt.lean` (core optimiser, proved
-in `A68/Verified/Opt.lean`) → `A68/Lower.lean` (lowering to MIR: most of what follows)
-→ `A68/MIR/Opt.lean` (MIR passes, proved in `A68/Verified/MIR.lean`) → `A68/LLVM.lean`
-(printer) → clang.
+in `A68/Verified/Opt.lean`) → the lowering to MIR (`A68/Lower.lean` with its state in
+`A68/Lower/`, one module per optimisation in `A68/Optimizations/` and one per analysis
+in `A68/Analysis/`) → `A68/MIR/Opt.lean` (MIR passes, proved in `A68/Verified/MIR.lean`)
+→ `A68/LLVM.lean` (printer) → clang.
+
+| module | what it holds |
+|---|---|
+| `A68/Optimizations/NativeCalls.lean` | direct and table-dispatched calls of plain routine entry points (§3) |
+| `A68/Optimizations/RowPromotion.lean` | rows that never escape as native arrays (§4) |
+| `A68/Optimizations/InlineRows.lean` | inline access to the rows, structures and names the runtime keeps (§4) |
+| `A68/Optimizations/RowCache.lean` | a loop's row descriptors in registers; element write and append paths (§4) |
+| `A68/Optimizations/DeferredTraps.lean` | checks as flag updates, unchecked arithmetic, sunk finiteness tests (§5) |
+| `A68/Analysis/JumpFree.lean` | routines that cannot jump out (§3) |
+| `A68/Analysis/Repeatable.lean` | what a loop body calls and assigns; jumps, WHILE, labels (§4–5) |
+| `A68/Analysis/Interval.lean` | intervals of INT expressions for bounds-check elimination (§5) |
+| `A68/Analysis/Definedness.lean` | rows known fully defined after an initialising loop (§5) |
+| `A68/Lower.lean` | the lowering proper: `lowerBlock` (row allocation), `lowerLoop` (the cache and the deferred-trap region), `lowerNative`, `lowerConformity` (static conformity) |
+| `A68/Lower/State.lean`, `Frames.lean`, `Mem.lean` | the lowering state, frames and inline memory access |
 
 ## 1. Core level (`A68/Opt.lean`, proved)
 
@@ -21,7 +36,7 @@ interval analysis below see literals.
 
 * **Scalars in registers.** `INT`, `REAL`, `BOOL`, `CHAR`, `BITS` are `i64`/`f64`/`i1`/
   `i32`; the operations carry a68g's checks (INT range ±2147483647, zero divisors,
-  NaN/infinite REAL results). `Lower.lean`: `lowerDyop`, `lowerMonop`, `emitBin`.
+  NaN/infinite REAL results). `Lower.lean`: `lowerDyop`, `lowerMonop`; `Optimizations/DeferredTraps.lean`: `emitBin`.
 * **Locals that cannot escape are registers**, with an "assigned" flag only when a read
   before assignment is possible (`PVar`; the escape analysis is the C back end's
   `CodeGen.planFrame`). Loop counters likewise (`lowerLoopBody`).

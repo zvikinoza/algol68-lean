@@ -243,6 +243,9 @@ A68/Opt.lean         optimisation passes over the core representation
 A68/MIR.lean         MIR: the typed register-machine IR the compiler optimises
 A68/MIR/Sem.lean     its semantics; A68/MIR/Opt.lean: its passes (proved in A68/Verified/MIR.lean)
 A68/Lower.lean       lowering of the core representation to MIR
+A68/Lower/           its state (State), frames and operator tables (Frames), inline memory access (Mem)
+A68/Optimizations/   one module per optimisation: NativeCalls, RowPromotion, InlineRows, RowCache, DeferredTraps
+A68/Analysis/        one module per analysis: JumpFree, Repeatable, Interval, Definedness
 A68/LLVM.lean        the LLVM IR printer
 A68/CodeGen.lean     the C back end (--c)
 A68/Serial.lean      mode and format tables carried by compiled programs
