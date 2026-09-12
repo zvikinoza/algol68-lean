@@ -1,0 +1,4 @@
+STRUCT (REAL x, REAL s) a := (1.0, 2.0); [1:2]STRUCT(REAL x, REAL s) t := ((1.0, 2.0), (3.0, 4.0));
+PROC f = ([]REAL lx) REAL: ([]REAL xx = lx[@1]; xx[2]);
+print((f(s OF t), newline));
+[]REAL v = (s OF t)[@0]; print((v[1], newline))

@@ -139,7 +139,10 @@ static a68_frame* env = NULL;              /* the innermost frame */
 static a68_frame** saved = NULL;           /* environments saved by env_set */
 static size_t nsaved = 0, saved_cap = 0;
 
+static int trace_env2 = -1;
 void  push(a68_val v) {
+  if (trace_env2 < 0) trace_env2 = getenv("A68LEAN_TRACE") != NULL;
+  if (trace_env2 > 0) fprintf(stderr, "push tag=%u sp=%zu line=%u\n", v.tag, sp + 1, a68_line_no);
   if (sp == stack_cap) {
     stack_cap = stack_cap ? stack_cap * 2 : 1024;
     stack = (a68_val*) realloc(stack, stack_cap * sizeof(a68_val));
@@ -149,6 +152,7 @@ void  push(a68_val v) {
 }
 
 a68_val  pop(void) {
+  if (trace_env2 > 0) fprintf(stderr, "pop tag=%u sp=%zu line=%u\n", sp ? stack[sp - 1].tag : 99, sp - 1, a68_line_no);
   if (sp == 0) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
   return stack[--sp];
 }
@@ -684,6 +688,7 @@ static void slice_into(a68_rowd* r, int is_name, const indexer* ixs, uint32_t ni
     return;
   }
   nr->off = off;
+  nr->field = r->field;   /* a trim of a multiple selection still selects the field */
   if (is_name) {
     nr->base = (a68_obj*) rowd_owner(r);
     *out = mk_ptr(T_REF, (a68_obj*) nr, VIEW_OFF);
@@ -1054,7 +1059,7 @@ double  as_real(a68_val v) {
   if (v.tag == T_REAL) return v.v.r;
   if (v.tag == T_INT) return (double) v.v.i;
   if (v.tag == T_UNDEF) die(undef_msg(T_REAL));
-  die("internal: REAL expected");
+  dief("internal: REAL expected, got tag %lld", (int64_t) v.tag, 0, 0);
 }
 uint8_t  as_bool(a68_val v) {
   if (v.tag == T_BOOL) return (uint8_t) v.v.u;

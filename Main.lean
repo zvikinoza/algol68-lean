@@ -7,6 +7,7 @@ import A68.CodeGen
 import A68.Opt
 import A68.Lower
 import A68.LLVM
+import A68.MIR.Opt
 
 open A68
 
@@ -73,6 +74,9 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
       let cFile := if llvm then out ++ ".ll" else out ++ ".c"
       if llvm then
         let mir := Lower.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file
+        -- the verified MIR passes (A68.Verified.MIR.run_correct), unless -O0
+        let mir := if level == 0 then mir else
+          { mir with fns := mir.fns.map MIR.Opt.run, holes := mir.holes.map MIR.Opt.run }
         IO.FS.writeFile cFile (LLVM.print mir)
       else
         IO.FS.writeFile cFile (CodeGen.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file)
@@ -114,16 +118,21 @@ def main (args : List String) : IO UInt32 := do
       Interp.run core modes ("a68g" :: file :: rest).toArray ll (A68.isRegression toks)
     | none => return 1
   | "compile" :: file :: rest => compileToBinary file rest
-  | ["dump", file] =>
+  | "dump" :: file :: rest =>
     match (← compile file) with
-    | some (core, _, _) => IO.println (Pretty.program core); return 0
+    | some (core0, _, _) =>
+      let level := if rest.contains "-O0" then 0 else if rest.contains "-O2" then 2 else if rest.contains "-O1" then 1 else 0
+      let core ← if level == 0 then pure core0 else Opt.run core0 level
+      IO.println (Pretty.program core); return 0
     | none => return 1
   | "dump-mir" :: file :: rest =>
     match (← compile file) with
     | some (core0, modes, ll) =>
       let level := if rest.contains "-O0" then 0 else if rest.contains "-O2" then 2 else 1
       let core ← Opt.run core0 level
-      IO.println (Lower.program core modes ll false [] file).show
+      let mir := Lower.program core modes ll false [] file
+      let mir := if level == 0 then mir else { mir with fns := mir.fns.map MIR.Opt.run, holes := mir.holes.map MIR.Opt.run }
+      IO.println mir.show
       return 0
     | none => return 1
   | ["lex", file] =>

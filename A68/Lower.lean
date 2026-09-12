@@ -202,9 +202,11 @@ partial def modeOf (c : Core) : L (Option Mode) := do
     return monopResult op (← resolve m)
   | .widen _ d _ => return some d
   | .cond _ t e => do
-    match ← modeOf t with
-    | some m => return some m
-    | none => modeOf e
+    -- every branch must have the mode: the optimiser folds a widened literal to the
+    -- literal, so one branch of a LONG conditional may look like an INT
+    match ← modeOf t, ← modeOf e with
+    | some m, some m' => return (if (← resolve m) == (← resolve m') then some m else none)
+    | _, _ => return none
   | .andThen _ _ | .orElse _ _ | .identRel _ _ _ => return some .bool
   | .call f [_] =>
     match CodeGen.strip f with
@@ -212,7 +214,13 @@ partial def modeOf (c : Core) : L (Option Mode) := do
     | _ => return none
   | .seq _ b => modeOf b
   | .skip m => return some m
-  | .caseInt _ (a :: _) _ => modeOf a
+  | .caseInt _ alts out => do
+    let mut r ← modeOf out
+    for a in alts do
+      match r, ← modeOf a with
+      | some m, some m' => if (← resolve m) != (← resolve m') then r := none
+      | _, _ => r := none
+    return r
   | .block _ stmts _ _ =>
     -- the last unit gives the value, when the block has no labels
     if stmts.any (fun st => match st with | .label _ | .exit => true | _ => false) then return none
