@@ -36,11 +36,14 @@ is the one idea kept.
 The generator already emits calls to 109 runtime entry points whose interface
 is integers and native scalars only (`a68rt_push_int`, `a68rt_slice(nidx,
 kinds, viaRef)`, …). Those entry points get a C implementation over a C heap,
-`csrc/rt.c`, with the same names and contracts. The emitted code is unchanged
-except for what the collector needs; the Lean `A68.Runtime` keeps serving the
-evaluator. The evaluator (`A68.Interp`) is the specification each C entry point
-is written against, and the 62 cases, 773 corpus programs and the fuzzers
-check the port byte for byte.
+`csrc/rt.c`, with the same names and contracts, and the services behind them —
+transput, the prelude, the operators, formatting, `LONG` arithmetic — are
+transcribed to C as well (`io.c`, `prelude.c`, `ops.c`, `fmt.c`, `mp*.c`), so a
+compiled program links the C library only. The emitted code is unchanged except
+for what the collector needs. The evaluator (`A68.Interp`) is the specification
+each C routine is written against, and the cases, the corpus programs, the
+fuzzers and the differential tests of the formatting and the arithmetic check
+the port byte for byte.
 
 Rejected: rewriting the generator to produce typed C directly. It would give
 the same heap and more speed, but changes everything at once; the entry-point
@@ -164,18 +167,20 @@ text, reported through the line the emitted code records, so that the exit
 status and standard error keep matching. `a68lean run` remains the arbiter
 where the C runtime and the evaluator disagree.
 
-### 3.8 The boundary to Lean
+### 3.8 The services
 
-A call of a builtin (`print`, `printf`, `read`, `whole`, `system`, …) converts
-its arguments to Lean `Value`s: scalars directly, rows and structures deeply,
-names to a Lean `Value.cref addr mode` whose `readRef`/`writeRef` call back into
-C (`a68c_load`, `a68c_store`). The result is converted back. Conversion is
-linear in the size of the value, which is what printing it costs anyway.
+A call of a builtin (`print`, `printf`, `read`, `whole`, `system`, …) is answered
+in C by `prelude.c` and `io.c` on the values as they are: rows and structures are
+walked in place, names are read and written through `ref_load` and `store_ref`.
+Nothing is converted and nothing crosses to Lean.
 
-Invariant B1: *a C object referenced by a Lean value during a builtin call is
-reachable from the operand stack for the duration of the call* — arguments stay
-on the stack until the builtin returns, and objects created for a result are
-created at return. The collector never runs during conversion.
+Invariant B1: *a heap object a service holds across a call back into compiled
+code is reachable from the operand stack.* The arguments of a builtin stay on the
+stack until it returns; a value the transput must keep while an event routine or
+a format hole runs — a temporary cell for reading into a united name, a format
+value an `f(…)` picture included — is pushed as a root and popped with the rest
+when the call ends. The stack depth is recorded when the builtin is entered and
+restored when it returns or is unwound by an event.
 
 ## 4. The collector
 
@@ -295,11 +300,12 @@ transcription itself and the C runtime's adherence to R2, which `stress` and
 
 ## 7. Status
 
-* M1 (C runtime) and M2 (collector) are implemented in `csrc/rt.c`; the Lean services
-  are `A68/Runtime.lean` and the codec `A68/Blob.lean`. The collector is eager
-  mark–sweep over a linked list of `malloc`ed objects; size-classed free lists and
-  lazy sweeping (§4.1) are performance work still to do, as is the generational
-  collector (M3).
+* M1 (C runtime) and M2 (collector) are implemented in `csrc/rt.c`, and the whole
+  runtime is C: a compiled program links `liba68rt.a` and the C library. The
+  collector is eager mark–sweep over a linked list of `malloc`ed objects;
+  size-classed free lists and lazy sweeping (§4.1) are performance work still to
+  do, as is the generational collector (M3).
 * M4: `A68/Verified/GC.lean` proves the four theorems of §5 on the model.
-* The operators of the primitive modes, strings and row bounds run natively; `LONG`,
-  `COMPL`, `BYTES` and rows compared as values still cross to the Lean side (§3.8).
+* Verify mode keeps every freed object poisoned for the rest of the run, so an
+  allocation-heavy program can exhaust memory under it; bounding that with a
+  quarantine of a few collections is still to do.

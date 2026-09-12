@@ -24,9 +24,10 @@ A68.Core    (optimised)
 observable behaviour (stdout bytes, files, exit status)
 ```
 
-Both back ends share `A68.Runtime`, so `print`, `printf`, the operators and the
-number formatting are one implementation reached two ways; that is what makes a
-compiled program and an interpreted one produce the same bytes.
+The evaluator is the specification: the C runtime a compiled program links
+(`csrc/`) is a function-by-function transcription of `A68.Interp`, each C routine
+named after the Lean definition it reproduces, and differential tests check the
+two produce the same bytes (docs/TESTING.md).
 
 ## Lexer (`A68/Lexer.lean`)
 
@@ -209,7 +210,7 @@ runs everything three times (a propagated literal is folded on the next round).
 [OPTIMISATION.md](OPTIMISATION.md) describes each pass, what it is allowed to
 assume, and which parts are proved.
 
-## C back end (`A68/CodeGen.lean`, `A68/Runtime.lean`, `A68/Serial.lean`)
+## C back end (`A68/CodeGen.lean`, `A68/Serial.lean`, `csrc/`)
 
 `a68lean compile` emits a self-contained C program and hands it to the system C
 compiler. The division of labour mirrors a68g's optimiser, which also compiles
@@ -237,38 +238,52 @@ program rather than a plugin loaded back into an interpreter:
   `rtDepthOf` translates the syntactic depths that `loadCell` and `refCell`
   carry into the run-time depths that remain. A `FOR` counter becomes the C
   induction variable itself, and `x +:= e` on such a variable is a C update.
-* **Everything else goes through the C runtime.** `csrc/rt.c` keeps the program's
-  values in C memory — a 16-byte tagged slot per value, objects for structures,
-  unions, frames and rows (a descriptor over a store, with copy-on-write for the
-  stores that values share) — and implements the entry points the generated code
-  calls: an environment of frames (`a68rt_enter` / `a68rt_leave`) and an operand
-  stack of slots (`a68rt_push_*`, `a68rt_dyop`, …), which is the discipline the
-  verified stack machine models. The operators of the primitive modes, strings and
-  row bounds are computed there; what is computed on copies — transput, formatting,
-  `LONG` arithmetic, the standard prelude — is asked of the Lean services
-  (`A68.Runtime`), with values crossing in the `A68.Blob` encoding and names,
-  closures and format texts crossing as C addresses the evaluator reaches back
-  through (`Value.cref`, `cclos`, `cfmt`). Rows and structures have short cuts: an
-  element of a row held directly in a cell, or a chain of field selections rooted at
-  one, is read and written by one call that carries a native value, `s +:= c`
-  appends to a string in place, and anything else falls back to the general
-  machinery.
-* **The heap is collected.** A mark–sweep collector in the same file marks from the
-  operand stack, the frame chain, the saved environments and the objects handed to
-  the Lean side, and sweeps the rest; allocation is the only safe point, taken at the
-  start of every entry point that allocates, so the generated C never holds a heap
-  pointer across a collection. The design, its invariants and the proof of the
-  collector's model are in docs/GC-DESIGN.md and `A68/Verified/GC.lean`.
+* **Everything else goes through the C runtime**, `liba68rt.a`, plain C that a
+  compiled program links together with the C library and nothing else. `csrc/rt.c`
+  keeps the program's values in C memory — a 16-byte tagged slot per value, objects
+  for structures, unions, frames and rows (a descriptor over a store, with
+  copy-on-write for the stores that values share) — and implements the entry points
+  the generated code calls: an environment of frames (`a68rt_enter` / `a68rt_leave`)
+  and an operand stack of slots (`a68rt_push_*`, `a68rt_dyop`, …), which is the
+  discipline the verified stack machine models. The operators of the primitive
+  modes, strings and row bounds are answered there; the general operators, the
+  coercions, `SKIP` values and conformity are in `ops.c`; transput — files, the
+  output buffer, formatted and unformatted reading and writing, binary transput —
+  in `io.c`; the standard prelude in `prelude.c`; the mode and format tables a
+  program carries are parsed by `tables.c`; number formatting is `fmt.c` over the
+  integers of `bigint.c`; `LONG` arithmetic is `mp.c`, `mpmath.c`, `mpfmt.c` and
+  `mprt.c`; the operating-system services are `os.c`, which the evaluator's
+  `@[extern]` wrappers (`sys.c`) share. Every one of these is a transcription of
+  the Lean definition it names. Rows and structures have short cuts: an element of
+  a row held directly in a cell, or a chain of field selections rooted at one, is
+  read and written by one call that carries a native value, `s +:= c` appends to a
+  string in place, and anything else falls back to the general machinery.
+* **The heap is collected.** A mark–sweep collector in `rt.c` marks from the
+  operand stack, the frame chain, the saved environments and the file table's
+  associated names and event routines, and sweeps the rest; allocation is the only
+  safe point, taken at the start of every entry point that allocates, so the
+  generated C never holds a heap pointer across a collection. The design, its
+  invariants and the proof of the collector's model are in docs/GC-DESIGN.md and
+  `A68/Verified/GC.lean`.
+* **Events unwind the transput.** A mended logical file end abandons the rest of
+  the transput call, and an event routine or a format hole may leave by a jump;
+  both unwind through `io.c` with `setjmp`/`longjmp`, restoring the operand and
+  environment stacks to what they were when the call began, after which the
+  generated code's own jump check takes over.
+* **`evaluate` is the one procedure a compiled program does not have**: it
+  compiles Algol 68 text while the program runs, which needs the evaluator, and
+  `a68lean compile` refuses a program that uses it.
 * **Reaching a statement is a store, not a call.** The current line lives in a C
   variable that the error reporters read when a compiled program is running.
 * **Tables are rebuilt at start-up.** Modes tag united values and drive the
   layout of `print`; format texts carry the pictures. Both are serialised by
   `A68.Serial` into a blob the C program carries as a string literal and hands
   to `a68rt_boot`.
-* **Calls back into compiled code.** A compiled procedure is a `Value.cproc`
-  holding a function index and its captured environment; the dynamic parts of a
-  format text are `Core.hole` nodes. When the runtime needs either, it calls
-  `a68_dispatch_proc` / `a68_dispatch_hole`, which the generated program
+* **Calls back into compiled code.** A compiled procedure is a closure holding a
+  function index and the frame it captured; the dynamic parts of a format text are
+  `Core.hole` nodes. When the runtime needs either — an event routine, a procedure
+  passed to a prelude routine, a replicator or the argument of a `g(w)` pattern —
+  it calls `a68_dispatch_proc` / `a68_dispatch_hole`, which the generated program
   defines. The `a68lean` binary itself links stubs for them (`csrc/stubs.c`).
 * **Direct calls.** A routine whose frame is exactly its parameters, all of
   primitive mode, whose result is primitive or `VOID`, and which contains no

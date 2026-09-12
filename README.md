@@ -133,12 +133,16 @@ fuzz/run.sh 1 200           # differential fuzzing: 200 random programs from see
   regular expressions, `evaluate`, `system`, `fork` and the `execve` family,
   directories and file enquiries, `getenv`, local and UTC time.
 * **Two back ends**: a direct evaluator, and a C back end that emits a C
-  program linked against the same runtime, so both produce identical bytes. The
-  emitted code computes primitive values in C types, keeps locals that cannot
-  escape in C variables, rows of primitive elements, structures and unions in C
-  arrays and strings in C buffers, and calls routines with primitive signatures
-  as plain C functions, falling back to the runtime wherever the analysis cannot
-  prove that safe.
+  program linked against a C runtime that transcribes the evaluator routine for
+  routine (`csrc/`), so both produce identical bytes; the binary depends on the
+  C library alone. The emitted code computes primitive values in C types, keeps
+  locals that cannot escape in C variables, rows of primitive elements,
+  structures and unions in C arrays and strings in C buffers, and calls routines
+  with primitive signatures as plain C functions, falling back to the runtime
+  wherever the analysis cannot prove that safe. The runtime collects its heap
+  with a precise mark–sweep collector whose model is proved in Lean
+  ([docs/GC-DESIGN.md](docs/GC-DESIGN.md)). `evaluate`, which compiles Algol 68
+  text at run time, is available under `a68lean run` only.
 * **Optimiser**: constant folding by evaluation, coercion simplification,
   constant control flow and frameless-block flattening, mirroring a68g's
   optimiser passes; the same rewrites are proved correct over the formal core.
@@ -160,12 +164,18 @@ A68/Elab.lean        elaborator: mode checking, coercions, operator identificati
 A68/Interp.lean      evaluator, standard prelude, formatted transput, files
 A68/Opt.lean         optimisation passes over the core representation
 A68/CodeGen.lean     C back end
-A68/Runtime.lean     C-callable runtime shared by both back ends
 A68/Serial.lean      mode and format tables carried by compiled programs
 A68/Pretty.lean      readable rendering of the core representation (dump)
 A68/Verified/        machine-checked theorems
-csrc/stubs.c         default dispatch hooks for the interpreter binary
-csrc/sys.c           operating-system procedures and COMPL arithmetic, as a68g calls C
+csrc/rt.c            C runtime of compiled programs: values, frames, operand stack, collector
+csrc/io.c            transput: files, formatted and unformatted reading and writing
+csrc/prelude.c       the standard prelude
+csrc/ops.c           operators, coercions, SKIP values, conformity
+csrc/tables.c        the mode and format tables of a compiled program
+csrc/fmt.c bigint.c  byte-exact number formatting, arbitrary-precision integers
+csrc/mp*.c           a68g's multi-precision arithmetic and its formatting
+csrc/os.c            operating-system services (processes, files, time, regex)
+csrc/sys.c stubs.c   the evaluator's @[extern] wrappers and dispatch stubs
 Main.lean            command line driver
 tests/               regression suite and differential-test scripts
 fuzz/                grammar-based program generator and fuzz driver

@@ -66,10 +66,14 @@ interpreter of the core representation, and those programs run for minutes in it
 
 ## 3a. The C back end
 
-Both back ends share `A68.Runtime`, so a difference between them can only come from
-the compiled structure — frames, control flow, jumps, promoted variables — which is
-what running the corpus compiled exercises. It found defects only compiled programs
-had, each now fixed and covered by a case: a subscript through a `REF STRING`
+A compiled program runs on a C runtime that transcribes the evaluator (`csrc/`), so
+running the corpus compiled checks both the compiled structure — frames, control
+flow, jumps, promoted variables — and the transcription. Two parts of the runtime
+have differential tests of their own against the Lean they transcribe: the number
+formatting (`tests/fmt/difftest-c.sh`, 171,112 cases with no difference) and the
+multi-precision arithmetic (`csrc/mp_test.sh`, 37,700 operations at several
+precisions with no difference). The corpus found defects only compiled programs had,
+each now fixed and covered by a case: a subscript through a `REF STRING`
 parameter sliced the cell holding the name instead of the row; values of declared
 modes could not be printed; a `GO TO` from a routine to a label outside it hung; an
 event routine leaving with a `GO TO` was taken to have returned; a routine leaving by a
@@ -88,7 +92,9 @@ the fuzzer too. Two cases exercise the collector directly: `gc-churn` allocates
 tens of megabytes of short-lived lists, rows and strings while keeping a small live
 set, and `gc-roots` uses values that are reachable only through roots the collector
 must know — a routine's frame, a file's associated string and event routine, a name
-of a sub-row, a united row, a procedure parameter — after heavy allocation.
+of a sub-row, a united row, a procedure parameter — after heavy allocation. A case
+that uses `evaluate` is marked `evaluator only` on its first line and skipped by
+`run-cases-compiled.sh`, since compiled programs do not have it.
 `A68LEAN_GC=stats` reports the collections, the bytes freed, the peak live size and
 the time spent.
 
