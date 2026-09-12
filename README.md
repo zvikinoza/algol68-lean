@@ -1,10 +1,14 @@
 # a68lean — an Algol 68 compiler written in Lean 4
 
-`a68lean` is an implementation of Algol 68 written from scratch in Lean 4. It
-compiles Algol 68 source into an explicitly typed, coercion-resolved core
-representation and executes it, reproducing the observable behaviour of
+`a68lean` is an Algol 68 compiler written from scratch in Lean 4. It compiles
+Algol 68 source into an explicitly typed, coercion-resolved core representation,
+lowers it to a typed intermediate representation with a semantics in Lean and
+optimisation passes proved to preserve it, and emits LLVM IR, which clang turns into
+a native binary. The binary reproduces the observable behaviour of
 [Algol 68 Genie](https://jmvdveer.home.xs4all.nl/en/algol.html) (a68g), the
-reference implementation, **byte for byte** on its standard output.
+reference implementation, **byte for byte** on its standard output. An evaluator in
+Lean (`a68lean run`) executes the same core representation directly and is the
+specification the compiled program is tested against.
 
 Lean was chosen so that the implementation is verifiable: every function is
 total unless marked `partial`, the type checker rules out whole classes of
@@ -31,17 +35,44 @@ fetched with `http content`, semaphores between parallel units), and three use
 `a68lean run` only. The evaluator additionally runs out of time on 12 programs that
 pass compiled. See [docs/TESTING.md](docs/TESTING.md).
 
+## What a compiled program is
+
+`a68lean compile prog.a68` runs the Lean front end (parse, elaborate, optimise the
+core), lowers the core to MIR — a typed register-machine IR with a semantics in Lean
+and optimisation passes each proved to preserve it ([docs/LLVM-DESIGN.md](docs/LLVM-DESIGN.md)) —
+prints the MIR as LLVM IR (`prog.ll`, kept with `-c`), and invokes clang:
+
+```
+clang -O2 prog.ll liba68rt.a -lm -o prog
+```
+
+`liba68rt.a` is the **runtime**, a C library built from `csrc/`. It is not an
+interpreter; it is the set of functions the emitted code calls for what is not plain
+arithmetic and control flow: the tagged value representation and the heap objects
+(rows, structures, unions, closures, frames) with their mark–sweep collector, transput
+and formats, the standard prelude, operators on non-primitive modes, multi-precision
+`LONG` arithmetic, and a68g's exact error messages and exit statuses. It is a
+transcription of the Lean evaluator, routine for routine. The binary links it and the C
+library only.
+
+The emitted code calls the runtime as little as possible. Values of primitive mode are
+computed in registers; locals that cannot escape are registers; routines with primitive
+signatures are plain LLVM functions called directly; rows, structures, unions, strings
+and names are read and written by emitted loads and stores that know the runtime's
+object layout, and a loop keeps a row's descriptor and bounds in registers for its
+duration. Each such fast path is guarded by a tag check that falls back to the runtime
+call whenever a value is not as expected, so the runtime's checks and messages are those
+of the evaluator. In a hot loop such as the sieve's the runtime is not called at all
+(see [examples/sieve.mir](examples/sieve.mir)).
+
+The runtime, the LLVM printer and LLVM itself are trusted, not proved; they are checked
+by the differential tests instead ([docs/TESTING.md](docs/TESTING.md)).
+
 ## Speed of the compiled program
 
-`a68lean compile` produces a native binary through LLVM (`docs/LLVM-DESIGN.md`): the
-elaborated core is lowered to MIR, a typed register-machine IR with a semantics in Lean
-and optimisation passes each proved to preserve it, printed as LLVM IR and compiled by
-clang against the C runtime. Values of primitive mode are native, locals that cannot
-escape are registers, routines with primitive signatures are plain functions called
-directly, and rows, structures, unions, strings and names are reached inline through
-the runtime's own object layout, with the runtime as the fallback whenever a value is
-not as expected. Every benchmark in `benchmarks/` ships with a C twin computing the same
-answer, which is the ceiling the emitted code is measured against.
+Every benchmark in `benchmarks/` ships with a C twin computing the same answer, which
+is the ceiling the emitted code is measured against; both sides are native code
+compiled by the same clang.
 
 | benchmark | LLVM back end vs hand-written C |
 |---|---:|
@@ -141,17 +172,15 @@ fuzz/run.sh 1 200           # differential fuzzing: 200 random programs from see
   (`random`, `first random`), environment enquiries, and a68g's extensions:
   regular expressions, `evaluate`, `system`, `fork` and the `execve` family,
   directories and file enquiries, `getenv`, local and UTC time.
-* **Two back ends**: a direct evaluator, and a C back end that emits a C
-  program linked against a C runtime that transcribes the evaluator routine for
-  routine (`csrc/`), so both produce identical bytes; the binary depends on the
-  C library alone. The emitted code computes primitive values in C types, keeps
-  locals that cannot escape in C variables, rows of primitive elements,
-  structures and unions in C arrays and strings in C buffers, and calls routines
-  with primitive signatures as plain C functions, falling back to the runtime
-  wherever the analysis cannot prove that safe. The runtime collects its heap
-  with a precise mark–sweep collector whose model is proved in Lean
-  ([docs/GC-DESIGN.md](docs/GC-DESIGN.md)). `evaluate`, which compiles Algol 68
-  text at run time, is available under `a68lean run` only.
+* **The compiler and two other implementations**: the LLVM back end described
+  above; a C back end (`--c`), the proof of concept it grew out of, which emits a C
+  program against the same runtime and stays as a second implementation the test
+  suites compare against; and the evaluator (`a68lean run`), which executes the core
+  representation directly in Lean and is the specification. All three produce
+  identical bytes. The runtime collects its heap with a precise mark–sweep collector
+  whose model is proved in Lean ([docs/GC-DESIGN.md](docs/GC-DESIGN.md)).
+  `evaluate`, which compiles Algol 68 text at run time, is available under
+  `a68lean run` only.
 * **Optimiser**: constant folding by evaluation, coercion simplification,
   constant control flow and frameless-block flattening, mirroring a68g's
   optimiser passes; the same rewrites are proved correct over the formal core.
@@ -172,11 +201,15 @@ A68/MPFmt.lean       formatting of LONG and LONG LONG values
 A68/Elab.lean        elaborator: mode checking, coercions, operator identification
 A68/Interp.lean      evaluator, standard prelude, formatted transput, files
 A68/Opt.lean         optimisation passes over the core representation
-A68/CodeGen.lean     C back end
+A68/MIR.lean         MIR: the typed register-machine IR the compiler optimises
+A68/MIR/Sem.lean     its semantics; A68/MIR/Opt.lean: its passes (proved in A68/Verified/MIR.lean)
+A68/Lower.lean       lowering of the core representation to MIR
+A68/LLVM.lean        the LLVM IR printer
+A68/CodeGen.lean     the C back end (--c)
 A68/Serial.lean      mode and format tables carried by compiled programs
 A68/Pretty.lean      readable rendering of the core representation (dump)
 A68/Verified/        machine-checked theorems
-csrc/rt.c            C runtime of compiled programs: values, frames, operand stack, collector
+csrc/rt.c            the runtime (liba68rt.a): values, heap objects, frames, collector
 csrc/io.c            transput: files, formatted and unformatted reading and writing
 csrc/prelude.c       the standard prelude
 csrc/ops.c           operators, coercions, SKIP values, conformity
@@ -194,6 +227,7 @@ docs/                architecture, compatibility notes, testing, verification
 ## Documentation
 
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the compilation pipeline and runtime model
+* [docs/LLVM-DESIGN.md](docs/LLVM-DESIGN.md) — MIR, the verified passes, the LLVM back end and its status
 * [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — how a68g's behaviour was reproduced, and known differences
 * [docs/TESTING.md](docs/TESTING.md) — corpora, methodology, results, fuzzing
 * [docs/VERIFICATION.md](docs/VERIFICATION.md) — what is proved and what is not
