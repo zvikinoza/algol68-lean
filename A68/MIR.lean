@@ -195,6 +195,7 @@ def natSigs : List (String × RtSig) :=
   [ ("a68n_pow_i", ⟨#[.i64, .i64], .i64⟩), ("a68n_pow_ri", ⟨#[.f64, .i64], .f64⟩), ("a68n_pow_rr", ⟨#[.f64, .f64], .f64⟩),
     ("a68n_entier", ⟨#[.f64], .i64⟩), ("a68n_round", ⟨#[.f64], .i64⟩), ("a68n_echo", ⟨#[u32], .none⟩),
     ("jump_flag", ⟨#[], .u32⟩),   -- the runtime's pending-jump flag, read inline
+    ("a68n_alloc", ⟨#[.i64], .ptr⟩), ("a68n_free", ⟨#[.ptr], .none⟩),
     -- memory access, printed inline: a load or store of the given width at a byte offset from
     -- a pointer; the narrow loads zero-extend to i64, the narrow stores truncate
     -- a pointer; the last argument is a constant naming what is accessed (the printer's

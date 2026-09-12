@@ -38,6 +38,44 @@ structure PVar where
   flag : Option Var := none
   deriving Inhabited
 
+/-- A primitive element mode in a leaf store: its tag, its size in bytes, the memory width
+    it is read and written with, and the kind of `a68rt_undef_error`. -/
+structure ElemInfo where
+  ek   : Int
+  es   : Nat
+  w    : String
+  kind : Nat
+  deriving Inhabited
+
+def elemInfo : Mode → Option ElemInfo
+  | .int 0 => some ⟨1, 8, "i64", 0⟩
+  | .real 0 => some ⟨2, 8, "f64", 1⟩
+  | .bool => some ⟨3, 1, "i8", 2⟩
+  | .char => some ⟨4, 1, "i8", 3⟩
+  | .bits 0 => some ⟨5, 8, "i64", 4⟩
+  | _ => none
+
+def T_REF : Int := 8
+def T_STRUCT : Int := 10
+def T_UNION : Int := 11
+def K_SLOTS : Int := 1
+def VIEW_OFF : Int := 4294967295
+
+/-- A row variable promoted to native arrays: it never escapes (the C back end's escape
+    analysis, `CodeGen.planFrame`), so it has no descriptor, no store and no collector
+    object — its bounds are variables, and each element field (one for a row of a
+    primitive mode, one per field for a row of structures) is an array allocated at the
+    declaration and freed with the block, with a defined byte per element beside it. -/
+structure PRow where
+  dims   : Nat
+  lo     : Array Var                 -- per dimension
+  hi     : Array Var
+  ext1   : Var                       -- the extent of the second dimension (1 for one)
+  fields : Array (ElemInfo × Ty × Mode)
+  data   : Array Var                 -- per field: the elements
+  flags  : Array Var                 -- per field: the defined bytes
+  deriving Inhabited
+
 /-- A frame as the lowering sees it: the modes of its slots, which slots are variables,
     and whether a run-time frame is pushed for it at all (a frame all of whose slots are
     variables needs none, and the depths of cell accesses skip it). -/
@@ -57,6 +95,8 @@ structure FrameInfo where
   /-- per slot: the literal bounds a non-flexible row variable was declared with, which it
       keeps for life (an assignment of other bounds is an error) -/
   bounds : Array (Option (List (Int × Int))) := #[]
+  /-- per slot: the native arrays a row variable was promoted to -/
+  rows   : Array (Option PRow) := #[]
   deriving Inhabited
 
 /-- What a loop keeps in variables about a row a cell holds, so that the elements are
@@ -315,29 +355,6 @@ def T_ROW : Int := 9
 def K_LEAF : Int := 2
 def K_ROWD : Int := 3
 
-/-- A primitive element mode in a leaf store: its tag, its size in bytes, the memory width
-    it is read and written with, and the kind of `a68rt_undef_error`. -/
-structure ElemInfo where
-  ek   : Int
-  es   : Nat
-  w    : String
-  kind : Nat
-  deriving Inhabited
-
-def elemInfo : Mode → Option ElemInfo
-  | .int 0 => some ⟨1, 8, "i64", 0⟩
-  | .real 0 => some ⟨2, 8, "f64", 1⟩
-  | .bool => some ⟨3, 1, "i8", 2⟩
-  | .char => some ⟨4, 1, "i8", 3⟩
-  | .bits 0 => some ⟨5, 8, "i64", 4⟩
-  | _ => none
-
-def T_REF : Int := 8
-def T_STRUCT : Int := 10
-def T_UNION : Int := 11
-def K_SLOTS : Int := 1
-def VIEW_OFF : Int := 4294967295
-
 /-- The descriptor of the row cell `(b, off)` holds: a row value, or a name of a sub-row
     (a view, `REF [] INT v = a[2:5]`); anything else takes `slow` (`rt.c: cell_rowd`). -/
 def cellRowd (b : Var) (off : Int) (slow : Nat) : L Var := do
@@ -423,6 +440,61 @@ def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : Ele
     structure object (`rt.c: sel_read`); `slow` when a tag is not as expected. -/
 def T_NIL : Int := 7
 def K_FRAME : Int := 4
+
+def prowOf (d s : Nat) : L (Option PRow) := do
+  match (← get).fb.frames[d]? with
+  | some f => return (f.rows[s]?).join
+  | none => return none
+
+/-- The element offset of `a[i]` or `a[i, j]` in a promoted row, with the evaluator's
+    subscript checks (`CodeGen: a68_ao`). -/
+def prowIndex (pr : PRow) (is : Array Opnd) : L Var := do
+  let mut idx : Option Var := none
+  for k in [0:pr.dims] do
+    let i := is[k]!
+    let l := pr.lo[k]!; let u := pr.hi[k]!
+    let ge ← binv .i1 .ge i (.v l)
+    let le ← binv .i1 .le i (.v u)
+    let inb ← binv .i1 .andB (.v ge) (.v le)
+    let errB ← newBlock
+    guard (.v inb) errB
+    let cur := (← get).fb.cur
+    switchTo errB
+    rt "a68rt_index_error" #[i, .v l, .v u]
+    terminate .unreachable
+    switchTo cur
+    let t ← binv .i64 .subW i (.v l)
+    idx ← match idx with
+      | none => pure (some t)
+      | some prev =>
+        let m ← binv .i64 .mulW (.v prev) (.v pr.ext1)
+        pure (some (← binv .i64 .addW (.v m) (.v t)))
+  return idx.get!
+
+/-- Field `f` of the element at offset `idx`, as its MIR type; undefined is reported. -/
+def prowGet (pr : PRow) (f : Nat) (idx : Var) : L Var := do
+  let (info, ty, _) := pr.fields[f]!
+  let flag ← ld "i8" .i64 pr.flags[f]! (.v idx) KLEAF
+  let undefB ← newBlock
+  guard (.v (← binv .i1 .ne (.v flag) (ki 0))) undefB
+  let cur := (← get).fb.cur
+  switchTo undefB
+  rt "a68rt_undef_error" #[ku info.kind]
+  terminate .unreachable
+  switchTo cur
+  let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
+  let raw ← ld info.w (if info.w == "f64" then .f64 else .i64) pr.data[f]! (.v eoff) KLEAF
+  match ty with
+  | .i1 => binv .i1 .ne (.v raw) (ki 0)
+  | .i32 => do let v ← newVar .i32; emit (.set v (.opnd (.v raw))); return v
+  | _ => return raw
+
+/-- Write field `f` of the element at offset `idx` and mark it defined. -/
+def prowSet (pr : PRow) (f : Nat) (idx : Var) (v : Opnd) : L Unit := do
+  let (info, _, _) := pr.fields[f]!
+  st "i8" pr.flags[f]! (.v idx) (ki 1) KLEAF
+  let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
+  st info.w pr.data[f]! (.v eoff) v KLEAF
 
 /-- The cache in scope for the row cell `(fid, slot)` with store kind `ek`. -/
 def lookupCache (fid slot : Nat) (ek : Int) : L (Option RowCache) := do
@@ -753,6 +825,12 @@ def appendElem (d s : Nat) (em : Mode) (v : Opnd) (fn : String) : L Unit := do
     would copy it first), else the runtime entry point `fn`. -/
 def rowWrite (d s dims : Nat) (is : Array Opnd) (mr : Mode) (v : Opnd) (fn : String) : L Unit := do
   let j := is[1]?.getD (ki 0)
+  match ← prowOf d s with
+  | some pr =>
+    let ix ← prowIndex pr is
+    prowSet pr 0 ix v
+    return
+  | none => pure ()
   match ← cellAddr d s, elemInfo mr with
   | some (b, off), some info =>
     let fid ← cellFid d
@@ -1062,9 +1140,10 @@ def jumpCheck : L Unit := do
   switchTo cont
 
 def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true)
-    (cells : Option Var := none) (bounds : Array (Option (List (Int × Int))) := #[]) : L Unit :=
+    (cells : Option Var := none) (bounds : Array (Option (List (Int × Int))) := #[])
+    (rows : Array (Option PRow) := #[]) : L Unit :=
   modify fun s =>
-    let f : FrameInfo := { modes := modes, vars := vars, pushed := pushed, cells := cells, fid := s.nextFid, bounds := bounds }
+    let f : FrameInfo := { modes := modes, vars := vars, pushed := pushed, cells := cells, fid := s.nextFid, bounds := bounds, rows := rows }
     { s with nextFid := s.nextFid + 1, fb := { s.fb with frames := f :: s.fb.frames } }
 
 /-- The routines the innermost frame's slots are known to hold. -/
@@ -1357,6 +1436,18 @@ partial def cellBase (base : Core) : L (Option (Nat × Nat × Bool)) := do
     that checks the bounds and reads the element (`a68rt_row_int` and its relatives). -/
 partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
   let some (d, s, viaName) ← cellBase base | return none
+  -- a promoted row: the element from its arrays
+  match ← prowOf d s with
+  | some pr =>
+    if idx.length != pr.dims || pr.fields.size != 1 then return none
+    let mut is : Array Opnd := #[]
+    for ix in idx do
+      match ix with
+      | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+      | _ => return none
+    let ix ← prowIndex pr is
+    return some (.sc (.v (← prowGet pr 0 ix)))
+  | none => pure ()
   let some m ← slotMode d s | return none
   let mr ← resolve m
   -- a cell holding a name of a row (`REF [] INT` parameter) is not a row the runtime's
@@ -1435,6 +1526,26 @@ partial def fieldsWord (fields : List Nat) : Nat := Id.run do
 
 /-- `f OF … OF x` of a primitive mode, read by one runtime call. -/
 partial def selRead (c : Core) : L (Option Res) := do
+  -- `f OF a[i]` on a promoted row of structures
+  match CodeGen.strip c with
+  | .select f (.slice base idx true) true =>
+    match ← cellBase base with
+    | some (d, s, false) =>
+      match ← prowOf d s with
+      | some pr =>
+        if idx.length == pr.dims && f < pr.fields.size then
+          let mut is : Array Opnd := #[]
+          let mut ok := true
+          for ix in idx do
+            match ix with
+            | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+            | _ => ok := false
+          if ok then
+            let ixv ← prowIndex pr is
+            return some (.sc (.v (← prowGet pr f ixv)))
+      | none => pure ()
+    | _ => pure ()
+  | _ => pure ()
   let some m ← modeOfRef c | return none
   let mr ← resolve m
   let some ty := tyOf mr | return none
@@ -1485,6 +1596,66 @@ partial def lowerSlice (arr : Core) (idx : List CoreIdx) (viaRef : Bool) : L Res
 /-- `a[i] := <scalar>` and `f OF … OF x := <scalar>` written in place by one runtime call.
     Returns whether it applied. -/
 partial def storeTyped (dst src : Core) : L Bool := do
+  -- a promoted row: `a[i] := v`, `a[i] := (f₁, …)` on a row of structures, `f OF a[i] := v`
+  match CodeGen.strip dst with
+  | .slice base idx true =>
+    match ← cellBase base with
+    | some (d, s, false) =>
+      match ← prowOf d s with
+      | some pr =>
+        if idx.length != pr.dims then return false
+        let mut is : Array Opnd := #[]
+        for ix in idx do
+          match ix with
+          | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+          | _ => return false
+        if pr.fields.size == 1 then
+          let (_, _, em) := pr.fields[0]!
+          let v ← toScalar (← lower src) em
+          let ix ← prowIndex pr is
+          prowSet pr 0 ix v
+          return true
+        else
+          match CodeGen.strip src with
+          | .collateral es _ _ =>
+            if es.length != pr.fields.size then return false
+            -- the fields in order, then the stores (`CodeGen`: a structure display into an element)
+            let mut vs : Array (Option Opnd) := #[]
+            let mut k := 0
+            for e in es do
+              let (_, _, em) := pr.fields[k]!
+              match CodeGen.strip e with
+              | .lit .undef => vs := vs.push none
+              | _ => vs := vs.push (some (← toScalar (← lower e) em))
+              k := k + 1
+            let ix ← prowIndex pr is
+            for f in [0:pr.fields.size] do
+              match vs[f]! with
+              | some v => prowSet pr f ix v
+              | none => st "i8" pr.flags[f]! (.v ix) (ki 0) KLEAF
+            return true
+          | _ => return false
+      | none => pure ()
+    | _ => pure ()
+  | .select f (.slice base idx true) true =>
+    match ← cellBase base with
+    | some (d, s, false) =>
+      match ← prowOf d s with
+      | some pr =>
+        if idx.length != pr.dims || f ≥ pr.fields.size then return false
+        let mut is : Array Opnd := #[]
+        for ix in idx do
+          match ix with
+          | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+          | _ => return false
+        let (_, _, em) := pr.fields[f]!
+        let v ← toScalar (← lower src) em
+        let ix ← prowIndex pr is
+        prowSet pr f ix v
+        return true
+      | none => pure ()
+    | _ => pure ()
+  | _ => pure ()
   let some m ← modeOfRef dst | return false
   let mr ← resolve m
   let some ty := tyOf mr | return false
@@ -1589,9 +1760,46 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := d
       emit (.set v (.bin bop (.v cur) rs))
       rt (setCellFn tmr) #[ku (← rtd dd), ku ss, .v v]
       return true
-  | .slice base idx true =>
-    -- `a[i] +:= e` on a row a cell holds
+  | .select f (.slice base idx true) true =>
+    -- `f OF a[i] +:= e` on a promoted row of structures
     let some (d, s, false) ← cellBase base | return false
+    let some pr ← prowOf d s | return false
+    if idx.length != pr.dims || f ≥ pr.fields.size then return false
+    let (_, _, em) := pr.fields[f]!
+    if (← resolve em) != tmr then return false
+    let mut is : Array Opnd := #[]
+    for ix in idx do
+      match ix with
+      | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+      | _ => return false
+    let rs ← toScalar (← lower r) m2
+    let ixv ← prowIndex pr is
+    let cur ← prowGet pr f ixv
+    let v ← newVar cur.ty
+    emit (.set v (.bin bop (.v cur) rs))
+    prowSet pr f ixv (.v v)
+    return true
+  | .slice base idx true =>
+    -- `a[i] +:= e` on a row a cell holds, or on a promoted row
+    let some (d, s, false) ← cellBase base | return false
+    match ← prowOf d s with
+    | some pr =>
+      if idx.length != pr.dims || pr.fields.size != 1 then return false
+      let (_, _, em) := pr.fields[0]!
+      if (← resolve em) != tmr then return false
+      let mut is : Array Opnd := #[]
+      for ix in idx do
+        match ix with
+        | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+        | _ => return false
+      let rs ← toScalar (← lower r) m2
+      let ixv ← prowIndex pr is
+      let cur ← prowGet pr 0 ixv
+      let v ← newVar cur.ty
+      emit (.set v (.bin bop (.v cur) rs))
+      prowSet pr 0 ixv (.v v)
+      return true
+    | none => pure ()
     let some bm ← slotMode d s | return false
     let .row dims _ em ← resolve bm | return false
     if (← resolve em) != tmr || idx.length != dims || dims > 2 then return false
@@ -1836,6 +2044,11 @@ partial def natCall (f : Core) (args : List Core) : L (Option (Option Opnd)) := 
     the cell holds a row value, else `slowAct`, which leaves the result on the stack. -/
 partial def rowBound (isUpb : Bool) (k : Nat) (e : Core) (slowAct : L Unit) : L (Option Res) := do
   let some (d, s, _) ← cellBase e | return none
+  match ← prowOf d s with
+  | some pr =>
+    if k < 1 || k > pr.dims then return none
+    return some (.sc (.v (if isUpb then pr.hi[k - 1]! else pr.lo[k - 1]!)))
+  | none => pure ()
   let some m ← slotMode d s | return none
   let .row dims _ _ ← resolve m | return none
   if k < 1 || k > dims then return none
@@ -2321,7 +2534,33 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       | none => pure ()
       pvars := pvars.push (some { v := v, m := m, flag := flag })
     | _, _ => pvars := pvars.push none
-  let pushed := plan.pushed || (List.range size).any fun i => (pvars[i]?.join).isNone
+  -- rows that never escape become native arrays (the C back end's analysis decides)
+  let mut prows : Array (Option PRow) := #[]
+  for i in [0:size] do
+    match (plan.rows[i]?).join with
+    | some rv =>
+      if !rv.umodes.isEmpty || rv.dims < 1 || rv.dims > 2 then prows := prows.push none else
+      let ctys : Array CodeGen.CTy := if rv.fields.isEmpty then #[rv.ty] else rv.fields
+      let mut fields : Array (ElemInfo × Ty × Mode) := #[]
+      let mut okF := true
+      for t in ctys do
+        let m := t.toMode
+        match elemInfo m, tyOf m with
+        | some info, some ty => fields := fields.push (info, ty, m)
+        | _, _ => okF := false
+      if !okF then prows := prows.push none else
+      let mut lo : Array Var := #[]; let mut hi : Array Var := #[]
+      for _ in [0:rv.dims] do
+        lo := lo.push (← newVar .i64); hi := hi.push (← newVar .i64)
+      let ext1 ← newVar .i64
+      let mut data : Array Var := #[]; let mut flags : Array Var := #[]
+      for _ in [0:fields.size] do
+        let dv ← newVar .ptr; let fv ← newVar .ptr
+        emit (.set dv (.opnd (.k .ptr (.i 0)))); emit (.set fv (.opnd (.k .ptr (.i 0))))
+        data := data.push dv; flags := flags.push fv
+      prows := prows.push (some { dims := rv.dims, lo := lo, hi := hi, ext1 := ext1, fields := fields, data := data, flags := flags })
+    | none => prows := prows.push none
+  let pushed := plan.pushed || (List.range size).any fun i => (pvars[i]?.join).isNone && (prows[i]?.join).isNone
   -- the routines with plain entry points this block declares; a routine sees those of its
   -- own run of consecutive routine declarations and of the runs before it, since no unit
   -- can run between the declarations of a run
@@ -2389,7 +2628,7 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
           | none => pure ()
         | _, _ => pure ()
     | _ => pure ()
-  pushFrame modes pvars pushed cells bounds
+  pushFrame modes pvars pushed cells bounds prows
   -- the scalar mode every unit that may yield the block's value has, when they agree: the
   -- value then goes into a variable, so that it survives the frame and needs no stack
   let varTy : Option (Ty × Mode) ← if wantValue then do
@@ -2441,12 +2680,48 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
         | _ => pure ()
       | _, _ => pure ()
       let boxedIdx := (← get).fns.size
-      match (pvars[slot]?).join with
-      | some _ =>
+      match (pvars[slot]?).join, (prows[slot]?).join with
+      | _, some pr =>
+        -- the bounds, in order, then the arrays (zeroed: every element undefined)
+        match CodeGen.strip init with
+        | .newRow bs _ _ =>
+          let mut k := 0
+          for (l, u) in bs do
+            if k < pr.dims then
+              let lv ← toScalar (← lower l) (.int 0)
+              let uv ← toScalar (← lower u) (.int 0)
+              emit (.set pr.lo[k]! (.opnd lv)); emit (.set pr.hi[k]! (.opnd uv))
+            k := k + 1
+          -- extents, clamped at 0
+          let mut n : Opnd := ki 1
+          for kd in [0:pr.dims] do
+            let e ← binv .i64 .subW (.v pr.hi[kd]!) (.v pr.lo[kd]!)
+            let e1 ← binv .i64 .addW (.v e) (ki 1)
+            let ext ← newVar .i64
+            emit (.set ext (.opnd (.v e1)))
+            let neg ← binv .i1 .lt (.v e1) (ki 0)
+            let zB ← newBlock; let cont ← newBlock
+            terminate (.condBr (.v neg) zB cont)
+            switchTo zB
+            emit (.set ext (.opnd (ki 0)))
+            terminate (.br cont)
+            switchTo cont
+            if kd == 1 then emit (.set pr.ext1 (.opnd (.v ext)))
+            n := .v (← binv .i64 .mulW n (.v ext))
+          if pr.dims == 1 then emit (.set pr.ext1 (.opnd (ki 1)))
+          for f in [0:pr.fields.size] do
+            let (info, _, _) := pr.fields[f]!
+            let bytes ← binv .i64 .mulW n (ki info.es)
+            let dp ← natv "a68n_alloc" .ptr #[.v bytes]
+            emit (.set pr.data[f]! (.opnd (.v dp)))
+            let fp ← natv "a68n_alloc" .ptr #[n]
+            emit (.set pr.flags[f]! (.opnd (.v fp)))
+        | _ => pure ()
+      | some _, none =>
         match CodeGen.strip init with
         | .lit .undef => pure ()      -- stays undefined; reads test the flag
         | _ => let _ ← storeScalar 0 slot init; pure ()
-      | none =>
+      | none, none =>
         match modes[slot]?.join with
         | some m =>
           if ← storeScalar 0 slot init then pure ()
@@ -2491,6 +2766,14 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
   terminate (.br endB)
   switchTo endB
   popFrame
+  -- the storage of promoted rows goes with the block; a jump out of the block leaves it
+  for pr? in prows do
+    match pr? with
+    | some pr =>
+      for f in [0:pr.fields.size] do
+        emit (.call (.nat "a68n_free") #[.v pr.data[f]!])
+        emit (.call (.nat "a68n_free") #[.v pr.flags[f]!])
+    | none => pure ()
   if pushed then rt "a68rt_leave"
   return (if wantValue then result else .stack)
 

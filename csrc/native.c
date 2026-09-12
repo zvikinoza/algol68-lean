@@ -4,6 +4,7 @@
    failure through a68rt_arith_error like the C back end's inline helpers. */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include "io.h"
 
@@ -88,3 +89,11 @@ PLAIN(sin, sin) PLAIN(sinh, sinh) DOMP(sqrt, sqrt) PLAIN(tan, tan) PLAIN(tanh, t
 
 /* `PR echo` texts are printed when the program is read, before anything it prints */
 void a68n_echo(const char* s) { fputs(s, stdout); fflush(stdout); }
+
+/* the storage of a row the compiler keeps as a native array: zeroed, freed with the block */
+void* a68n_alloc(int64_t bytes) {
+  void* p = calloc((size_t) (bytes > 0 ? bytes : 1), 1);
+  if (!p) { fprintf(stderr, "a68lean: out of memory\n"); exit(1); }
+  return p;
+}
+void a68n_free(void* p) { free(p); }
