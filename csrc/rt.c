@@ -33,6 +33,7 @@
 #include "a68rt.h"
 #include "tables.h"
 #include "io.h"
+#include "stackmap.h"
 
 static a68_obj* all_objects = NULL;
 static uint64_t bytes_allocated = 0;      /* since the last collection */
@@ -706,7 +707,9 @@ static void trim_error(int64_t lo, int64_t hi, int64_t l, int64_t u) {
    Mark–sweep, non-moving (docs/GC-DESIGN.md §4).  Marking is a worklist over objects: a
    SLOTS or FRAME object contributes each slot whose tag says pointer (and a frame its
    parent), a ROWD its base, a LEAF nothing.  The roots are the operand stack, the frame
-   chain, the saved environments and the pins.  Sweeping frees every unmarked object, after
+   chain, the saved environments, the pins, and — in a program of the LLVM back end — the
+   heap pointers its native frames hold at their statepoints, found through the LLVM stack
+   maps (stackmap.c).  Sweeping frees every unmarked object, after
    dropping its share of a store that stays alive.  The C functions here transcribe
    `A68.Verified.GC`: `gc_mark` is `markAll`, `gc_sweep` is `sweep`. */
 
@@ -728,12 +731,16 @@ static inline void gc_push_val(const a68_val* v) {
   if (tag_is_ptr(v->tag)) gc_push_obj(v->v.p);
 }
 
+/* a root the LLVM stack maps report: always an object base (docs/GC-DESIGN.md §3.4) */
+static void gc_mark_root(void* obj) { gc_push_obj((a68_obj*) obj); }
+
 static void gc_mark(void) {
   nwork = 0;
   for (size_t i = 0; i < sp; i++) gc_push_val(&stack[i]);
   gc_push_obj((a68_obj*) env);
   for (size_t i = 0; i < nsaved; i++) gc_push_obj((a68_obj*) saved[i]);
   io_gc_roots(gc_push_val);
+  stackmap_roots(gc_mark_root);   /* returns at once when the binary has no stack maps */
   while (nwork) {
     a68_obj* o = worklist[--nwork];
     switch (o->kind) {
@@ -879,6 +886,7 @@ void  env_restore(void) {
 
 void a68rt_boot(const char* blob, uint32_t ll, uint8_t regression, int argc, char** argv, const char* src) {
   gc_init();
+  stackmap_init();   /* a no-op for the C back end, whose binaries carry no stack maps */
   tables_parse(blob, &strtab, &strlen_tab, &nstr);
   io_init(argc, argv, src, regression != 0, (int) ll);
   a68_jump_flag = 0;

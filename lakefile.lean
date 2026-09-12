@@ -10,7 +10,7 @@ package algol68 where
     operating-system services.  A compiled program links this archive and the C library
     only; the `a68lean` executable links it too, for the services the evaluator shares. -/
 def rtSources : Array String :=
-  #["rt", "tables", "io", "prelude", "ops", "os", "fmt", "bigint", "mp", "mpmath", "mpfmt", "mprt", "native"]
+  #["rt", "tables", "io", "prelude", "ops", "os", "fmt", "bigint", "mp", "mpmath", "mpfmt", "mprt", "native", "stackmap"]
 
 extern_lib liba68rt pkg := do
   let name := nameToStaticLib "a68rt"
