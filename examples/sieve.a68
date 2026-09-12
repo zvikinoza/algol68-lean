@@ -1,0 +1,26 @@
+# The sieve of Eratosthenes over a row of BOOL, then the primes as a table.        #
+# The inner loops read and write row elements; compiled, they run on the row's     #
+# own storage with the bounds known from the declaration (see sieve.mir).         #
+BEGIN
+  INT n = 100;
+  [1:n] BOOL prime;
+  FOR i TO n DO prime[i] := TRUE OD;
+  prime[1] := FALSE;
+  FOR i FROM 2 TO n DO
+    IF prime[i] THEN
+      INT j := i + i;
+      WHILE j <= n DO prime[j] := FALSE; j +:= i OD
+    FI
+  OD;
+  INT count := 0, col := 0;
+  FOR i TO n DO
+    IF prime[i] THEN
+      count +:= 1;
+      printf(($4d$, i));
+      col +:= 1;
+      IF col = 10 THEN print(newline); col := 0 FI
+    FI
+  OD;
+  IF col /= 0 THEN print(newline) FI;
+  printf(($"primes up to "g(0)": "g(0)l$, n, count))
+END

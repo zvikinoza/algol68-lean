@@ -1,0 +1,35 @@
+# A singly linked list of HEAP nodes: building, reversing, mapping and folding it.  #
+# Names (REF NODE) are followed inline by the compiled code; NIL is a tag test.    #
+BEGIN
+  MODE NODE = STRUCT (INT val, REF NODE next);
+  REF NODE head := NIL;
+  PROC push = (INT v) VOID: head := HEAP NODE := (v, head);
+  PROC length = (REF NODE p) INT:
+    BEGIN INT k := 0; REF NODE q := p; WHILE q ISNT REF NODE (NIL) DO k +:= 1; q := next OF q OD; k END;
+  PROC reverse = (REF NODE p) REF NODE:
+    BEGIN REF NODE prev := NIL, cur := p;
+      WHILE cur ISNT REF NODE (NIL) DO
+        REF NODE nxt = next OF cur;
+        next OF cur := prev; prev := cur; cur := nxt
+      OD;
+      prev
+    END;
+  PROC map = (REF NODE p, PROC (INT) INT f) VOID:
+    BEGIN REF NODE q := p; WHILE q ISNT REF NODE (NIL) DO val OF q := f(val OF q); q := next OF q OD END;
+  PROC fold = (REF NODE p, INT z, PROC (INT, INT) INT f) INT:
+    BEGIN INT acc := z; REF NODE q := p; WHILE q ISNT REF NODE (NIL) DO acc := f(acc, val OF q); q := next OF q OD; acc END;
+  PROC show = (REF NODE p) VOID:
+    BEGIN REF NODE q := p; print("[");
+      WHILE q ISNT REF NODE (NIL) DO print(whole(val OF q, 0)); q := next OF q; IF q ISNT REF NODE (NIL) THEN print(", ") FI OD;
+      print(("]", newline))
+    END;
+  FOR i TO 10 DO push(i * i) OD;
+  show(head);
+  print(("length: ", whole(length(head), 0), newline));
+  head := reverse(head);
+  show(head);
+  map(head, (INT x) INT: x MOD 7);
+  show(head);
+  print(("sum: ", whole(fold(head, 0, (INT a, INT b) INT: a + b), 0), newline));
+  print(("max: ", whole(fold(head, 0, (INT a, INT b) INT: (a > b | a | b)), 0), newline))
+END

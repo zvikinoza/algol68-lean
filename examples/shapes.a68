@@ -1,0 +1,38 @@
+# A row of a union of structures, dispatched by conformity clauses: total area,   #
+# a count per kind, and the largest shape.  The united values live in the row;  #
+# the compiled conformity clause reads their mode and content in place.          #
+BEGIN
+  MODE CIRCLE = STRUCT (REAL r),
+       RECT = STRUCT (REAL w, h),
+       TRIANGLE = STRUCT (REAL a, b, c);
+  MODE SHAPE = UNION (CIRCLE, RECT, TRIANGLE);
+  PROC area = (SHAPE s) REAL:
+    CASE s IN
+      (CIRCLE c): pi * r OF c * r OF c,
+      (RECT q): w OF q * h OF q,
+      (TRIANGLE t): BEGIN REAL p = (a OF t + b OF t + c OF t) / 2;
+                          sqrt(p * (p - a OF t) * (p - b OF t) * (p - c OF t)) END
+    ESAC;
+  PROC name = (SHAPE s) STRING:
+    CASE s IN (CIRCLE): "circle", (RECT): "rectangle", (TRIANGLE): "triangle" ESAC;
+  PROC circle = (REAL radius) SHAPE: BEGIN CIRCLE c; r OF c := radius; c END;
+  [1:7] SHAPE shapes := (circle(1.0), RECT(2.0, 3.0), TRIANGLE(3.0, 4.0, 5.0),
+                         circle(0.5), RECT(1.5, 1.5), TRIANGLE(6.0, 6.0, 6.0), circle(2.0));
+  REAL total := 0; INT circles := 0, rects := 0, triangles := 0;
+  INT biggest := 1;
+  FOR i TO UPB shapes DO
+    REAL a = area(shapes[i]);
+    total +:= a;
+    IF a > area(shapes[biggest]) THEN biggest := i FI;
+    CASE shapes[i] IN
+      (CIRCLE): circles +:= 1,
+      (RECT): rects +:= 1,
+      (TRIANGLE): triangles +:= 1
+    ESAC;
+    print((name(shapes[i]), ": ")); printf(($g(-8,3)l$, a))
+  OD;
+  printf(($"total area "g(-8,3)l$, total));
+  printf(($g(0)" circles, "g(0)" rectangles, "g(0)" triangles"l$, circles, rects, triangles));
+  print(("largest: shape ", whole(biggest, 0), ", a ", name(shapes[biggest]), " of area "));
+  printf(($g(-8,3)l$, area(shapes[biggest])))
+END
