@@ -124,14 +124,22 @@ batches) and the golden corpus (the same 763 of 773 as the C back end):
   by itself. Statepoints (`csrc/stackmap.c` is in place) are therefore not needed yet;
   they become necessary once native pointers are kept live across calls.
 
-Benchmarks (`benchmarks/bench.sh`, `VARIANTS="native comp2 llvm2"`), LLVM back end
-relative to the C back end: `calls` 0.75, `ctl_fib` 1.2, `ctl_hof` 1.0, `ctl_mutual` 1.2,
-`ctl_goto` 1.0, `num_power` 1.0, `num_mandel` 0.5, `intloop` 0.94, `arraysum` 1.4,
-`data_matmul` 1.1, `data_slice` 0.7, `data_list` 0.07, `data_union` 2.0, `sieve` 3.0,
-`data_struct` 3.7, `data_string` 6.0. The last four are where the C back end promotes
-whole rows, rows of structures and strings to C arrays and buffers (no tags, no defined
-bits); doing the same in MIR for rows that never escape is the next step of milestone 2,
-after which every benchmark should be at or under the C back end.
+  A loop whose body (outside its slow paths) calls only runtime entry points that change
+  no cell and no store — a trial lowering of the body tells — reads the descriptor,
+  bounds, offset and store of every row it reaches inline once before the loop into
+  variables and recomputes them after any slow path, so its element accesses are
+  register-based. The inline accesses carry alias information (TBAA: a frame cell, an
+  object header, leaf data, a slot value never overlap) for LLVM's own hoisting.
+
+Benchmarks (`benchmarks/bench.sh`, `VARIANTS="native comp2 llvm2"`, quiet machine),
+LLVM back end relative to the C back end: `calls` 1.0, `ctl_fib` 1.5, `ctl_hof` 1.0,
+`ctl_mutual` 1.2, `ctl_goto` 1.0, `ctl_case` 0.75, `num_power` 1.0, `num_mandel` 0.67,
+`num_real` 0.5, `intloop` 0.9, `arraysum` 1.3, `data_matmul` 1.0, `data_slice` 0.7,
+`data_list` 0.07, `data_union` 2.0, `data_struct` 3.0, `sieve` 3.0, `data_string` 7.0.
+Relative to hand-written C, every benchmark but the last four is within 1.0x–3.0x. The
+last four are where the C back end promotes whole rows, rows of structures and strings to
+C arrays and buffers (no tags, no defined bits, no bounds words); doing the same in MIR
+for rows that never escape is the next step of milestone 2.
 
 Not done: the remainder of milestone 2 (promotion of non-escaping rows and strings to
 native arrays; statepoints once pointers live across calls); milestone 3 (further
