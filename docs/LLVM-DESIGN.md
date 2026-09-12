@@ -139,18 +139,22 @@ batches) and the golden corpus (the same 763 of 773 as the C back end):
   store keeps a defined byte per element (not a bit), so an element write is two plain
   stores.
 
+  A non-flexible row variable declared with literal bounds keeps them for life, so a
+  loop's cache of it holds the bounds and strides as constants and LLVM folds the bounds
+  check into the loop condition.
+
 `a68lean compile` is the LLVM back end; `--c` selects the C back end, kept as the second
 implementation the suites compare against. Benchmarks (`benchmarks/bench.sh`,
-`VARIANTS="native comp2 llvm2"`), LLVM back end relative to the C back end: `calls` 0.75,
-`ctl_fib` 0.75, `ctl_mutual` 0.9, `ctl_hof` 1.0, `ctl_goto` 1.0, `ctl_case` 0.86,
-`num_mandel` 0.5, `num_real` 0.75, `num_divmod` 0.7, `intloop` 0.94, `arraysum` 1.2,
-`data_matmul` 1.1, `data_slice` 0.7, `data_list` 0.07, `sieve` 1.5, `data_union` 1.8,
-`data_struct` 2.0, `data_string` 6.0. Relative to hand-written C: 1.0x–1.8x on eighteen
-of the twenty-two, `sieve` and `data_union` about 3x, `data_struct` 6x, `data_string` 12x.
-What is left on rows is the per-access bounds check, index arithmetic and defined byte
-(the C twins have none), and on strings the runtime's row representation; both are
-addressed by the next step of milestone 2, promoting rows and strings that never
-escape to native arrays and buffers in MIR.
+`VARIANTS="native comp2 llvm2" REPS=5`, quiet machine), LLVM back end relative to the C
+back end: `sieve` 1.0, `arraysum` 1.1, `ctl_mutual` 0.8, `ctl_fib` 1.0, `calls` 1.0,
+`ctl_hof` 1.0, `ctl_case` 0.75, `num_mandel` 0.67, `num_real` 0.5, `num_divmod` 0.75,
+`intloop` 0.9, `data_matmul` 1.0, `data_slice` 0.7, `data_list` 0.07, `data_union` 2.0,
+`data_struct` 2.0, `data_string` 6.0. Relative to hand-written C: 1.0x–2.0x on twenty of
+the twenty-two (`ctl_mutual` 1.3x, `arraysum` 1.7x, `sieve` at the timer's resolution),
+`data_union` 3x and `data_string` further. What is left on rows is the per-access defined
+byte and index arithmetic, and on strings the runtime's row representation; both are
+addressed by the next step of milestone 2, promoting rows and strings that never escape
+to native arrays and buffers in MIR.
 
 Not done: the remainder of milestone 2 (promotion of non-escaping rows and strings to
 native arrays; statepoints once pointers live across calls); milestone 3 (further

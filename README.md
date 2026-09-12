@@ -54,8 +54,9 @@ answer, which is the ceiling the emitted code is measured against.
 | `data_matmul`, matrix multiplication | 1.8x |
 | `data_list`, walking a linked list of `HEAP` nodes | 1.7x |
 | `data_slice`, a sliding window taken by slicing | 1.8x |
-| `sieve`, a sieve over 2 million `BOOL`s | 3x |
-| `data_union`, `data_struct`, `data_string` | 3x–7x |
+| `sieve`, a sieve over 2 million `BOOL`s | ~1x (at the timer's resolution) |
+| `data_struct`, `data_union` | 2x–3x |
+| `data_string`, building and comparing strings | 6x |
 
 The C back end (`--c`) was the proof of concept for the compiled structure — frames,
 control flow, jumps, promoted variables — and stays as a second implementation the
