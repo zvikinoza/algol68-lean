@@ -143,18 +143,30 @@ batches) and the golden corpus (the same 763 of 773 as the C back end):
   loop's cache of it holds the bounds and strides as constants and LLVM folds the bounds
   check into the loop condition.
 
+  Conformity is resolved statically: the mode indices a united value can carry are the
+  constituents of its union, as written or as resolved, so whether one conforms to an
+  alternative is decided at compile time (`Mode.eqv`) and the test is a switch on the
+  index; the runtime's `conforms` is asked only for an index the compiler did not
+  enumerate. Runtime calls carry an effect: a call that changes one named cell only
+  (`a68rt_append*`) leaves a loop's caches of other rows valid and has that cell's
+  recomputed after it. `s +:= v` on a row variable is inline when the row owns an
+  unshared leaf store with room to spare. The collector recycles small objects through
+  size-classed free lists, and the runtime's row-of-CHAR conversions copy a contiguous,
+  fully defined leaf as it is.
+
 `a68lean compile` is the LLVM back end; `--c` selects the C back end, kept as the second
 implementation the suites compare against. Benchmarks (`benchmarks/bench.sh`,
-`VARIANTS="native comp2 llvm2" REPS=5`, quiet machine), LLVM back end relative to the C
-back end: `sieve` 1.0, `arraysum` 1.1, `ctl_mutual` 0.8, `ctl_fib` 1.0, `calls` 1.0,
-`ctl_hof` 1.0, `ctl_case` 0.75, `num_mandel` 0.67, `num_real` 0.5, `num_divmod` 0.75,
-`intloop` 0.9, `data_matmul` 1.0, `data_slice` 0.7, `data_list` 0.07, `data_union` 2.0,
-`data_struct` 2.0, `data_string` 6.0. Relative to hand-written C: 1.0x–2.0x on twenty of
-the twenty-two (`ctl_mutual` 1.3x, `arraysum` 1.7x, `sieve` at the timer's resolution),
-`data_union` 3x and `data_string` further. What is left on rows is the per-access defined
-byte and index arithmetic, and on strings the runtime's row representation; both are
-addressed by the next step of milestone 2, promoting rows and strings that never escape
-to native arrays and buffers in MIR.
+`VARIANTS="native comp2 llvm2" REPS=5`), LLVM back end relative to the C back end:
+`sieve` 1.0, `arraysum` 1.1, `ctl_mutual` 0.9, `ctl_fib` 0.75, `calls` 0.75, `ctl_hof`
+1.0, `ctl_case` 0.86, `num_mandel` 0.5, `num_real` 0.75, `num_divmod` 0.7, `intloop` 0.9,
+`data_matmul` 1.0, `data_slice` 0.7, `data_list` 0.1, `data_union` 0.83, `data_struct`
+1.7, `data_string` 2.0. Relative to hand-written C: 1.0x–2.0x on twenty of the
+twenty-two, `data_string` 2x–4x and `data_struct` 3x–5x (the timer's resolution makes
+the small ones coarse). What is left on rows is the per-access defined byte and index
+arithmetic; on rows of structures the element being a separate object; on strings the
+per-call descriptor borrows of the comparison path. The next step of milestone 2,
+promoting rows and strings that never escape to native arrays and buffers in MIR,
+addresses the first two; a direct comparison entry taking cells addresses the third.
 
 Not done: the remainder of milestone 2 (promotion of non-escaping rows and strings to
 native arrays; statepoints once pointers live across calls); milestone 3 (further

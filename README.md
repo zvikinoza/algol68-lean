@@ -86,8 +86,9 @@ compiled by the same clang.
 | `data_list`, walking a linked list of `HEAP` nodes | 1.7x |
 | `data_slice`, a sliding window taken by slicing | 1.8x |
 | `sieve`, a sieve over 2 million `BOOL`s | ~1x (at the timer's resolution) |
-| `data_struct`, `data_union` | 2x–3x |
-| `data_string`, building and comparing strings | 6x |
+| `data_union`, a row of a union dispatched by conformity | 1.2x |
+| `data_string`, building and comparing strings | 2x–4x |
+| `data_struct`, a row of structures updated in place | 3x–5x |
 
 The C back end (`--c`) was the proof of concept for the compiled structure — frames,
 control flow, jumps, promoted variables — and stays as a second implementation the
