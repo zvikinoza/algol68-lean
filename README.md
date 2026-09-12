@@ -57,10 +57,11 @@ library only.
 
 The emitted code calls the runtime as little as possible. Values of primitive mode are
 computed in registers; locals that cannot escape are registers; routines with primitive
-signatures are plain LLVM functions called directly; rows, structures, unions, strings
-and names are read and written by emitted loads and stores that know the runtime's
-object layout, and a loop keeps a row's descriptor and bounds in registers for its
-duration. Each such fast path is guarded by a tag check that falls back to the runtime
+signatures are plain LLVM functions called directly; rows that never escape are native
+arrays (one per field for a row of structures) with their bounds in registers; other
+rows, structures, unions, strings and names are read and written by emitted loads and
+stores that know the runtime's object layout, and a loop keeps such a row's descriptor
+and bounds in registers for its duration. Each such fast path is guarded by a tag check that falls back to the runtime
 call whenever a value is not as expected, so the runtime's checks and messages are those
 of the evaluator. In a hot loop such as the sieve's the runtime is not called at all
 (see [examples/sieve.mir](examples/sieve.mir)).
@@ -87,8 +88,8 @@ compiled by the same clang.
 | `data_slice`, a sliding window taken by slicing | 1.8x |
 | `sieve`, a sieve over 2 million `BOOL`s | ~1x (at the timer's resolution) |
 | `data_union`, a row of a union dispatched by conformity | 1.2x |
+| `data_struct`, a row of structures updated in place | 2x |
 | `data_string`, building and comparing strings | 2x–4x |
-| `data_struct`, a row of structures updated in place | 3x–5x |
 
 The C back end (`--c`) was the proof of concept for the compiled structure — frames,
 control flow, jumps, promoted variables — and stays as a second implementation the

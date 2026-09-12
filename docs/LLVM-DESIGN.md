@@ -154,21 +154,27 @@ batches) and the golden corpus (the same 763 of 773 as the C back end):
   size-classed free lists, and the runtime's row-of-CHAR conversions copy a contiguous,
   fully defined leaf as it is.
 
+  **Promotion.** A row variable declared by a generator with an undefined initial value,
+  of a primitive element mode or of structures with primitive fields, that is only
+  subscripted, updated by assigning operators, asked for its bounds, or (for a row of
+  structures) read and written field by field or assigned a structure display — the C
+  back end's escape analysis decides — has no descriptor, no store and no collector
+  object: its bounds are registers and each element field is a native array with a
+  defined byte per element, allocated at the declaration and freed with the block.
+
 `a68lean compile` is the LLVM back end; `--c` selects the C back end, kept as the second
 implementation the suites compare against. Benchmarks (`benchmarks/bench.sh`,
 `VARIANTS="native comp2 llvm2" REPS=5`), LLVM back end relative to the C back end:
-`sieve` 1.0, `arraysum` 1.1, `ctl_mutual` 0.9, `ctl_fib` 0.75, `calls` 0.75, `ctl_hof`
-1.0, `ctl_case` 0.86, `num_mandel` 0.5, `num_real` 0.75, `num_divmod` 0.7, `intloop` 0.9,
-`data_matmul` 1.0, `data_slice` 0.7, `data_list` 0.1, `data_union` 0.83, `data_struct`
-1.7, `data_string` 2.0. Relative to hand-written C: 1.0x–2.0x on twenty of the
-twenty-two, `data_string` 2x–4x and `data_struct` 3x–5x (the timer's resolution makes
-the small ones coarse). What is left on rows is the per-access defined byte and index
-arithmetic; on rows of structures the element being a separate object; on strings the
-per-call descriptor borrows of the comparison path. The next step of milestone 2,
-promoting rows and strings that never escape to native arrays and buffers in MIR,
-addresses the first two; a direct comparison entry taking cells addresses the third.
+`sieve` 1.0, `arraysum` 0.94, `data_struct` 0.67, `data_union` 0.83, `ctl_mutual` 0.9,
+`ctl_fib` 0.75, `calls` 0.75, `ctl_hof` 1.0, `ctl_case` 0.86, `num_mandel` 0.5, `num_real`
+0.75, `num_divmod` 0.7, `intloop` 0.9, `data_matmul` 1.0, `data_slice` 0.7, `data_list`
+0.1, `data_string` 2.0 — at or under the C back end on twenty-one of the twenty-two.
+Relative to hand-written C: 1.0x–2.0x on twenty-one, `data_string` 2x–4x. What is
+left on `data_string` is the per-call descriptor borrows and byte conversions of the
+comparison path (a comparison entry taking cells directly would remove them) and the
+growth steps of a string built from empty.
 
-Not done: the remainder of milestone 2 (promotion of non-escaping rows and strings to
-native arrays; statepoints once pointers live across calls); milestone 3 (further
+Not done: the remainder of milestone 2 (promotion of non-escaping strings to native
+buffers and of rows of unions; statepoints once pointers live across calls); milestone 3 (further
 verified passes — CSE, LICM, bounds-check elimination, inlining — and the verified
 lowering of the formal core); milestone 4 (generational collection).
