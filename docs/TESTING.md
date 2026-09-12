@@ -85,9 +85,9 @@ stack when the label was in a loop body; and compiled programs saw their own pat
 
 Compiled programs collect their heap (docs/GC-DESIGN.md). `A68LEAN_GC=stress` makes the
 collector run at every safe point, so any value the runtime failed to keep in a root
-is freed while still in use; `A68LEAN_GC=verify` never reuses freed memory and, after
-every collection, walks everything reachable and stops the program if it finds a freed
-object. The compiled case suite is run under `stress,verify` as well as plainly, and
+is freed while still in use; `A68LEAN_GC=verify` poisons freed objects instead of
+reusing them, keeps each for four collections, and after every collection walks
+everything reachable and stops the program if it finds a poisoned object. The compiled case suite is run under `stress,verify` as well as plainly, and
 the fuzzer too. Two cases exercise the collector directly: `gc-churn` allocates
 tens of megabytes of short-lived lists, rows and strings while keeping a small live
 set, and `gc-roots` uses values that are reachable only through roots the collector

@@ -306,6 +306,6 @@ transcription itself and the C runtime's adherence to R2, which `stress` and
   size-classed free lists and lazy sweeping (§4.1) are performance work still to
   do, as is the generational collector (M3).
 * M4: `A68/Verified/GC.lean` proves the four theorems of §5 on the model.
-* Verify mode keeps every freed object poisoned for the rest of the run, so an
-  allocation-heavy program can exhaust memory under it; bounding that with a
-  quarantine of a few collections is still to do.
+* Verify mode keeps a freed object poisoned for four collections (a dangling
+  reference is checked at each of them) and then releases it, so allocation-heavy
+  programs run under it in bounded memory.

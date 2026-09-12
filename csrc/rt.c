@@ -720,6 +720,19 @@ static void gc_mark(void) {
 
 enum { K_FREED = 0xee };
 
+/* In verify mode a freed object is poisoned rather than freed, so that a dangling
+   reference is caught by the next check; it is kept for `QUARANTINE` collections (a
+   reference to it that survives that long would have been seen), then released, so that
+   an allocation-heavy program can run under verify mode. */
+#define QUARANTINE 4
+static a68_obj* quarantine[QUARANTINE];
+
+static void quarantine_release(size_t slot) {
+  a68_obj* o = quarantine[slot];
+  while (o) { a68_obj* n = o->next; free(o); o = n; }
+  quarantine[slot] = NULL;
+}
+
 static void gc_sweep(void) {
   /* a dead descriptor gives back its share of a store that survives */
   for (a68_obj* o = all_objects; o; o = o->next)
@@ -734,8 +747,10 @@ static void gc_sweep(void) {
     if (o->mark) { o->mark = 0; live += o->size; link = &o->next; continue; }
     *link = o->next;
     gc_freed_bytes += o->size;
-    if (gc_verify) { o->kind = K_FREED; o->next = NULL; }   /* kept, poisoned, never reused */
-    else free(o);
+    if (gc_verify) {   /* kept, poisoned, released after QUARANTINE collections */
+      size_t slot = (size_t) (gc_collections % QUARANTINE);
+      o->kind = K_FREED; o->next = quarantine[slot]; quarantine[slot] = o;
+    } else free(o);
   }
   bytes_live = live;
 }
@@ -764,6 +779,7 @@ static void gc_collect(void) {
   struct timespec t0, t1;
   clock_gettime(CLOCK_MONOTONIC, &t0);
   gc_mark();
+  if (gc_verify) quarantine_release((size_t) ((gc_collections + 1) % QUARANTINE));
   gc_sweep();
   if (gc_verify) gc_verify_reachable();
   clock_gettime(CLOCK_MONOTONIC, &t1);
