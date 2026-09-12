@@ -200,6 +200,12 @@ def binSem : BinOp → Val → Val → Option Val
   | .shrW, .i a, .i b => if b < 0 ∨ b ≥ 64 then none else some (.i ((toU64 a >>> b.toNat : Nat) : Int))
   | .andW, .i a, .i b => some (.i (wrap64 ((toU64 a &&& toU64 b : Nat) : Int)))
   | .orW, .i a, .i b => some (.i (wrap64 ((toU64 a ||| toU64 b : Nat) : Int)))
+  | .overW, .i a, .i b => if b = 0 then none else some (.i (Int.tdiv a b))
+  | .modW, .i a, .i b => if b = 0 then none else some (.i (a % (b.natAbs : Int)))
+  | .addFW, .f a, .f b => some (.f (a + b))
+  | .subFW, .f a, .f b => some (.f (a - b))
+  | .mulFW, .f a, .f b => some (.f (a * b))
+  | .divFW, .f a, .f b => some (.f (a / b))
   | .addI, .i a, .i b => checkInt (a + b)
   | .subI, .i a, .i b => checkInt (a - b)
   | .mulI, .i a, .i b => checkInt (a * b)
@@ -229,6 +235,9 @@ abbrev MathFns := String → Float → Option Float
 
 /-- The meaning of a monadic operation, given the mathematical functions. -/
 def unSem (math : MathFns) : UnOp → Val → Option Val
+  | .nanF, .f x => some (.b x.isNaN)
+  | .infF, .f x => some (.b x.isInf)
+  | .badF, .f x => some (.b (x.isNaN || x.isInf))
   | .negI, .i n => checkInt (-n)
   | .absI, .i n => some (.i (n.natAbs : Int))
   | .signI, .i n => some (.i (if n > 0 then 1 else if n < 0 then -1 else 0))
@@ -314,6 +323,7 @@ def evalRhs (math : MathFns) (env : Env) : Rhs → Option Val
   | .un op a => unSem math op (evalOpnd env a)
   | .call _ _ => none
   | .natTab i => some (evalOpnd env i)   -- a pointer is identified by its routine index
+  | .select c a b => some (if (evalOpnd env c).truthy then evalOpnd env a else evalOpnd env b)
 
 /-- A call: the arguments are evaluated, the runtime steps, the call is recorded. -/
 def execCall (rt : Runtime R) (f : Callee) (args : Array Opnd) (s : State R) :

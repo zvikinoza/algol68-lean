@@ -73,29 +73,44 @@ by the differential tests instead ([docs/TESTING.md](docs/TESTING.md)).
 
 Every benchmark in `benchmarks/` ships with a C twin computing the same answer, which
 is the ceiling the emitted code is measured against; both sides are native code
-compiled by the same clang.
+compiled by the same clang (`-ffp-contract=off` on both, so both round alike). Ratios
+are the compiled program's time over the C twin's, best of five on a quiet machine
+(`VARIANTS="native llvm2" REPS=5 benchmarks/bench.sh`); a 10 ms timer makes the small
+ones coarse.
 
-| benchmark | LLVM back end vs hand-written C |
+| numeric kernels (`benchmarks/progs/ai_*`) | vs hand-written C |
 |---|---:|
-| `intloop`, integer arithmetic in a loop | 1.3x |
-| `num_real`, `num_divmod`, real and integer arithmetic | 1.0x |
-| `ctl_fib`, 18 million recursive calls | 1.5x |
-| `ctl_mutual`, three mutually recursive routines | 1.3x |
-| `calls`, `ctl_hof`, procedure calls and procedures as parameters | 1.5x–2x |
-| `arraysum`, 40 million row element accesses | 1.7x |
-| `data_matmul`, matrix multiplication | 1.8x |
-| `data_list`, walking a linked list of `HEAP` nodes | 1.7x |
-| `data_slice`, a sliding window taken by slicing | 1.8x |
-| `sieve`, a sieve over 2 million `BOOL`s | ~1x (at the timer's resolution) |
-| `data_union`, a row of a union dispatched by conformity | 1.2x |
-| `data_struct`, a row of structures updated in place | 2x |
+| `ai_dot`, 82 million multiply-accumulates over two vectors | 1.0x |
+| `ai_matmul_real`, a 400x400 REAL matrix multiply | 1.1x |
+| `ai_softmax`, softmax over 512 logits, 40000 times | 1.2x |
+| `ai_layernorm`, layer normalisation of 1024-vectors, 30000 times | 1.3x |
+| `ai_sgd`, linear regression by SGD, 8 features, 200 epochs | 1.4x |
+| `ai_kmeans`, 5000 points, 8 dimensions, 8 centroids, 100 iterations | 2x |
+| `ai_dense`, a 256x256 dense layer with ReLU over 1000 inputs | 2x |
+| `ai_attention`, scaled dot-product attention, 64 positions x 64 | 2.4x |
+| `ai_conv2d`, a 3x3 convolution over 256x256, 100 passes | 3x |
+| `ai_conv1d`, a 16-tap convolution over 100000 samples, 50 passes | 4x–8x |
+
+| general programs | vs hand-written C |
+|---|---:|
+| `intloop`, `num_real`, `num_divmod`, `num_math`, `num_power`, `num_mandel`, `ctl_ops` | 1.0x–1.5x |
+| `sieve`, `arraysum`, `data_matmul`, `data_struct` | 1.3x–2x |
+| `ctl_fib`, `ctl_mutual`, `calls`, `ctl_hof`, `ctl_case`, `ctl_goto` | 1.3x–2x |
+| `data_list`, `data_slice`, `data_union` | 1.2x–1.8x |
 | `data_string`, building and comparing strings | 2x–4x |
 
-The C back end (`--c`) was the proof of concept for the compiled structure — frames,
-control flow, jumps, promoted variables — and stays as a second implementation the
-test suites run for comparison; the evaluator (`a68lean run`) is the specification both
-are checked against. See [benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for all 22
-programs and for what is left.
+What the compiled code does to get there, each mechanism general rather than tied to
+a benchmark: scalars and non-escaping locals in registers; routines with primitive
+signatures as plain functions called directly; rows that never escape as native arrays
+(one per field for rows of structures) with bounds in registers; an interval analysis
+that removes subscript checks a loop cannot violate; a definedness analysis that removes
+the undefined-element test once a loop has assigned every element; and, in a counted
+loop whose body is repeatable, every remaining check deferred to one flag with the loop
+run again in checked form on failure, so the loop body has no early exit. The C twins'
+remaining edge is vectorisation across independent iterations, which a68g's fixed
+summation order does not permit within a reduction. See
+[docs/LLVM-DESIGN.md](docs/LLVM-DESIGN.md) for the mechanisms and
+[benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for the earlier programs.
 
 ## Quick start
 

@@ -162,19 +162,44 @@ batches) and the golden corpus (the same 763 of 773 as the C back end):
   object: its bounds are registers and each element field is a native array with a
   defined byte per element, allocated at the declaration and freed with the block.
 
-`a68lean compile` is the LLVM back end; `--c` selects the C back end, kept as the second
-implementation the suites compare against. Benchmarks (`benchmarks/bench.sh`,
-`VARIANTS="native comp2 llvm2" REPS=5`), LLVM back end relative to the C back end:
-`sieve` 1.0, `arraysum` 0.94, `data_struct` 0.67, `data_union` 0.83, `ctl_mutual` 0.9,
-`ctl_fib` 0.75, `calls` 0.75, `ctl_hof` 1.0, `ctl_case` 0.86, `num_mandel` 0.5, `num_real`
-0.75, `num_divmod` 0.7, `intloop` 0.9, `data_matmul` 1.0, `data_slice` 0.7, `data_list`
-0.1, `data_string` 2.0 — at or under the C back end on twenty-one of the twenty-two.
-Relative to hand-written C: 1.0x–2.0x on twenty-one, `data_string` 2x–4x. What is
-left on `data_string` is the per-call descriptor borrows and byte conversions of the
-comparison path (a comparison entry taking cells directly would remove them) and the
-growth steps of a string built from empty.
+  **Checks in counted loops.** Three analyses remove or defer the checks a68g's
+  semantics require, without changing what a failing program prints:
+  * *Interval analysis*: a loop counter running by 1 between literal bounds has a known
+    interval; so has an index built from such counters by ±constants; when it lies within
+    a promoted row's declared literal bounds, the subscript check — and the clamp that
+    would otherwise keep a wrong index harmless — is not emitted.
+  * *Definedness*: a loop nest running over exactly a promoted row's declared bounds
+    and assigning every element (as a statement of the row's own block, which has no
+    labels a jump could skip it by) leaves the row known defined for what follows, per
+    field; reads then need no undefined-element test. Storing an undefined value clears
+    the knowledge.
+  * *Deferred traps*: a counted loop whose body calls only what a second run may repeat,
+    reaches no row through the runtime, has no jump, WHILE or label, and emits no check
+    that cannot be deferred becomes a region in which every check (subscript, undefined
+    element, INT range, zero divisor, NaN or infinite REAL) only sets one flag and every
+    memory index is clamped: no early exit. A NaN or infinity survives + - *, so a chain
+    of those is tested once where it ends (a statement, branch or loop body's end, or
+    before a division or a mathematical function). If the flag is set when the loop
+    ends, the registers the loop assigned are restored to their entry values, every
+    promoted row it both read and wrote is restored from the copy taken before the loop
+    (taken only for loops of at least 32 steps; shorter ones keep the checked form), and
+    the loop runs again in checked form, which stops at the first failure with its
+    message. Nothing observable happened in between, so output, message and exit
+    status are those of the evaluator. MIR gained `select`, the unchecked REAL
+    operations and the finiteness tests for this, with semantics, passes and proofs.
 
-Not done: the remainder of milestone 2 (promotion of non-escaping strings to native
-buffers and of rows of unions; statepoints once pointers live across calls); milestone 3 (further
+`a68lean compile` is the LLVM back end; `--c` selects the C back end, kept as the second
+implementation the suites compare against. The README's tables give the current
+ratios against hand-written C: the numeric kernels (`benchmarks/progs/ai_*`) at 1.0x on
+dot products and 1.1x–1.4x on matrix multiply, softmax, layer normalisation and SGD,
+2x–3x on k-means, the dense layer, attention and the 2-D convolution, and 4x–8x on the
+1-D convolution, where clang vectorises the C twin across independent output elements
+(a legal transformation the compiler does not yet perform for MIR loops); the earlier
+programs at 1.0x–2x except `data_string`.
+
+Not done: outer-loop vectorisation of MIR loop nests (independent output elements
+computed in lanes, order-preserving); the remainder of milestone 2 (promotion of
+non-escaping strings to native buffers and of rows of unions; statepoints once pointers
+live across calls); milestone 3 (further
 verified passes — CSE, LICM, bounds-check elimination, inlining — and the verified
 lowering of the formal core); milestone 4 (generational collection).

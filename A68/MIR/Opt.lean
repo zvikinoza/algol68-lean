@@ -48,6 +48,7 @@ def rhsReads : Rhs → List Nat
   | .un _ a => opndReads a
   | .call _ args => args.toList.flatMap opndReads
   | .natTab i => opndReads i
+  | .select c a b => opndReads c ++ opndReads a ++ opndReads b
 
 def instrReads : Instr → List Nat
   | .set _ r => rhsReads r
@@ -84,6 +85,7 @@ def substRhs (m : Copies) : Rhs → Rhs
   | .un op a => .un op (substOpnd m a)
   | .call f args => .call f (args.map (substOpnd m))
   | .natTab i => .natTab (substOpnd m i)
+  | .select c a b => .select (substOpnd m c) (substOpnd m a) (substOpnd m b)
 
 def substTerm (m : Copies) : Term → Term
   | .condBr c t f => .condBr (substOpnd m c) t f
@@ -199,6 +201,7 @@ def rhsNoDead (dead : Nat → Bool) : Rhs → Bool
   | .un _ a => opndNoDead dead a
   | .call _ args => args.toList.all (opndNoDead dead)
   | .natTab i => opndNoDead dead i
+  | .select c a b => opndNoDead dead c && opndNoDead dead a && opndNoDead dead b
 
 def instrNoDead (dead : Nat → Bool) : Instr → Bool
   | .set _ r => rhsNoDead dead r

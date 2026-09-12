@@ -55,9 +55,12 @@ inductive BinOp where
   | andU | orU | xorU       -- BITS
   | addW | subW | mulW      -- i64, wrapping, unchecked: address arithmetic
   | shlW | shrW | andW | orW   -- i64 bit operations, unchecked: address arithmetic
+  | overW | modW            -- INT OVER and MOD without the zero-divisor check (the caller excludes 0)
+  | addFW | subFW | mulFW | divFW   -- REAL, unchecked: IEEE results, NaN and infinity included
   deriving Repr, BEq, Inhabited
 
 inductive UnOp where
+  | nanF | infF | badF      -- is the REAL a NaN / infinite / either (the checks of addF …, as values)
   | negI | absI | signI | oddI | reprI
   | negF | absF | signF | entier | round
   | notB | absB | absC
@@ -81,6 +84,7 @@ inductive Rhs where
   | un (op : UnOp) (a : Opnd)
   | call (f : Callee) (args : Array Opnd)
   | natTab (i : Opnd)       -- the plain entry point of boxed routine `i - 1`, null when it has none
+  | select (c : Opnd) (a b : Opnd)   -- `a` when `c` holds, else `b`
   deriving Repr, Inhabited
 
 inductive Instr where
@@ -195,7 +199,8 @@ def natSigs : List (String × RtSig) :=
   [ ("a68n_pow_i", ⟨#[.i64, .i64], .i64⟩), ("a68n_pow_ri", ⟨#[.f64, .i64], .f64⟩), ("a68n_pow_rr", ⟨#[.f64, .f64], .f64⟩),
     ("a68n_entier", ⟨#[.f64], .i64⟩), ("a68n_round", ⟨#[.f64], .i64⟩), ("a68n_echo", ⟨#[u32], .none⟩),
     ("jump_flag", ⟨#[], .u32⟩),   -- the runtime's pending-jump flag, read inline
-    ("a68n_alloc", ⟨#[.i64], .ptr⟩), ("a68n_free", ⟨#[.ptr], .none⟩),
+    ("set_line", ⟨#[.i64], .none⟩),   -- the line number, from a value (a deferred trap's)
+    ("a68n_alloc", ⟨#[.i64], .ptr⟩), ("a68n_free", ⟨#[.ptr], .none⟩), ("a68n_memcpy", ⟨#[.ptr, .ptr, .i64], .none⟩),
     -- memory access, printed inline: a load or store of the given width at a byte offset from
     -- a pointer; the narrow loads zero-extend to i64, the narrow stores truncate
     -- a pointer; the last argument is a constant naming what is accessed (the printer's
@@ -230,6 +235,7 @@ def Rhs.show : Rhs → String
   | .un op a => s!"{repr op} {a.show}"
   | .call f as => s!"{f.show}({", ".intercalate (as.toList.map Opnd.show)})"
   | .natTab i => s!"nf_of_fn[{i.show}]"
+  | .select c a b => s!"{c.show} ? {a.show} : {b.show}"
 
 def Instr.show : Instr → String
   | .set d r => s!"%{d.id} : {d.ty.show} = {r.show}"

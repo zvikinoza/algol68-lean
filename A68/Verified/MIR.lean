@@ -71,6 +71,7 @@ theorem evalRhs_foldRhs (m : MathFns) (env : Env) (d : Var) (r : Rhs) :
   | opnd o => rfl
   | call f args => rfl
   | natTab i => rfl
+  | select c a b => rfl
   | bin op a b =>
     cases a <;> cases b <;> try rfl
     simp only [Opt.foldRhs]
@@ -103,6 +104,7 @@ theorem execInstr_foldInstr (i : Instr) (s : State R) :
     | opnd o => rfl
     | call f args => rfl
     | natTab i => rfl
+    | select c a b => rfl
     | bin op a b =>
       simp only [Opt.foldInstr]
       cases a <;> cases b <;> try rfl
@@ -259,6 +261,7 @@ theorem copiesValid_addCopy (env : Env) (m : Opt.Copies) (d : Var) (rhs : Rhs) (
   | un op a => exact hm
   | call f args => exact hm
   | natTab i => exact hm
+  | select c a b => exact hm
 
 /-- A call leaves the variables alone. -/
 theorem execCall_env (f : Callee) (args : Array Opnd) (s s' : State R) (ret : Option Val)
@@ -287,6 +290,9 @@ theorem execInstr_set_ok (d : Var) (rhs : Rhs) (s s' : State R)
   | natTab i =>
     simp only [execInstr, evalRhs] at h
     cases h; exact ⟨_, rfl⟩
+  | select c a b =>
+    simp only [execInstr, evalRhs] at h
+    cases h; exact ⟨_, rfl⟩
   | bin op a b =>
     simp only [execInstr] at h
     split at h
@@ -307,6 +313,7 @@ theorem execInstr_set_subst (d : Var) (rhs : Rhs) (s : State R) (m : Opt.Copies)
   | bin op a b => simp only [Opt.substRhs, execInstr, evalRhs, evalOpnd_substOpnd s.env m h]
   | un op a => simp only [Opt.substRhs, execInstr, evalRhs, evalOpnd_substOpnd s.env m h]
   | natTab i => simp only [Opt.substRhs, execInstr, evalRhs, evalOpnd_substOpnd s.env m h]
+  | select c a b => simp only [Opt.substRhs, execInstr, evalRhs, evalOpnd_substOpnd s.env m h]
 
 /-- **Copy propagation within a block**: the propagated instructions execute as the
     originals do, and the copies in force at the end hold in the final environment. -/
@@ -358,6 +365,7 @@ theorem copyPropInstrs_correct (is : List Instr) : ∀ (m : Opt.Copies) (s : Sta
             | un op a => simp [Opt.substRhs] at hy
             | call f args => simp [Opt.substRhs] at hy
             | natTab i => simp [Opt.substRhs] at hy
+            | select c a b => simp [Opt.substRhs] at hy
         exact ih _ s₁ hval
 
 /-- A propagated block executes as the original does. -/
@@ -437,6 +445,10 @@ theorem evalRhs_envEq (mf : MathFns) (dead : Nat → Bool) (e₁ e₂ : Env) (h 
     simp [evalRhs, evalOpnd_envEq dead e₁ e₂ h a hr.1, evalOpnd_envEq dead e₁ e₂ h b hr.2]
   | un op a => simp [evalRhs, evalOpnd_envEq dead e₁ e₂ h a hr]
   | natTab i => simp [evalRhs, evalOpnd_envEq dead e₁ e₂ h i hr]
+  | select c a b =>
+    simp only [Opt.rhsNoDead, Bool.and_eq_true] at hr
+    simp [evalRhs, evalOpnd_envEq dead e₁ e₂ h c hr.1.1, evalOpnd_envEq dead e₁ e₂ h a hr.1.2,
+          evalOpnd_envEq dead e₁ e₂ h b hr.2]
   | call f args => rfl
 
 theorem args_envEq (dead : Nat → Bool) (e₁ e₂ : Env) (h : EnvEq dead e₁ e₂) (args : Array Opnd)
@@ -482,6 +494,11 @@ theorem execInstr_envEq (dead : Nat → Bool) (i : Instr) (s₁ s₂ : State R) 
       simp only [execInstr, evalRhs]
       rw [evalOpnd_envEq dead _ _ henv i hi]
       exact ⟨envEq_set dead _ _ henv _ _, hrt, htr⟩
+    | select c a b =>
+      simp only [execInstr, evalRhs_envEq rt.math dead s₁.env s₂.env henv (.select c a b) hi]
+      cases evalRhs rt.math s₂.env (.select c a b) with
+      | none => exact ⟨htr, rfl⟩
+      | some v => exact ⟨envEq_set dead _ _ henv _ _, hrt, htr⟩
     | bin op a b =>
       simp only [execInstr, evalRhs_envEq rt.math dead s₁.env s₂.env henv (.bin op a b) hi]
       cases evalRhs rt.math s₂.env (.bin op a b) with
@@ -528,6 +545,7 @@ theorem execInstrs_dropDead (dead : Nat → Bool) (is : List Instr) : ∀ (s₁ 
       | bin op a b => exact keep
       | un op a => exact keep
       | natTab i => exact keep
+      | select c a b => exact keep
       | opnd o =>
         simp only [Opt.dropDeadInstrs]
         split
@@ -625,6 +643,12 @@ theorem rhsNoDead_deadVar (f : Func) (r : Rhs) (h : ∀ id ∈ Opt.rhsReads r, i
            opndNoDead_deadVar f b (fun id hid => h id (Or.inr hid))⟩
   | un op a => exact opndNoDead_deadVar f a h
   | natTab i => exact opndNoDead_deadVar f i h
+  | select c a b =>
+    simp only [Opt.rhsReads, List.mem_append] at h
+    simp only [Opt.rhsNoDead, Bool.and_eq_true]
+    exact ⟨⟨opndNoDead_deadVar f c (fun id hid => h id (Or.inl (Or.inl hid))),
+            opndNoDead_deadVar f a (fun id hid => h id (Or.inl (Or.inr hid)))⟩,
+           opndNoDead_deadVar f b (fun id hid => h id (Or.inr hid))⟩
   | call g args =>
     simp only [Opt.rhsReads, List.mem_flatMap] at h
     simp only [Opt.rhsNoDead, List.all_eq_true]

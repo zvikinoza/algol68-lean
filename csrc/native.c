@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include "io.h"
 
@@ -97,3 +98,4 @@ void* a68n_alloc(int64_t bytes) {
   return p;
 }
 void a68n_free(void* p) { free(p); }
+void a68n_memcpy(void* dst, const void* src, int64_t bytes) { if (bytes > 0) memcpy(dst, src, (size_t) bytes); }

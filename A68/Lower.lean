@@ -36,6 +36,7 @@ structure PVar where
   v    : Var
   m    : Mode
   flag : Option Var := none
+  range : Option (Int × Int) := none   -- a loop counter with literal bounds: its interval
   deriving Inhabited
 
 /-- A primitive element mode in a leaf store: its tag, its size in bytes, the memory width
@@ -74,6 +75,10 @@ structure PRow where
   fields : Array (ElemInfo × Ty × Mode)
   data   : Array Var                 -- per field: the elements
   flags  : Array Var                 -- per field: the defined bytes
+  known  : Array Bool := #[]         -- per field: every element is known to be defined here
+  litBounds : Option (List (Int × Int)) := none   -- the declared bounds when literal
+  shadowD : Array Var := #[]         -- per field: a copy of the elements, for a loop's second run (allocated on first use)
+  shadowF : Array Var := #[]         -- per field: a copy of the defined bytes
   deriving Inhabited
 
 /-- A frame as the lowering sees it: the modes of its slots, which slots are variables,
@@ -117,6 +122,19 @@ structure RowCache where
   n     : Var                     -- the store's element count
   deriving Inhabited
 
+/-- A region of deferred traps: a counted loop whose body makes no call and no jump, in
+    which every check only sets a flag instead of branching, and every memory index is
+    clamped, so that the body has no early exit — what LLVM's vectoriser needs.  When the
+    flag is set at the loop's end (an erroneous program), the registers the loop assigned
+    are restored to their values at its entry and the loop runs again in checked form,
+    which stops at the first failure with its message: nothing observable happened
+    between the point where the evaluator would have stopped and the second run, and the
+    second run sees what the first saw, since a loop is only made such a region when it
+    reads no array it writes. -/
+structure DeferCtx where
+  bad : Var       -- i1: some check failed in the loop so far
+  deriving Inhabited
+
 /-- The function under construction. -/
 structure FnB where
   name     : String := ""
@@ -134,6 +152,7 @@ structure FnB where
   entryDepth : Nat := 0                    -- how many frames the entry pushes (0 or 1)
   outerCells : List (Nat × Var) := []      -- per captured frame (0 = the declaring one): its cells
   lastLine : Option Nat := none            -- the line number in force since the block began or the last call
+  curLine  : Nat := 0                      -- the line number of the code being lowered
   deriving Inhabited
 
 structure St where
@@ -151,6 +170,13 @@ structure St where
   rowUses  : Array (Nat × Nat × Int × Nat) := #[]   -- rows accessed inline: fid, slot, store kind, dims
   slowRanges : Array (Nat × Nat) := #[]    -- block ranges [from, to) that are slow paths
   cellCalls : Array (Nat × Nat) := #[]     -- (block, instruction) of runtime calls that change one named cell only
+  defer    : Option DeferCtx := none       -- the region of deferred traps being lowered
+  pendingF : List Var := []                -- REAL results of + - * in the region not yet tested for finiteness
+  noDefer  : Bool := false                 -- lowering the checked second run of a region: no new region
+  hardTraps : Nat := 0                     -- checks emitted that cannot be deferred (a trial counts them)
+  prowReads : Array Nat := #[]             -- promoted rows read / written (by the variable of their first field)
+  prowWrites : Array Nat := #[]
+  prowSeen : List PRow := []               -- the promoted rows accessed, for their snapshots
   deriving Inhabited
 
 abbrev L := StateM St
@@ -177,9 +203,9 @@ def emit (i : Instr) : L Unit :=
   modify fun s =>
     match i with
     | .line n =>
-      if s.fb.lastLine == some n then s else
+      if s.fb.lastLine == some n then { s with fb := { s.fb with curLine := n } } else
       let b := s.fb.blocks[s.fb.cur]!
-      { s with fb := { s.fb with blocks := s.fb.blocks.set! s.fb.cur { b with instrs := b.instrs.push i }, lastLine := some n } }
+      { s with fb := { s.fb with blocks := s.fb.blocks.set! s.fb.cur { b with instrs := b.instrs.push i }, lastLine := some n, curLine := n } }
     | _ =>
       let isCall := match i with | .call _ _ | .set _ (.call _ _) => true | _ => false
       let b := s.fb.blocks[s.fb.cur]!
@@ -350,6 +376,73 @@ def guard (c : Opnd) (no : Nat) : L Unit := do
   terminate (.condBr c yes no)
   switchTo yes
 
+/-- In a region of deferred traps: note that `cond` failed; outside one, nothing. -/
+def deferFail (cond : Opnd) (_code : Int) (_ix : Option (Opnd × Opnd × Opnd) := none) : L Unit := do
+  let some ctx := (← get).defer | return
+  let b ← binv .i1 .orB (.v ctx.bad) cond
+  emit (.set ctx.bad (.opnd (.v b)))
+
+/-- Test every pending REAL result of the region for finiteness now: at the end of a
+    statement, a branch or a loop body, and before an operation through which a NaN or
+    infinity would not survive (a division, a mathematical function). -/
+def flushPending : L Unit := do
+  let ps := (← get).pendingF
+  if ps.isEmpty then return
+  modify fun st => { st with pendingF := [] }
+  for v in ps do
+    let bad ← newVar .i1
+    emit (.set bad (.un .badF (.v v)))
+    deferFail (.v bad) 12
+
+/-- A checked dyadic operation: as it is, or, in a region of deferred traps, the unchecked
+    operation with its check recorded (`Sem.binSem`'s conditions: the INT range
+    ±2147483647, a zero divisor, a NaN or infinite REAL result). -/
+def emitBin (v : Var) (bop : BinOp) (a b : Opnd) : L Unit := do
+  match (← get).defer with
+  | none =>
+    match bop with
+    | .powI | .powFI | .powFF => modify fun st => { st with hardTraps := st.hardTraps + 1 }
+    | _ => pure ()
+    emit (.set v (.bin bop a b))
+  | some _ =>
+    match bop with
+    | .addI | .subI | .mulI =>
+      let w : BinOp := match bop with | .addI => .addW | .subI => .subW | _ => .mulW
+      let t ← binv .i64 w a b
+      let hi ← binv .i1 .gt (.v t) (ki 2147483647)
+      let lo ← binv .i1 .lt (.v t) (ki (-2147483647))
+      let bad ← binv .i1 .orB (.v hi) (.v lo)
+      deferFail (.v bad) 10
+      emit (.set v (.opnd (.v t)))
+    | .overI | .modI =>
+      let bad ← binv .i1 .eq b (ki 0)
+      let d ← newVar .i64
+      emit (.set d (.select (.v bad) (ki 1) b))
+      deferFail (.v bad) 11
+      emit (.set v (.bin (if bop == .overI then .overW else .modW) a (.v d)))
+    | .addF | .subF | .mulF =>
+      -- a NaN or infinity survives + - *: the result is tested where the chain ends
+      -- (`flushPending`), not at every step
+      let w : BinOp := match bop with | .addF => .addFW | .subF => .subFW | _ => .mulFW
+      let t ← binv .f64 w a b
+      emit (.set v (.opnd (.v t)))
+      modify fun st => { st with pendingF := v :: st.pendingF }
+    | .divF =>
+      flushPending
+      let bad ← binv .i1 .eq b (.k .f64 (.f 0.0))
+      let d ← newVar .f64
+      emit (.set d (.select (.v bad) (.k .f64 (.f 1.0)) b))
+      deferFail (.v bad) 13
+      emit (.set v (.bin .divFW a (.v d)))
+    | _ => emit (.set v (.bin bop a b))
+
+/-- A monadic operation; `entier`, `round` and `repr` trap and are not deferred. -/
+def emitUn (v : Var) (uop : UnOp) (a : Opnd) : L Unit := do
+  match uop with
+  | .entier | .round | .reprI => modify fun st => { st with hardTraps := st.hardTraps + 1 }
+  | _ => pure ()
+  emit (.set v (.un uop a))
+
 /-- The layout of the runtime's objects (`csrc/a68rt.h`). -/
 def T_ROW : Int := 9
 def K_LEAF : Int := 2
@@ -448,40 +541,79 @@ def prowOf (d s : Nat) : L (Option PRow) := do
 
 /-- The element offset of `a[i]` or `a[i, j]` in a promoted row, with the evaluator's
     subscript checks (`CodeGen: a68_ao`). -/
-def prowIndex (pr : PRow) (is : Array Opnd) : L Var := do
+def prowIndex (pr : PRow) (is : Array Opnd) (ranges : Array (Option (Int × Int)) := #[]) : L Var := do
+  let deferring := (← get).defer.isSome
   let mut idx : Option Var := none
+  let mut allIn : Option Var := none
   for k in [0:pr.dims] do
     let i := is[k]!
     let l := pr.lo[k]!; let u := pr.hi[k]!
+    -- a subscript whose interval lies within the declared literal bounds needs no check
+    let inRange : Bool := match (ranges[k]?).join, pr.litBounds with
+      | some (a, b), some bs => match bs[k]? with
+        | some (lo, hi) => lo ≤ a && b ≤ hi
+        | none => false
+      | _, _ => false
+    if inRange then
+      let t ← binv .i64 .subW i (.v l)
+      idx ← match idx with
+        | none => pure (some t)
+        | some prev =>
+          let m ← binv .i64 .mulW (.v prev) (.v pr.ext1)
+          pure (some (← binv .i64 .addW (.v m) (.v t)))
+      continue
     let ge ← binv .i1 .ge i (.v l)
     let le ← binv .i1 .le i (.v u)
     let inb ← binv .i1 .andB (.v ge) (.v le)
-    let errB ← newBlock
-    guard (.v inb) errB
-    let cur := (← get).fb.cur
-    switchTo errB
-    rt "a68rt_index_error" #[i, .v l, .v u]
-    terminate .unreachable
-    switchTo cur
+    if deferring then
+      let out ← newVar .i1; emit (.set out (.un .notB (.v inb)))
+      deferFail (.v out) 1 (some (i, .v l, .v u))
+      allIn ← match allIn with
+        | none => pure (some inb)
+        | some prev => pure (some (← binv .i1 .andB (.v prev) (.v inb)))
+    else
+      let errB ← newBlock
+      guard (.v inb) errB
+      let cur := (← get).fb.cur
+      switchTo errB
+      rt "a68rt_index_error" #[i, .v l, .v u]
+      terminate .unreachable
+      switchTo cur
     let t ← binv .i64 .subW i (.v l)
     idx ← match idx with
       | none => pure (some t)
       | some prev =>
         let m ← binv .i64 .mulW (.v prev) (.v pr.ext1)
         pure (some (← binv .i64 .addW (.v m) (.v t)))
-  return idx.get!
+  match allIn with
+  | some ok =>
+    -- a subscript out of bounds has been recorded: the access is made safe
+    let c ← newVar .i64
+    emit (.set c (.select (.v ok) (.v idx.get!) (ki 0)))
+    return c
+  | none => return idx.get!
 
 /-- Field `f` of the element at offset `idx`, as its MIR type; undefined is reported. -/
 def prowGet (pr : PRow) (f : Nat) (idx : Var) : L Var := do
+  let pid := pr.data[0]!.id
+  modify fun st =>
+    let seen := if st.prowSeen.any (·.data[0]!.id == pid) then st.prowSeen else pr :: st.prowSeen
+    { st with prowReads := st.prowReads.push pid, prowSeen := seen }
   let (info, ty, _) := pr.fields[f]!
-  let flag ← ld "i8" .i64 pr.flags[f]! (.v idx) KLEAF
-  let undefB ← newBlock
-  guard (.v (← binv .i1 .ne (.v flag) (ki 0))) undefB
-  let cur := (← get).fb.cur
-  switchTo undefB
-  rt "a68rt_undef_error" #[ku info.kind]
-  terminate .unreachable
-  switchTo cur
+  if pr.known[f]?.getD false then pure ()   -- every element defined: no test
+  else if (← get).defer.isSome then
+    let flag ← ld "i8" .i64 pr.flags[f]! (.v idx) KLEAF
+    let undef ← binv .i1 .eq (.v flag) (ki 0)
+    deferFail (.v undef) (2 + info.kind)
+  else
+    let flag ← ld "i8" .i64 pr.flags[f]! (.v idx) KLEAF
+    let undefB ← newBlock
+    guard (.v (← binv .i1 .ne (.v flag) (ki 0))) undefB
+    let cur := (← get).fb.cur
+    switchTo undefB
+    rt "a68rt_undef_error" #[ku info.kind]
+    terminate .unreachable
+    switchTo cur
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
   let raw ← ld info.w (if info.w == "f64" then .f64 else .i64) pr.data[f]! (.v eoff) KLEAF
   match ty with
@@ -491,6 +623,10 @@ def prowGet (pr : PRow) (f : Nat) (idx : Var) : L Var := do
 
 /-- Write field `f` of the element at offset `idx` and mark it defined. -/
 def prowSet (pr : PRow) (f : Nat) (idx : Var) (v : Opnd) : L Unit := do
+  let pid := pr.data[0]!.id
+  modify fun st =>
+    let seen := if st.prowSeen.any (·.data[0]!.id == pid) then st.prowSeen else pr :: st.prowSeen
+    { st with prowWrites := st.prowWrites.push pid, prowSeen := seen }
   let (info, _, _) := pr.fields[f]!
   st "i8" pr.flags[f]! (.v idx) (ki 1) KLEAF
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
@@ -899,6 +1035,7 @@ def readPVar (pv : PVar) : L Opnd := do
   match pv.flag with
   | none => return .v pv.v
   | some fl =>
+    modify fun st => { st with hardTraps := st.hardTraps + 1 }
     let ok ← newBlock; let bad ← newBlock
     terminate (.condBr (.v fl) ok bad)
     switchTo bad
@@ -1185,6 +1322,21 @@ partial def jumpFreeSet (rs : List (Nat × Core)) : List Nat := Id.run do
 def popFrame : L Unit :=
   modify fun s => { s with fb := { s.fb with frames := s.fb.frames.tail } }
 
+/-- Does the loop body jump, loop by a WHILE (possibly forever), or leave a block by a
+    label or EXIT?  Such a body cannot have its traps deferred to the loop's end. -/
+partial def hasJumpsOrWhile (c : Core) : Bool :=
+  match c with
+  | .goto _ => true
+  | .loop _ f b t w body =>
+    w.isSome || hasJumpsOrWhile f || hasJumpsOrWhile b
+      || (match t with | some e => hasJumpsOrWhile e | none => false) || hasJumpsOrWhile body
+  | .block _ stmts _ _ =>
+    stmts.any (fun st => match st with
+      | .label _ | .exit => true
+      | .decl _ _ init => hasJumpsOrWhile init
+      | .unit e => hasJumpsOrWhile e)
+  | _ => (CodeGen.childrenD c).any fun (_, ch) => hasJumpsOrWhile ch
+
 /-- The runtime entry points that change no cell and no row store: a loop calling only
     these (outside its slow paths) may keep what it knows about a row in variables. -/
 def harmlessRt : List String :=
@@ -1196,6 +1348,119 @@ def harmlessRt : List String :=
     "a68rt_pop_bits", "a68rt_pop", "a68rt_jump_pending", "a68rt_jump_clear", "a68rt_index_error",
     "a68rt_undef_error", "a68rt_arith_error", "a68rt_conforms", "a68rt_frame_cells",
     "a68rt_env_depth", "a68rt_stack_depth", "a68rt_env_truncate", "a68rt_stack_truncate" ]
+
+/-- Mark field `f` (every field when `none`) of promoted row `s` of the innermost frame as
+    known defined, or not. -/
+def setKnown (s : Nat) (f : Option Nat) (val : Bool) : L Unit :=
+  modify fun st => match st.fb.frames with
+    | fr :: rest =>
+      match (fr.rows[s]?).join with
+      | some pr =>
+        let known := if pr.known.isEmpty then Array.replicate pr.fields.size false else pr.known
+        let known := match f with
+          | some k => known.set! k val
+          | none => known.map fun _ => val
+        { st with fb := { st.fb with frames := { fr with rows := fr.rows.set! s (some { pr with known := known }) } :: rest } }
+      | none => st
+    | [] => st
+
+/-- Are two bounds the same expression, evaluated at the same level: the same literal, or
+    the same cell? -/
+def sameBound (a b : Core) : Bool :=
+  match CodeGen.strip a, CodeGen.strip b with
+  | .lit (.int x), .lit (.int y) => x == y
+  | .loadCell d1 s1, .loadCell d2 s2 => d1 == d2 && s1 == s2
+  | _, _ => false
+
+/-- The elements a loop nest writes for every index of a row declared in the innermost
+    frame with bounds `decl`: the loop nest must run over exactly those bounds by 1, its
+    body must be assignments (in a sequence, possibly in a block without declarations or
+    labels) to `a[i]`, `a[i, j]` or `f OF a[i]`, indexed by the counters, of defined
+    values.  Returns the row slots and the field (none for the whole element) so written. -/
+partial def initTargets (decl : Nat → Option (List (Core × Core))) (e : Core) : List (Nat × Option Nat) :=
+  go e [] 0
+where
+  -- `bounds` collected so far (outermost first); `extra`: block levels between the loops
+  go (e : Core) (bounds : List (Core × Core)) (extra : Nat) : List (Nat × Option Nat) :=
+    match e with
+    | .at _ e' | .voiding e' => go e' bounds extra
+    | .loop (some _) f (.lit (.int 1)) (some t) none body =>
+      if bounds.length ≥ 2 then [] else go body (bounds ++ [(f, t)]) 0
+    | .loop _ _ _ _ _ _ => []
+    | _ =>
+      if bounds.isEmpty then [] else
+      let dims := bounds.length
+      stmtsOf e extra |>.filterMap fun st => target st dims bounds
+  -- the units of a body: a sequence, or a block without declarations or labels
+  stmtsOf (e : Core) (extra : Nat) : List (Core × Nat) :=
+    match e with
+    | .at _ e' | .voiding e' => stmtsOf e' extra
+    | .seq a b => stmtsOf a extra ++ stmtsOf b extra
+    | .block _ stmts _ _ =>
+      if stmts.any (fun st => match st with | .unit _ => false | _ => true) then []
+      else stmts.toList.flatMap fun st => match st with
+        | .unit u => stmtsOf u (extra + 1)
+        | _ => []
+    | e' => [(e', extra)]
+  target (st : Core × Nat) (dims : Nat) (bounds : List (Core × Core)) : Option (Nat × Option Nat) :=
+    let (e, extra) := st
+    match CodeGen.strip e with
+    | .assign dst src _ =>
+      if (match CodeGen.strip src with | .lit .undef => true | _ => false) then none else
+      match CodeGen.strip dst with
+      | .slice base idx true => elem base idx dims extra none bounds
+      | .select f (.slice base idx true) true => elem base idx dims extra (some f) bounds
+      | _ => none
+    | _ => none
+  elem (base : Core) (idx : List CoreIdx) (dims extra : Nat) (f : Option Nat) (bounds : List (Core × Core)) : Option (Nat × Option Nat) :=
+    match CodeGen.strip base with
+    | .refCell dd s =>
+      if dd != extra + dims || idx.length != dims then none else
+      let ok := (List.range dims).all fun k => match idx[k]! with
+        | .index ie => (match CodeGen.strip ie with | .loadCell d 0 => d == extra + dims - 1 - k | _ => false)
+        | _ => false
+      if !ok then none else
+      -- the loop bounds must be the declared ones
+      match decl s with
+      | some bs =>
+        if bs.length == dims && (List.range dims).all (fun k =>
+              sameBound (bs[k]!).1 (bounds[k]!).1 && sameBound (bs[k]!).2 (bounds[k]!).2)
+        then some (s, f) else none
+      | none => none
+    | _ => none
+
+/-- The runtime entry points a loop may call and still be run twice: they change nothing
+    a second run could see differently. -/
+def repeatableRt : List String :=
+  [ "a68rt_enter", "a68rt_leave", "a68rt_cell_int", "a68rt_cell_real", "a68rt_cell_bool",
+    "a68rt_cell_char", "a68rt_cell_bits", "a68rt_cell_isnil", "a68rt_cell_cproc", "a68rt_push_int",
+    "a68rt_push_real", "a68rt_push_bool", "a68rt_push_char", "a68rt_push_bits", "a68rt_pop_int",
+    "a68rt_pop_real", "a68rt_pop_bool", "a68rt_pop_char", "a68rt_pop_bits", "a68rt_pop",
+    "a68rt_jump_pending", "a68rt_conforms", "a68rt_frame_cells", "a68rt_env_depth", "a68rt_stack_depth",
+    -- the checks: those that cannot be deferred are counted separately (`hardTraps`)
+    "a68rt_index_error", "a68rt_undef_error", "a68rt_arith_error" ]
+
+/-- Do blocks `[from, to)` call only what a second run may repeat, and reach no row through
+    the runtime (no slow path)?  The registers a second run must restore are those assigned
+    in the blocks that existed before it (`v0`). -/
+def repeatable (from_ to v0 : Nat) : L (Bool × List Var) := do
+  let st ← get
+  let ok (f : Callee) : Bool := match f with
+    | .rt name => repeatableRt.contains name
+    | .nat _ => true
+    | _ => false
+  let mut mods : List Var := []
+  for b in [from_:to] do
+    let some blk := st.fb.blocks[b]? | continue
+    for ins in blk.instrs do
+      match ins with
+      | .call f _ => if !ok f then return (false, [])
+      | .set d (.call f _) =>
+        if !ok f then return (false, [])
+        if d.id < v0 && !mods.any (·.id == d.id) then mods := d :: mods
+      | .set d _ => if d.id < v0 && !mods.any (·.id == d.id) then mods := d :: mods
+      | _ => pure ()
+  return (true, mods)
 
 /-- Does every runtime call in blocks `[from, to)` outside the slow paths leave cells and
     row stores alone?  A call of a routine may do anything. -/
@@ -1316,6 +1581,7 @@ partial def lower (c : Core) : L Res := do
     | .lit (.builtin n), [arg] =>
       if CodeGen.nativeMathFns.contains n && (← modeOf arg) == some (.real 0) then
         let x ← toScalar (← lower arg) (.real 0)
+        flushPending
         let v ← newVar .f64
         emit (.set v (.un (.math n) x))
         return .sc (.v v)
@@ -1432,6 +1698,41 @@ partial def cellBase (base : Core) : L (Option (Nat × Nat × Bool)) := do
     | _ => return none
   | _ => return none
 
+/-- The interval of an INT expression, when it is known: a literal, a loop counter with
+    literal bounds, and sums, differences and products by constants of such. -/
+partial def intervalOf (c : Core) : L (Option (Int × Int)) := do
+  match c with
+  | .at _ e => intervalOf e
+  | .lit (.int n) => return some (n, n)
+  | .loadCell d s =>
+    match ← pvarOf d s with
+    | some pv => return pv.range
+    | none => return none
+  | .dyop op m1 m2 l r =>
+    if (← resolve m1) != .int 0 || (← resolve m2) != .int 0 then return none
+    match op, ← intervalOf l, ← intervalOf r with
+    | "+", some (a, b), some (c', d) => return some (a + c', b + d)
+    | "-", some (a, b), some (c', d) => return some (a - d, b - c')
+    | "*", some (a, b), some (c', d) =>
+      let ps := [a * c', a * d, b * c', b * d]
+      return some (ps.foldl min (a * c'), ps.foldl max (a * c'))
+    | _, _, _ => return none
+  | _ => return none
+
+/-- The subscripts of a promoted row access: each lowered to a scalar, with its interval
+    for the bounds check, then the element offset. -/
+partial def prowIdx (pr : PRow) (idx : List CoreIdx) : L (Option Var) := do
+  if idx.length != pr.dims then return none
+  let mut is : Array Opnd := #[]
+  let mut ranges : Array (Option (Int × Int)) := #[]
+  for ix in idx do
+    match ix with
+    | .index e =>
+      ranges := ranges.push (← intervalOf e)
+      is := is.push (← toScalar (← lower e) (.int 0))
+    | _ => return none
+  return some (← prowIndex pr is ranges)
+
 /-- `a[i]` or `a[i, j]` on a row a cell holds, of a primitive element mode: one runtime call
     that checks the bounds and reads the element (`a68rt_row_int` and its relatives). -/
 partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
@@ -1439,13 +1740,8 @@ partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
   -- a promoted row: the element from its arrays
   match ← prowOf d s with
   | some pr =>
-    if idx.length != pr.dims || pr.fields.size != 1 then return none
-    let mut is : Array Opnd := #[]
-    for ix in idx do
-      match ix with
-      | .index e => is := is.push (← toScalar (← lower e) (.int 0))
-      | _ => return none
-    let ix ← prowIndex pr is
+    if pr.fields.size != 1 then return none
+    let some ix ← prowIdx pr idx | return none
     return some (.sc (.v (← prowGet pr 0 ix)))
   | none => pure ()
   let some m ← slotMode d s | return none
@@ -1533,16 +1829,10 @@ partial def selRead (c : Core) : L (Option Res) := do
     | some (d, s, false) =>
       match ← prowOf d s with
       | some pr =>
-        if idx.length == pr.dims && f < pr.fields.size then
-          let mut is : Array Opnd := #[]
-          let mut ok := true
-          for ix in idx do
-            match ix with
-            | .index e => is := is.push (← toScalar (← lower e) (.int 0))
-            | _ => ok := false
-          if ok then
-            let ixv ← prowIndex pr is
-            return some (.sc (.v (← prowGet pr f ixv)))
+        if f < pr.fields.size then
+          match ← prowIdx pr idx with
+          | some ixv => return some (.sc (.v (← prowGet pr f ixv)))
+          | none => pure ()
       | none => pure ()
     | _ => pure ()
   | _ => pure ()
@@ -1604,15 +1894,10 @@ partial def storeTyped (dst src : Core) : L Bool := do
       match ← prowOf d s with
       | some pr =>
         if idx.length != pr.dims then return false
-        let mut is : Array Opnd := #[]
-        for ix in idx do
-          match ix with
-          | .index e => is := is.push (← toScalar (← lower e) (.int 0))
-          | _ => return false
         if pr.fields.size == 1 then
           let (_, _, em) := pr.fields[0]!
+          let some ix ← prowIdx pr idx | return false
           let v ← toScalar (← lower src) em
-          let ix ← prowIndex pr is
           prowSet pr 0 ix v
           return true
         else
@@ -1620,6 +1905,7 @@ partial def storeTyped (dst src : Core) : L Bool := do
           | .collateral es _ _ =>
             if es.length != pr.fields.size then return false
             -- the fields in order, then the stores (`CodeGen`: a structure display into an element)
+            let some ix ← prowIdx pr idx | return false
             let mut vs : Array (Option Opnd) := #[]
             let mut k := 0
             for e in es do
@@ -1628,11 +1914,12 @@ partial def storeTyped (dst src : Core) : L Bool := do
               | .lit .undef => vs := vs.push none
               | _ => vs := vs.push (some (← toScalar (← lower e) em))
               k := k + 1
-            let ix ← prowIndex pr is
             for f in [0:pr.fields.size] do
               match vs[f]! with
               | some v => prowSet pr f ix v
-              | none => st "i8" pr.flags[f]! (.v ix) (ki 0) KLEAF
+              | none =>
+                st "i8" pr.flags[f]! (.v ix) (ki 0) KLEAF
+                if d == 0 then setKnown s (some f) false
             return true
           | _ => return false
       | none => pure ()
@@ -1642,15 +1929,10 @@ partial def storeTyped (dst src : Core) : L Bool := do
     | some (d, s, false) =>
       match ← prowOf d s with
       | some pr =>
-        if idx.length != pr.dims || f ≥ pr.fields.size then return false
-        let mut is : Array Opnd := #[]
-        for ix in idx do
-          match ix with
-          | .index e => is := is.push (← toScalar (← lower e) (.int 0))
-          | _ => return false
+        if f ≥ pr.fields.size then return false
+        let some ix ← prowIdx pr idx | return false
         let (_, _, em) := pr.fields[f]!
         let v ← toScalar (← lower src) em
-        let ix ← prowIndex pr is
         prowSet pr f ix v
         return true
       | none => pure ()
@@ -1749,7 +2031,7 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := d
     | some pv =>
       let cur ← readPVar pv
       let v ← newVar pv.v.ty
-      emit (.set v (.bin bop cur rs))
+      emitBin v bop cur rs
       writePVar pv (.v v)
       return true
     | none =>
@@ -1757,26 +2039,21 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := d
       if (← resolve sm) != tmr then return false
       let cur ← rtv (cellFn tmr) #[ku (← rtd dd), ku ss]
       let v ← newVar cur.ty
-      emit (.set v (.bin bop (.v cur) rs))
+      emitBin v bop (.v cur) rs
       rt (setCellFn tmr) #[ku (← rtd dd), ku ss, .v v]
       return true
   | .select f (.slice base idx true) true =>
     -- `f OF a[i] +:= e` on a promoted row of structures
     let some (d, s, false) ← cellBase base | return false
     let some pr ← prowOf d s | return false
-    if idx.length != pr.dims || f ≥ pr.fields.size then return false
+    if f ≥ pr.fields.size then return false
     let (_, _, em) := pr.fields[f]!
     if (← resolve em) != tmr then return false
-    let mut is : Array Opnd := #[]
-    for ix in idx do
-      match ix with
-      | .index e => is := is.push (← toScalar (← lower e) (.int 0))
-      | _ => return false
+    let some ixv ← prowIdx pr idx | return false
     let rs ← toScalar (← lower r) m2
-    let ixv ← prowIndex pr is
     let cur ← prowGet pr f ixv
     let v ← newVar cur.ty
-    emit (.set v (.bin bop (.v cur) rs))
+    emitBin v bop (.v cur) rs
     prowSet pr f ixv (.v v)
     return true
   | .slice base idx true =>
@@ -1784,19 +2061,14 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := d
     let some (d, s, false) ← cellBase base | return false
     match ← prowOf d s with
     | some pr =>
-      if idx.length != pr.dims || pr.fields.size != 1 then return false
+      if pr.fields.size != 1 then return false
       let (_, _, em) := pr.fields[0]!
       if (← resolve em) != tmr then return false
-      let mut is : Array Opnd := #[]
-      for ix in idx do
-        match ix with
-        | .index e => is := is.push (← toScalar (← lower e) (.int 0))
-        | _ => return false
+      let some ixv ← prowIdx pr idx | return false
       let rs ← toScalar (← lower r) m2
-      let ixv ← prowIndex pr is
       let cur ← prowGet pr 0 ixv
       let v ← newVar cur.ty
-      emit (.set v (.bin bop (.v cur) rs))
+      emitBin v bop (.v cur) rs
       prowSet pr 0 ixv (.v v)
       return true
     | none => pure ()
@@ -1816,7 +2088,7 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := d
       | _ => ("a68rt_row_char", "a68rt_set_row_char")
     let cur ← rtv rd #[ku (← rtd d), ku s, ku dims, is[0]!, j]
     let v ← newVar cur.ty
-    emit (.set v (.bin bop (.v cur) rs))
+    emitBin v bop (.v cur) rs
     rt wr #[ku (← rtd d), ku s, ku dims, is[0]!, j, .v v]
     return true
   | _ => return false
@@ -2125,10 +2397,10 @@ partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
           if nn &&& bit != 0 then
             match p with
             | none => p := some mm
-            | some pv => let v ← newVar .i64; emit (.set v (.bin .mulI pv mm)); p := some (.v v)
+            | some pv => let v ← newVar .i64; emitBin v .mulI pv mm; p := some (.v v)
           bit := bit <<< 1
           if bit ≤ nn then
-            let v ← newVar .i64; emit (.set v (.bin .mulI mm mm)); mm := .v v
+            let v ← newVar .i64; emitBin v .mulI mm mm; mm := .v v
           else break
         return .sc (p.getD a)
     | _ => pure ()
@@ -2138,7 +2410,7 @@ partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
     let a ← toScalar (← lower l) r1
     let b ← toScalar (← lower r) r2
     let v ← newVar ((tyOf (← resolve res)).getD .i1)
-    emit (.set v (.bin bop a b))
+    emitBin v bop a b
     return .sc (.v v)
   | _, _, _ => general
 
@@ -2155,7 +2427,7 @@ partial def lowerMonop (op : String) (m : Mode) (e : Core) : L Res := do
   | some _, some uop, some res =>
     let x ← toScalar (← lower e) mr
     let v ← newVar ((tyOf (← resolve res)).getD .i64)
-    emit (.set v (.un uop x))
+    emitUn v uop x
     return .sc (.v v)
   | some _, none, some _ =>
     if isPlus op then lower e else do
@@ -2217,8 +2489,8 @@ partial def lowerCondInto (dest : Dest) (cc t e : Core) : L Unit := do
   let cond ← toScalar (← lower cc) .bool
   let tb ← newBlock; let eb ← newBlock; let done ← newBlock
   terminate (.condBr cond tb eb)
-  switchTo tb; lowerInto dest t; terminate (.br done)
-  switchTo eb; lowerInto dest e; terminate (.br done)
+  switchTo tb; lowerInto dest t; flushPending; terminate (.br done)
+  switchTo eb; lowerInto dest e; flushPending; terminate (.br done)
   switchTo done
 
 /-- Compute `c` into the destination: a scalar variable, or the stack. -/
@@ -2254,10 +2526,12 @@ partial def lowerCaseInto (dest : Dest) (sel : Core) (alts : List Core) (out : C
   for a in alts do
     switchTo blocks[i]!
     lowerInto dest a
+    flushPending
     terminate (.br done)
     i := i + 1
   switchTo dflt
   lowerInto dest out
+  flushPending
   terminate (.br done)
   switchTo done
 
@@ -2377,6 +2651,7 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
           lowerInto dest body
           popFrame
         | none => lowerInto dest body
+        flushPending
         terminate (.br done)
         switchTo no
       lowerInto dest out
@@ -2419,12 +2694,28 @@ partial def lowerLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
   -- before the loop, the descriptor and store are read once before the loop and kept in
   -- variables (recomputed after any slow path), so that the accesses are register-based.
   let snapshot ← get
-  modify fun st => { st with rowUses := #[], slowRanges := #[], cellCalls := #[] }
+  modify fun st => { st with rowUses := #[], slowRanges := #[], cellCalls := #[], hardTraps := 0,
+                             prowReads := #[], prowWrites := #[], prowSeen := [] }
+  let v0 := (← get).fb.vars.size
   let blk0 := (← get).fb.blocks.size
   lowerLoopBody slot from_ by_ to_ w body
   let blk1 := (← get).fb.blocks.size
   let uses := (← get).rowUses
   let safe ← callFree blk0 blk1
+  -- may the loop's checks be deferred to its end?  Only a counted loop, outside another
+  -- such region and not in a second run, whose body is repeatable (calls only what a
+  -- second run may repeat, reaches no row through the runtime, reads no promoted row it
+  -- writes), has no jump, WHILE or label, and emits no check that cannot be deferred
+  let trialSt ← get
+  let (rep, mods) ← repeatable blk0 blk1 v0
+  -- the promoted rows the loop both reads and writes: a second run needs them as they
+  -- were, so they are copied before the loop (a loop long enough to be worth the copy)
+  let rw : List PRow := trialSt.prowSeen.filter fun pr =>
+    trialSt.prowWrites.contains pr.data[0]!.id && trialSt.prowReads.contains pr.data[0]!.id
+  let deferOK := w.isNone && snapshot.defer.isNone && !snapshot.noDefer && rep
+    && (rw.isEmpty || to_.isSome)
+    && trialSt.slowRanges.isEmpty && trialSt.cellCalls.isEmpty && trialSt.hardTraps == 0
+    && !hasJumpsOrWhile body
   set snapshot
   let mut added : List RowCache := []
   if safe then
@@ -2446,11 +2737,104 @@ partial def lowerLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
       slowPath.recache c
       added := c :: added
   modify fun st => { st with caches := added ++ st.caches }
-  lowerLoopBody slot from_ by_ to_ w body
+  if deferOK then
+    let cont ← newBlock
+    -- with rows to copy: only a loop of at least 32 steps that covers its rows takes the
+    -- fast form; otherwise the loop is lowered as usual (its inner loops may still form
+    -- regions of their own)
+    let checkedB ← newBlock
+    if !rw.isEmpty then
+      let some tv := to_ | pure ()
+      -- the number of steps: (to - from) / by + 1 (a zero step: never worth it)
+      let n ← binv .i64 .subW tv from_
+      let byZero ← binv .i1 .eq by_ (ki 0)
+      let b1 ← newVar .i64; emit (.set b1 (.select (.v byZero) (ki 1) by_))
+      let steps ← binv .i64 .overW (.v n) (.v b1)
+      let n1 ← binv .i64 .addW (.v steps) (ki 1)
+      -- a copy is worth it only for a loop of at least 32 steps that covers at least an
+      -- eighth of every row it would copy
+      let mut short ← binv .i1 .lt (.v n1) (ki 32)
+      short ← binv .i1 .orB (.v short) (.v byZero)
+      for pr in rw do
+        let e0 ← binv .i64 .subW (.v pr.hi[0]!) (.v pr.lo[0]!)
+        let e0 ← binv .i64 .addW (.v e0) (ki 1)
+        let cnt ← binv .i64 .mulW (.v e0) (.v pr.ext1)
+        let work ← binv .i64 .mulW (.v n1) (ki 8)
+        let small ← binv .i1 .lt (.v work) (.v cnt)
+        short ← binv .i1 .orB (.v short) (.v small)
+      let fastB ← newBlock; let normalB ← newBlock
+      terminate (.condBr (.v short) normalB fastB)
+      switchTo normalB
+      lowerLoopBody slot from_ by_ to_ w body
+      terminate (.br cont)
+      switchTo fastB
+      -- the copies: the elements and defined bytes of each such row, into shadows
+      -- allocated on first use
+      for pr in rw do
+        let e0 ← binv .i64 .subW (.v pr.hi[0]!) (.v pr.lo[0]!)
+        let e0 ← binv .i64 .addW (.v e0) (ki 1)
+        let neg ← binv .i1 .lt (.v e0) (ki 0)
+        let cnt0 ← newVar .i64; emit (.set cnt0 (.select (.v neg) (ki 0) (.v e0)))
+        let cnt ← binv .i64 .mulW (.v cnt0) (.v pr.ext1)
+        for f in [0:pr.fields.size] do
+          let (info, _, _) := pr.fields[f]!
+          let bytes ← binv .i64 .mulW (.v cnt) (ki info.es)
+          for (sh, src, nb) in [(pr.shadowD[f]!, pr.data[f]!, bytes), (pr.shadowF[f]!, pr.flags[f]!, cnt)] do
+            let isNull ← binv .i1 .eq (.v sh) (.k .ptr (.i 0))
+            let allocB ← newBlock; let haveB ← newBlock
+            terminate (.condBr (.v isNull) allocB haveB)
+            switchTo allocB
+            let p ← natv "a68n_alloc" .ptr #[.v nb]
+            emit (.set sh (.opnd (.v p)))
+            terminate (.br haveB)
+            switchTo haveB
+            emit (.call (.nat "a68n_memcpy") #[.v sh, .v src, .v nb])
+    -- the registers the loop assigns, saved for a second run
+    let mut saved : List (Var × Var) := []
+    for v in mods do
+      let sv ← newVar v.ty
+      emit (.set sv (.opnd (.v v)))
+      saved := (v, sv) :: saved
+    let bad ← newVar .i1
+    emit (.set bad (.opnd (kb false)))
+    modify fun st => { st with defer := some { bad := bad } }
+    lowerLoopBody slot from_ by_ to_ w body
+    flushPending
+    modify fun st => { st with defer := none }
+    -- a failure: back to the entry state, then the loop again with its checks in place,
+    -- which stops at the first failure as the evaluator does
+    let rerunB ← newBlock
+    terminate (.condBr (.v bad) rerunB cont)
+    switchTo rerunB
+    for (v, sv) in saved do emit (.set v (.opnd (.v sv)))
+    for pr in rw do
+      let e0 ← binv .i64 .subW (.v pr.hi[0]!) (.v pr.lo[0]!)
+      let e0 ← binv .i64 .addW (.v e0) (ki 1)
+      let neg ← binv .i1 .lt (.v e0) (ki 0)
+      let cnt0 ← newVar .i64; emit (.set cnt0 (.select (.v neg) (ki 0) (.v e0)))
+      let cnt ← binv .i64 .mulW (.v cnt0) (.v pr.ext1)
+      for f in [0:pr.fields.size] do
+        let (info, _, _) := pr.fields[f]!
+        let bytes ← binv .i64 .mulW (.v cnt) (ki info.es)
+        emit (.call (.nat "a68n_memcpy") #[.v pr.data[f]!, .v pr.shadowD[f]!, .v bytes])
+        emit (.call (.nat "a68n_memcpy") #[.v pr.flags[f]!, .v pr.shadowF[f]!, .v cnt])
+    terminate (.br checkedB)
+    switchTo checkedB
+    modify fun st => { st with noDefer := true }
+    lowerLoopBody slot from_ by_ to_ w body
+    modify fun st => { st with noDefer := false }
+    terminate (.br cont)
+    switchTo cont
+  else
+    lowerLoopBody slot from_ by_ to_ w body
   modify fun st => { st with caches := st.caches.drop added.length }
 
 /-- The loop proper, from its evaluated bounds. -/
 partial def lowerLoopBody (slot : Option Nat) (from_ by_ : Opnd) (to_ : Option Opnd) (w : Option Core) (body : Core) : L Unit := do
+  -- a counter running by 1 between literal bounds has a known interval
+  let counterRange : Option (Int × Int) := match from_, by_, to_ with
+    | .k _ (.i a), .k _ (.i 1), some (.k _ (.i b)) => if a ≤ b then some (a, b) else none
+    | _, _, _ => none
   let i ← newVar .i64
   emit (.set i (.opnd from_))
   let head ← newBlock; let bodyB ← newBlock; let exitB ← newBlock; let stepB ← newBlock
@@ -2485,7 +2869,7 @@ partial def lowerLoopBody (slot : Option Nat) (from_ by_ : Opnd) (to_ : Option O
     | some sl => rt "a68rt_set_int" #[ku 0, ku sl, .v i]
     | none => pure ()
   pushFrame (if slot.isSome then #[some (.int 0)] else #[])
-    (if promote && slot.isSome then #[some { v := i, m := .int 0 }] else #[]) pushed cells
+    (if promote && slot.isSome then #[some { v := i, m := .int 0, range := counterRange }] else #[]) pushed cells
   match w with
   | some wc =>
     let cnd ← toScalar (← lower wc) .bool
@@ -2497,12 +2881,13 @@ partial def lowerLoopBody (slot : Option Nat) (from_ by_ : Opnd) (to_ : Option O
     switchTo go
   | none => pure ()
   lowerVoid body
+  flushPending
   popFrame
   if pushed then rt "a68rt_leave"
   terminate (.br stepB)
   switchTo stepB
   let ni ← newVar .i64
-  emit (.set ni (.bin .addI (.v i) by_))
+  emitBin ni .addI (.v i) by_
   emit (.set i (.opnd (.v ni)))
   terminate (.br head)
   switchTo exitB
@@ -2534,6 +2919,24 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       | none => pure ()
       pvars := pvars.push (some { v := v, m := m, flag := flag })
     | _, _ => pvars := pvars.push none
+  -- a non-flexible row variable declared by a generator with literal, non-empty bounds
+  -- keeps those bounds for life
+  let mut bounds : Array (Option (List (Int × Int))) := Array.replicate size none
+  for st in stmts do
+    match st with
+    | .decl sl m init =>
+      if sl < size then
+        match ← resolve m, CodeGen.strip init with
+        | .row dims false _, .newRow bs _ false =>
+          let lits : Option (List (Int × Int)) := bs.mapM fun (l, u) =>
+            match CodeGen.strip l, CodeGen.strip u with
+            | .lit (.int lo), .lit (.int hi) => if lo ≤ hi then some (lo, hi) else none
+            | _, _ => none
+          match lits with
+          | some ls => if ls.length == dims then bounds := bounds.set! sl (some ls)
+          | none => pure ()
+        | _, _ => pure ()
+    | _ => pure ()
   -- rows that never escape become native arrays (the C back end's analysis decides)
   let mut prows : Array (Option PRow) := #[]
   for i in [0:size] do
@@ -2554,11 +2957,13 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
         lo := lo.push (← newVar .i64); hi := hi.push (← newVar .i64)
       let ext1 ← newVar .i64
       let mut data : Array Var := #[]; let mut flags : Array Var := #[]
+      let mut shadowD : Array Var := #[]; let mut shadowF : Array Var := #[]
       for _ in [0:fields.size] do
-        let dv ← newVar .ptr; let fv ← newVar .ptr
-        emit (.set dv (.opnd (.k .ptr (.i 0)))); emit (.set fv (.opnd (.k .ptr (.i 0))))
-        data := data.push dv; flags := flags.push fv
-      prows := prows.push (some { dims := rv.dims, lo := lo, hi := hi, ext1 := ext1, fields := fields, data := data, flags := flags })
+        let dv ← newVar .ptr; let fv ← newVar .ptr; let sd ← newVar .ptr; let sf ← newVar .ptr
+        for v in [dv, fv, sd, sf] do emit (.set v (.opnd (.k .ptr (.i 0))))
+        data := data.push dv; flags := flags.push fv; shadowD := shadowD.push sd; shadowF := shadowF.push sf
+      prows := prows.push (some { dims := rv.dims, lo := lo, hi := hi, ext1 := ext1, fields := fields, data := data, flags := flags,
+                                  litBounds := (bounds[i]?).join, shadowD := shadowD, shadowF := shadowF })
     | none => prows := prows.push none
   let pushed := plan.pushed || (List.range size).any fun i => (pvars[i]?.join).isNone && (prows[i]?.join).isNone
   -- the routines with plain entry points this block declares; a routine sees those of its
@@ -2610,25 +3015,16 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     | _ => pure ()
   modify fun s => { s with fb := { s.fb with labelBlk := s.fb.labelBlk ++ lbl } }
   let cells : Option Var ← if pushed then some <$> rtv "a68rt_enter" #[ku size] else pure none
-  -- a non-flexible row variable declared by a generator with literal, non-empty bounds
-  -- keeps those bounds for life
-  let mut bounds : Array (Option (List (Int × Int))) := Array.replicate size none
-  for st in stmts do
-    match st with
-    | .decl sl m init =>
-      if sl < size then
-        match ← resolve m, CodeGen.strip init with
-        | .row dims false _, .newRow bs _ false =>
-          let lits : Option (List (Int × Int)) := bs.mapM fun (l, u) =>
-            match CodeGen.strip l, CodeGen.strip u with
-            | .lit (.int lo), .lit (.int hi) => if lo ≤ hi then some (lo, hi) else none
-            | _, _ => none
-          match lits with
-          | some ls => if ls.length == dims then bounds := bounds.set! sl (some ls)
-          | none => pure ()
-        | _, _ => pure ()
-    | _ => pure ()
   pushFrame modes pvars pushed cells bounds prows
+  -- the bounds each promoted row was declared with, as expressions, for the definedness
+  -- analysis: a loop nest over exactly them assigning every element makes it known defined
+  let declBounds : Array (Option (List (Core × Core))) := stmts.foldl (fun acc st =>
+    match st with
+    | .decl sl _ init =>
+      match CodeGen.strip init with
+      | .newRow bs _ _ => if sl < size then acc.set! sl (some bs) else acc
+      | _ => acc
+    | _ => acc) (Array.replicate size none)
   -- the scalar mode every unit that may yield the block's value has, when they agree: the
   -- value then goes into a variable, so that it survives the frame and needs no stack
   let varTy : Option (Ty × Mode) ← if wantValue then do
@@ -2746,6 +3142,18 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
         | some (ty, v, m) => lowerInto (.var ty v m) e; produced := true; result := .sc (.v v)
         | none => let _ ← lowerStack e; produced := true; result := .stack
       else lowerVoid e
+      flushPending
+      -- a loop nest that assigns every element of a promoted row of this block leaves it
+      -- known defined for what follows (unconditionally: this is a statement of the block,
+      -- and the block has no labels a jump could skip it by)
+      if !hasLabels then
+        for (sl, f) in initTargets (fun sl => (declBounds[sl]?).join) e do
+          match (prows[sl]?).join with
+          | some pr =>
+            match f with
+            | some k => if k < pr.fields.size then setKnown sl (some k) true
+            | none => setKnown sl none true
+          | none => pure ()
     | .label id =>
       match lbl.find? (·.1 == id), depths with
       | some (_, b), some (e, s) =>
@@ -2773,6 +3181,8 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       for f in [0:pr.fields.size] do
         emit (.call (.nat "a68n_free") #[.v pr.data[f]!])
         emit (.call (.nat "a68n_free") #[.v pr.flags[f]!])
+        emit (.call (.nat "a68n_free") #[.v pr.shadowD[f]!])
+        emit (.call (.nat "a68n_free") #[.v pr.shadowF[f]!])
     | none => pure ()
   if pushed then rt "a68rt_leave"
   return (if wantValue then result else .stack)

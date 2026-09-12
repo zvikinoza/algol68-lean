@@ -253,7 +253,7 @@ def natCall (name : String) (args : Array Opnd) (dst : Option Var) : M Unit := d
 def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
   match f with
   | .nat name =>
-    if name.startsWith "mem_" || name == "jump_flag" then pure () else lineStore
+    if name.startsWith "mem_" || name == "jump_flag" || name == "set_line" then pure () else lineStore
   | _ => lineStore
   match f with
   | .fn i => line s!"  call void @a68_fn{i}()"
@@ -272,6 +272,12 @@ def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
     | some d, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"; store d t
     | _, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"
     | _, none => line s!"  call void {fp}({argText})"
+  | .nat "set_line" =>
+    let v ← opnd args[0]!
+    let v ← coerce v args[0]!.ty .i64
+    let t ← fresh; line s!"  {t} = trunc i64 {v} to i32"
+    line s!"  store i32 {t}, ptr @a68_line_no, !tbaa !16"
+    modify fun p => { p with storedLine := none }
   | .nat "jump_flag" =>
     let some d := dst | return
     let t ← fresh; line s!"  {t} = load i32, ptr @a68_jump_flag"
@@ -295,6 +301,19 @@ def bin (d : Var) (op : BinOp) (a b : Opnd) : M Unit := do
   | .addI => line s!"  {t} = add {tyName ty} {x}, {y}"; if ty == Ty.i64 then rangeCheck t
   | .subI => line s!"  {t} = sub {tyName ty} {x}, {y}"; if ty == Ty.i64 then rangeCheck t
   | .mulI => line s!"  {t} = mul {tyName ty} {x}, {y}"; if ty == Ty.i64 then rangeCheck t
+  | .overW => line s!"  {t} = sdiv i64 {x}, {y}"
+  | .modW =>
+    let neg ← fresh; line s!"  {neg} = icmp slt i64 {y}, 0"
+    let ny ← fresh; line s!"  {ny} = sub i64 0, {y}"
+    let m ← fresh; line s!"  {m} = select i1 {neg}, i64 {ny}, i64 {y}"
+    let r ← fresh; line s!"  {r} = srem i64 {x}, {m}"
+    let rn ← fresh; line s!"  {rn} = icmp slt i64 {r}, 0"
+    let r2 ← fresh; line s!"  {r2} = add i64 {r}, {m}"
+    line s!"  {t} = select i1 {rn}, i64 {r2}, i64 {r}"
+  | .addFW => line s!"  {t} = fadd double {x}, {y}"
+  | .subFW => line s!"  {t} = fsub double {x}, {y}"
+  | .mulFW => line s!"  {t} = fmul double {x}, {y}"
+  | .divFW => line s!"  {t} = fdiv double {x}, {y}"
   | .overI =>
     let z ← fresh; line s!"  {z} = icmp eq i64 {y}, 0"; trapIf z 1
     line s!"  {t} = sdiv i64 {x}, {y}"
@@ -355,6 +374,16 @@ def un (d : Var) (op : UnOp) (a : Opnd) : M Unit := do
     let c ← fresh; line s!"  {c} = or i1 {a1}, {a2}"
     trapIf c 6
     line s!"  {t} = trunc i64 {x} to i32"
+  | .nanF => line s!"  {t} = fcmp uno double {x}, {x}"
+  | .badF =>
+    -- NaN or infinite: |x| > DBL_MAX, unordered
+    use "llvm.fabs.f64"
+    let a ← fresh; line s!"  {a} = call double @llvm.fabs.f64(double {x})"
+    line s!"  {t} = fcmp ugt double {a}, 0x7FEFFFFFFFFFFFFF"
+  | .infF =>
+    let a ← fresh; line s!"  {a} = fcmp ogt double {x}, 0x7FEFFFFFFFFFFFFF"
+    let b ← fresh; line s!"  {b} = fcmp olt double {x}, 0xFFEFFFFFFFFFFFFF"
+    line s!"  {t} = or i1 {a}, {b}"
   | .negF => line s!"  {t} = fneg double {x}"
   | .absF =>
     let n ← fresh; line s!"  {n} = fcmp olt double {x}, 0.0"
@@ -384,6 +413,13 @@ def instr (i : Instr) : M Unit := do
     | .bin op a b => bin d op a b
     | .un op a => un d op a
     | .call f args => call f args (some d)
+    | .select c a b =>
+      let cv ← opnd c
+      let cv ← coerce cv c.ty .i1
+      let av ← opnd a; let av ← coerce av a.ty d.ty
+      let bv ← opnd b; let bv ← coerce bv b.ty d.ty
+      let t ← fresh; line s!"  {t} = select i1 {cv}, {tyName d.ty} {av}, {tyName d.ty} {bv}"
+      store d t
     | .natTab i =>
       let k ← opnd i
       let k ← coerce k i.ty .i64
@@ -496,13 +532,14 @@ def print (p : Program) : String := Id.run do
       let as := (sg.args.toList.map cTyName) ++ ["i32"]
       head := head.push s!"declare {retName sg.ret} @{n}({", ".intercalate as})"
     | none =>
-      if n.startsWith "mem_" || n == "jump_flag" then continue
+      if n.startsWith "mem_" || n == "jump_flag" || n == "set_line" then continue
       match natSigs.find? (·.1 == n) with
       | some (_, sg) =>
         let as := sg.args.toList.map cTyName
         head := head.push s!"declare {retName sg.ret} @{n}({", ".intercalate as})"
       | none =>
         if n.startsWith "a68n_m_" then head := head.push s!"declare double @{n}(double)"
+        else if n == "llvm.fabs.f64" then head := head.push "declare double @llvm.fabs.f64(double)"
   head := head.push ""
   return "\n".intercalate (head ++ st.out ++ tbaaLines.toArray).toList
 
