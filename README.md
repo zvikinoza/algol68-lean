@@ -59,6 +59,20 @@ of the twenty-two benchmarks are within about 1.1x to 3x of C; structures reache
 through `REF` still go through the runtime. See
 [benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for all 22 and for what is left.
 
+### The LLVM back end
+
+`a68lean compile --llvm` emits LLVM IR instead of C (docs/LLVM-DESIGN.md): a typed
+register-machine IR (MIR) with a Lean semantics and verified optimisation passes,
+printed as textual IR and compiled by clang against the same runtime. Scalars are
+native, routines with primitive signatures are plain functions called directly or
+through a table, and rows, structures, unions, strings and names are accessed inline
+through the runtime's own object layout, with the runtime as the fallback. Measured
+against the C back end on the same programs it is within 0.7x–1.4x on nineteen of
+the twenty-two benchmarks (`data_list` 14x faster, since names are followed inline),
+and 2x–6x slower on `data_union`, `sieve`, `data_struct` and `data_string`, where the C
+back end promotes whole rows and strings to C arrays and buffers. The same test
+suites, corpus and fuzzers run through it (docs/TESTING.md §3c).
+
 ## Quick start
 
 ```bash

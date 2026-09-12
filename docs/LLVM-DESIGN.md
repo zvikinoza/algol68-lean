@@ -76,3 +76,64 @@ same differential tests as the C back end: every program through both back ends 
 through the evaluator must give the same bytes, plus the MIR interpreter against the
 evaluator on the fuzzers' programs. This boundary is stated here so that no claim
 outruns it.
+
+## 5. Status
+
+Done, on branch `llvm`, every step byte-identical to a68g on the case suite (68/68 at
+`-O0` and `-O2`, and under `A68LEAN_GC=stress,verify`), the fuzzers (300-program
+batches) and the golden corpus (the same 763 of 773 as the C back end):
+
+* **Milestone 1, parity.** MIR (`A68/MIR.lean`), the lowering of every core construct
+  (`A68/Lower.lean`), the printer (`A68/LLVM.lean`), the driver (`--llvm`, `dump-mir`).
+* **The verified optimiser** (`A68/MIR/Sem.lean`, `A68/MIR/Opt.lean`,
+  `A68/Verified/MIR.lean`): copy and constant propagation, constant folding, branch
+  folding, dead assignment elimination and unreachable block removal, each with its
+  theorem that `run` is preserved for every fuel, runtime and runtime state; the
+  pipeline `Opt.run` is proved from them (axioms: `propext`, `Classical.choice`,
+  `Quot.sound` only).
+* **Milestone 2 in part.** Scalars in registers; locals and loop counters promoted by the
+  C back end's escape analysis; routines whose frame is exactly their primitive
+  parameters get a plain entry point `a68_nf<k>` (typed arguments and result, no
+  run-time frame) called directly when the callee is known and its environment is in
+  effect, or through `@a68_nf_of_fn` after reading a procedure-valued cell, with the
+  boxed call as fallback; `INT ** k` unrolled; conditionals in void position without
+  the stack; label blocks keeping a scalar value in a register.
+
+  Rows, structures, unions, strings and names are reached **inline through the
+  runtime's own object layout** (`csrc/a68rt.h`): the address of a frame's cells is
+  returned by `a68rt_enter`/`a68rt_enter_args` (or read once at the function entry for
+  a captured frame), the descriptor's bounds are checked inline, an element of a leaf
+  store is loaded or stored directly with its defined bit, a row of structures is
+  followed to the field, a united value's mode index is compared with each alternative's
+  (the runtime's cached `conforms` decides when they differ), `p IS NIL` reads a tag,
+  a name in a cell is followed to the slot it refers to, and a value of a REF mode is
+  copied as its 16 bytes. Every inline path has a runtime fallback taken when a tag is
+  not as expected — an undefined value, a name where a value was expected, a slots
+  store where a leaf was, a shared store on a write — so the runtime's checks and
+  messages are those of the evaluator. A fresh row of a primitive mode is a leaf from
+  the start (`a68rt_new_row_of`); `s +:= t` appends in place. The memory operations
+  are `mem_ld_*`/`mem_st_*` native calls in MIR — opaque runtime steps to the
+  semantics, so the optimiser stays verified — printed as `getelementptr` and
+  `load`/`store`; the address arithmetic uses the unchecked `addW`/`mulW`/`shlW`/…
+  operations, whose semantics wrap at 64 bits as LLVM's do.
+
+  GC safety of the inline paths rests on three facts: the collector does not move
+  objects; a frame on the environment chain, and what its cells reach, is never
+  collected; and no inline path keeps a pointer into an object across a runtime call —
+  each access re-derives it from the cell, which LLVM then hoists out of call-free loops
+  by itself. Statepoints (`csrc/stackmap.c` is in place) are therefore not needed yet;
+  they become necessary once native pointers are kept live across calls.
+
+Benchmarks (`benchmarks/bench.sh`, `VARIANTS="native comp2 llvm2"`), LLVM back end
+relative to the C back end: `calls` 0.75, `ctl_fib` 1.2, `ctl_hof` 1.0, `ctl_mutual` 1.2,
+`ctl_goto` 1.0, `num_power` 1.0, `num_mandel` 0.5, `intloop` 0.94, `arraysum` 1.4,
+`data_matmul` 1.1, `data_slice` 0.7, `data_list` 0.07, `data_union` 2.0, `sieve` 3.0,
+`data_struct` 3.7, `data_string` 6.0. The last four are where the C back end promotes
+whole rows, rows of structures and strings to C arrays and buffers (no tags, no defined
+bits); doing the same in MIR for rows that never escape is the next step of milestone 2,
+after which every benchmark should be at or under the C back end.
+
+Not done: the remainder of milestone 2 (promotion of non-escaping rows and strings to
+native arrays; statepoints once pointers live across calls); milestone 3 (further
+verified passes — CSE, LICM, bounds-check elimination, inlining — and the verified
+lowering of the formal core); milestone 4 (generational collection).

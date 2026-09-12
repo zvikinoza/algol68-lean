@@ -100,6 +100,17 @@ that uses `evaluate` is marked `evaluator only` on its first line and skipped by
 `A68LEAN_GC=stats` reports the collections, the bytes freed, the peak live size and
 the time spent.
 
+## 3c. The LLVM back end
+
+`a68lean compile --llvm` (docs/LLVM-DESIGN.md) emits LLVM IR instead of C, through the
+same runtime. Every suite above runs through it by setting `A68LEAN_OPTS=--llvm`:
+`A68LEAN_OPTS=--llvm tests/run-cases-compiled.sh -O2` (also at `-O0`, and under
+`A68LEAN_GC=stress,verify`), `A68LEAN_OPTS=--llvm fuzz/run-compiled.sh START COUNT -O2`,
+and the corpus runner. The MIR the back end lowers to can be inspected with
+`a68lean dump-mir prog.a68 -O2`; the verified MIR passes (`A68/Verified/MIR.lean`) are
+applied unless `-O0` is given. What is proved and what is tested is stated in
+docs/LLVM-DESIGN.md §4.
+
 ## 4. Differential fuzzing (`fuzz/`)
 
 `fuzz/gen.py` is a grammar-based generator of random Algol 68 programs over
@@ -144,6 +155,7 @@ brew install algol68g coreutils        # a68g 3.13.3 and gtimeout
 lake build
 tests/run-cases.sh
 tests/run-cases-compiled.sh -O2
+A68LEAN_OPTS=--llvm tests/run-cases-compiled.sh -O2
 ( cd tests/fmt && python3 gen.py 1 300 && a68g cases.a68 > expected.txt \
   && ../../.lake/build/bin/a68lean fmttest cases.txt > actual.txt && diff expected.txt actual.txt )
 tests/fetch-corpus.sh                  # ~20 minutes: clones, records a68g output
