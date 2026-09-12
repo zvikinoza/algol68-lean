@@ -39,9 +39,9 @@ status are compared with a68g's.
 
 | corpus | golden programs | evaluator | compiled `-O2` |
 |---|---:|---:|---:|
-| Rosetta Code, ALGOL 68 solutions | 744 | 724 | 737 |
+| Rosetta Code, ALGOL 68 solutions | 744 | 726 | 735 |
 | Algol 68 Genie bundled test set | 29 | 28 | 28 |
-| **total** | **773** | **752** | **765** |
+| **total** | **773** | **754** | **763** |
 
 A program that calls `random` without `first random` is not golden, even when
 its two reference runs agree: a68g seeds its generator from the clock, so such a
@@ -121,7 +121,9 @@ whose partial text a68g loses and this implementation used to keep.
 
 `fuzz/run-compiled.sh START COUNT -O1|-O2` does the same through the C back end: it
 compiles each program, runs the binary, and compares with a68g. Every change to the
-back end was fuzzed with 300 fresh programs, 150 at each level, before it was merged.
+back end was fuzzed with 300 fresh programs, 150 at each level, before it was merged;
+the C runtime was fuzzed with 500 more (seeds 5000–5149 and 7000–7149 under
+`A68LEAN_GC=stress,verify`, 6000–6199 at `-O2`), all agreeing.
 This caught two defects. `x +:= e` with a non-trivial right operand wrote through a
 reference to a variable that had been promoted to a C variable and had no cell (seed
 12102). And `REAL` division checked its quotient, which a68g does not: `exp(769.9) /

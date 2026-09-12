@@ -15,20 +15,21 @@ machine-checked theorems (see [docs/VERIFICATION.md](docs/VERIFICATION.md)).
 
 | Test | Programs | Byte-identical to a68g |
 |---|---:|---:|
-| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic), compiled `-O2` | 744 | 737 |
+| Rosetta Code ALGOL 68 solutions (a68g-runnable, deterministic), compiled `-O2` | 744 | 735 |
 | Algol 68 Genie bundled test set (a68g-runnable, deterministic), compiled `-O2` | 29 | 28 |
-| The same 773 programs through the evaluator | 773 | 752 |
-| In-repo regression cases, evaluator and C back end at `-O0`, `-O1`, `-O2` | 62 | 62 |
-| Random programs through the C back end, `-O1` and `-O2` | 300 | 300 |
+| The same 773 programs through the evaluator | 773 | 754 |
+| In-repo regression cases, evaluator and C back end at `-O0`, `-O1`, `-O2` | 67 | 67 |
+| Random programs through the C back end, `-O1` and `-O2`, also under the collector's stress and verify modes | 500 | 500 |
 | Random programs through the evaluator | 300 | 300 |
 
-Of the eight corpus programs that differ when compiled, four print the date, the
-host name or a speed measured while running, one depends on the order in which
-a68g's threads ran a `PAR` clause, two use extensions not implemented here (a web
-page fetched with `http content`, semaphores between parallel units), and one,
-Square-form factorization, gives a68g's output but needs about 150 seconds of
-multi-precision arithmetic. The evaluator additionally runs out of time on 13
-programs that pass compiled. See [docs/TESTING.md](docs/TESTING.md).
+Of the ten corpus programs that differ when compiled, four print the date, the
+host name or a speed measured while running (one of them overflows an `INT` with
+the speed the compiled program reaches), one depends on the order in which a68g's
+threads ran a `PAR` clause, two use extensions not implemented here (a web page
+fetched with `http content`, semaphores between parallel units), and three use
+`evaluate`, which compiles Algol 68 text at run time and is available under
+`a68lean run` only. The evaluator additionally runs out of time on 12 programs that
+pass compiled. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Speed of the compiled program
 
