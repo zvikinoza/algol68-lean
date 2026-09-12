@@ -139,7 +139,8 @@ static a68_val str_val(const char* s) { return of_string(s, strlen(s)); }
 /* a NUL-terminated copy of a string value */
 static char* cstr_of(a68_val v) { int64_t n; return (char*) str_of(v, &n); }
 
-static uint32_t union_mode(a68_val v) { return v.tag == T_UNION ? mode_resolve(v.aux) : 0; }
+/* the resolved mode of a united value; ~0u when the value is not a union */
+static uint32_t union_mode(a68_val v) { return v.tag == T_UNION ? mode_resolve(v.aux) : ~0u; }
 static a68_val union_inner(a68_val v) { return ((a68_slots*) v.v.p)->s[0]; }
 
 /* the lower bound of a row */
@@ -356,7 +357,7 @@ static void sf_act(uint32_t fid, void* ctx) {
 enum { NUM_INT, NUM_LONG_INT, NUM_MP, NUM_REAL };
 static int number_kind(a68_val x, a68_val* v, int64_t* longness, const char* what) {
   uint32_t m = union_mode(x);
-  if (!m) die(what);
+  if (m == ~0u) die(what);
   const a68_mode* p = mode_at(m);
   *v = union_inner(x);
   *longness = p->len;
@@ -852,8 +853,8 @@ static void builtin(uint32_t si, int id, int sub, a68_val* a, uint32_t n, a68_va
     case B_SLEEP: {
       ARGS(1);
       uint32_t m = union_mode(a[0]);
-      const a68_mode* p = m ? mode_at(m) : NULL;
-      a68_val v = m ? union_inner(a[0]) : a[0];
+      const a68_mode* p = m != ~0u ? mode_at(m) : NULL;
+      a68_val v = m != ~0u ? union_inner(a[0]) : a[0];
       if (p && p->k == M_INT && v.tag == T_INT) { int64_t k = v.v.i < 0 ? -v.v.i : v.v.i; *res = mk_int(signed32(os_sleep((uint32_t) k))); return; }
       if (p && p->k == M_REAL && v.tag == T_REAL) { os_sleep_ms((uint32_t) (fabs(v.v.r) * 1000.0)); *res = mk_int(0); return; }
       *res = mk_int(-1);
