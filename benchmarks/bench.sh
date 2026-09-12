@@ -16,7 +16,7 @@
 #
 # Environment:
 #   REPS=n        repetitions per measurement, best taken (default 3)
-#   VARIANTS=...  space-separated subset of: native a68g a68gO interp comp0 comp1 comp2
+#   VARIANTS=...  space-separated subset of: native a68g a68gO interp comp0 comp1 comp2 llvm0 llvm1 llvm2
 #                 (default: all).  `interp` and `comp0` are the slow ones; when you are
 #                 measuring the emitted binary, VARIANTS="native a68g comp1 comp2" is
 #                 several times quicker and measures the same thing.
@@ -116,17 +116,20 @@ for name in $progs; do
   fi
   fi
 
-  for lvl in 0 1 2; do
-    want "comp$lvl" || continue
-    exe=$DIR/build/$name.O$lvl
-    if "$BIN" compile "$src" -O$lvl -o "$exe" >/dev/null 2>&1; then
+  # comp<n>: the C back end; llvm<n>: the LLVM back end (`--llvm`)
+  for v in comp0 comp1 comp2 llvm0 llvm1 llvm2; do
+    want "$v" || continue
+    lvl=${v: -1}
+    extra=""; case "$v" in llvm*) extra="--llvm";; esac
+    exe=$DIR/build/$name.$v
+    if "$BIN" compile "$src" -O$lvl $extra -o "$exe" >/dev/null 2>&1; then
       if gtimeout 300 "$exe" > "$o" 2>/dev/null; then
-        t=$(timeit "$exe"); record "$name" "comp$lvl" "$t" "$ops" "$(check "$o")"
+        t=$(timeit "$exe"); record "$name" "$v" "$t" "$ops" "$(check "$o")"
       else
-        record "$name" "comp$lvl" 999999 "$ops" failed
+        record "$name" "$v" 999999 "$ops" failed
       fi
     else
-      record "$name" "comp$lvl" 999999 "$ops" compile-error
+      record "$name" "$v" 999999 "$ops" compile-error
     fi
   done
 done

@@ -23,9 +23,21 @@ inductive Res where
   | sc (o : Opnd)     -- a scalar
   deriving Inhabited
 
-/-- Per-slot modes of a frame, for typed cell access. -/
+/-- A slot promoted to a MIR variable: the variable, its mode, and the flag that says it
+    has been given a value, when reads must test for an undefined variable. -/
+structure PVar where
+  v    : Var
+  m    : Mode
+  flag : Option Var := none
+  deriving Inhabited
+
+/-- A frame as the lowering sees it: the modes of its slots, which slots are variables,
+    and whether a run-time frame is pushed for it at all (a frame all of whose slots are
+    variables needs none, and the depths of cell accesses skip it). -/
 structure FrameInfo where
-  modes : Array (Option Mode) := #[]
+  modes  : Array (Option Mode) := #[]
+  vars   : Array (Option PVar) := #[]
+  pushed : Bool := true
   deriving Inhabited
 
 /-- The function under construction. -/
@@ -89,7 +101,7 @@ def rt (name : String) (args : Array Opnd := #[]) : L Unit := emit (.call (.rt n
 def rtv (name : String) (args : Array Opnd := #[]) : L Var := do
   let ret := match rtSigOf name with
     | some sg => sg.ret.ty.getD .i32
-    | none => .i32
+    | none => panic! s!"a68lean: no signature for runtime function {name}"
   let v ← newVar ret
   emit (.set v (.call (.rt name) args))
   return v
@@ -140,6 +152,47 @@ def slotMode (d s : Nat) : L (Option Mode) := do
   | some f => return (f.modes[s]?).join
   | none => return none
 
+/-- The run-time depth of syntactic depth `d`: only pushed frames count.  Frames past the
+    end of the list belong to enclosing functions and are always real. -/
+def rtd (d : Nat) : L Nat := do
+  let fs := (← get).fb.frames
+  let mut r := 0
+  let mut i := 0
+  for f in fs do
+    if i ≥ d then break
+    if f.pushed then r := r + 1
+    i := i + 1
+  if d > fs.length then r := r + (d - fs.length)
+  return r
+
+def pvarOf (d s : Nat) : L (Option PVar) := do
+  match (← get).fb.frames[d]? with
+  | some f => return (f.vars[s]?).join
+  | none => return none
+
+def undefKind : Ty → Nat
+  | .i64 => 0 | .f64 => 1 | .i1 => 2 | .i32 => 3
+
+/-- Read a promoted variable, reporting an undefined one as the evaluator would. -/
+def readPVar (pv : PVar) : L Opnd := do
+  match pv.flag with
+  | none => return .v pv.v
+  | some fl =>
+    let ok ← newBlock; let bad ← newBlock
+    terminate (.condBr (.v fl) ok bad)
+    switchTo bad
+    let kind := if (← resolve pv.m) matches .bits _ then 4 else undefKind pv.v.ty
+    rt "a68rt_undef_error" #[ku kind]
+    terminate .unreachable
+    switchTo ok
+    return .v pv.v
+
+def writePVar (pv : PVar) (o : Opnd) : L Unit := do
+  emit (.set pv.v (.opnd o))
+  match pv.flag with
+  | some fl => emit (.set fl (.opnd (kb true)))
+  | none => pure ()
+
 def pushFn : Ty → String
   | .i64 => "a68rt_push_int" | .f64 => "a68rt_push_real" | .i1 => "a68rt_push_bool" | .i32 => "a68rt_push_char"
 def popFn : Ty → String
@@ -178,6 +231,17 @@ def toScalar (r : Res) (m : Mode) : L Opnd := do
 def dyopResult := CodeGen.dyopResult
 def monopResult := CodeGen.monopResult
 
+/-- The mode of `row[idx]` when every indexer is a subscript. -/
+partial def elemMode (rowMode : Mode) (idx : List CoreIdx) : L (Option Mode) := do
+  match rowMode with
+  | .row dims _ em =>
+    if idx.length == dims && idx.all (fun ix => match ix with | .index _ => true | _ => false) then return some em
+    return none
+  | _ => return none
+
+
+mutual
+
 partial def modeOf (c : Core) : L (Option Mode) := do
   match c with
   | .at _ e => modeOf e
@@ -189,6 +253,18 @@ partial def modeOf (c : Core) : L (Option Mode) := do
   | .loadCell d s => slotMode d s
   | .deref (.refCell d s) => slotMode d s
   | .deref (.at _ e) => modeOf (.deref e)
+  | .deref e =>
+    match ← modeOfRef e with
+    | some m => return some m
+    | none => return none
+  | .slice base idx false =>
+    -- an element of a row value held in a cell
+    match CodeGen.strip base with
+    | .loadCell d s =>
+      match ← slotMode d s with
+      | some m => elemMode (← resolve m) idx
+      | none => return none
+    | _ => return none
   | .dyop op m1 m2 _ _ =>
     if op == "LWB" || op == "UPB" || op == "ELEMS" then return some (.int 0)
     let r1 ← resolve m1
@@ -233,6 +309,33 @@ partial def modeOf (c : Core) : L (Option Mode) := do
       return r
     | _ => return none
   | _ => return none
+
+/-- The mode a reference expression designates: `&x`, `a[i]`, `f OF s`, `p` holding a name. -/
+partial def modeOfRef (c : Core) : L (Option Mode) := do
+  match c with
+  | .at _ e => modeOfRef e
+  | .refCell d s => slotMode d s
+  | .loadCell d s | .deref (.refCell d s) =>
+    match ← slotMode d s with
+    | some m =>
+      match ← resolve m with
+      | .ref t => return some t
+      | _ => return none
+    | none => return none
+  | .slice base idx true =>
+    match ← modeOfRef base with
+    | some m => elemMode (← resolve m) idx
+    | none => return none
+  | .select f e true =>
+    match ← modeOfRef e with
+    | some m =>
+      match ← resolve m with
+      | .struct fs => return (fs[f]?).map (·.2)
+      | _ => return none
+    | none => return none
+  | _ => return none
+
+end
 
 /-- The scalar operation of a dyadic operator on operands of a primitive mode. -/
 def binOf (op : String) (m : Mode) : Option BinOp :=
@@ -306,8 +409,8 @@ def jumpCheck : L Unit := do
   terminate (.condBr (.v c) d cont)
   switchTo cont
 
-def pushFrame (modes : Array (Option Mode)) : L Unit :=
-  modify fun s => { s with fb := { s.fb with frames := { modes := modes } :: s.fb.frames } }
+def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true) : L Unit :=
+  modify fun s => { s with fb := { s.fb with frames := { modes := modes, vars := vars, pushed := pushed } :: s.fb.frames } }
 def popFrame : L Unit :=
   modify fun s => { s with fb := { s.fb with frames := s.fb.frames.tail } }
 
@@ -320,21 +423,25 @@ partial def lower (c : Core) : L Res := do
   match c with
   | .at p e => emit (.line p.line); lower e
   | .lit v => lowerLit v
-  | .loadCell d s =>
-    match (← slotMode d s).bind tyOf with
-    | some _ =>
-      let m := (← slotMode d s).get!
-      return .sc (.v (← rtv (cellFn (← resolve m)) #[ku d, ku s]))
-    | none => rt "a68rt_push_cell" #[ku d, ku s]; return .stack
-  | .refCell d s => rt "a68rt_push_ref" #[ku d, ku s]; return .stack
+  | .loadCell d s => readCell d s
+  | .refCell d s =>
+    match ← pvarOf d s with
+    | some _ => rt "a68rt_push_void"; return .stack   -- never reached: the analysis keeps such slots in cells
+    | none => rt "a68rt_push_ref" #[ku (← rtd d), ku s]; return .stack
   | .deref e =>
     match CodeGen.strip e with
-    | .refCell d s =>
-      match (← slotMode d s).bind tyOf with
-      | some _ =>
-        let m := (← slotMode d s).get!
-        return .sc (.v (← rtv (cellFn (← resolve m)) #[ku d, ku s]))
-      | none => rt "a68rt_push_cell" #[ku d, ku s]; return .stack
+    | .refCell d s => readCell d s
+    | .slice base idx true =>
+      match ← rowRead base idx with
+      | some r => return r
+      | none =>
+        match ← selRead e with
+        | some r => return r
+        | none => let _ ← lowerStack e; rt "a68rt_deref"; return .stack
+    | .select _ _ true =>
+      match ← selRead e with
+      | some r => return r
+      | none => let _ ← lowerStack e; rt "a68rt_deref"; return .stack
     | _ => let _ ← lowerStack e; rt "a68rt_deref"; return .stack
   | .deproc e => let _ ← lowerStack e; rt "a68rt_deproc"; jumpCheck; return .stack
   | .widen a b e =>
@@ -355,11 +462,27 @@ partial def lower (c : Core) : L Res := do
     match CodeGen.strip d with
     | .refCell dd ss =>
       if ← storeScalar dd ss s then
-        rt "a68rt_push_ref" #[ku dd, ku ss]
+        rt "a68rt_push_ref" #[ku (← rtd dd), ku ss]
         return .stack
       lowerAssignGeneral d s flex
     | _ => lowerAssignGeneral d s flex
   | .identRel l r isnt =>
+    -- `p IS NIL` on a variable held in a cell
+    let cellOf (x : Core) : Option (Nat × Nat) := match CodeGen.strip x with
+      | .loadCell d s => some (d, s)
+      | .deref e => match CodeGen.strip e with | .refCell d s => some (d, s) | _ => none
+      | _ => none
+    let side := if CodeGen.isNilLit r then cellOf l else if CodeGen.isNilLit l then cellOf r else none
+    match side with
+    | some (d, s) =>
+      if (← pvarOf d s).isNone then
+        let z ← rtv "a68rt_cell_isnil" #[ku (← rtd d), ku s]
+        if isnt then
+          let v ← newVar .i1
+          emit (.set v (.un .notB (.v z)))
+          return .sc (.v v)
+        return .sc (.v z)
+    | none => pure ()
     let _ ← lowerStack l; let _ ← lowerStack r
     rt "a68rt_ident_rel" #[kb isnt]
     return .stack
@@ -379,22 +502,11 @@ partial def lower (c : Core) : L Res := do
     let idx ← lowerFunction nparams frameSize body
     rt "a68rt_push_proc" #[ku idx, ku nparams]
     return .stack
-  | .slice arr idx viaRef =>
-    let _ ← lowerStack arr
-    let mut kinds : Nat := 0
-    let mut i := 0
-    for ix in idx do
-      match ix with
-      | .index e => lowerStackM e (.int 0)
-      | .trim l u a =>
-        let mut bits := 1
-        match l with | some e => lowerStackM e (.int 0); bits := bits + 2 | none => pure ()
-        match u with | some e => lowerStackM e (.int 0); bits := bits + 4 | none => pure ()
-        match a with | some e => lowerStackM e (.int 0); bits := bits + 8 | none => pure ()
-        kinds := kinds + bits * 16 ^ i
-      i := i + 1
-    rt "a68rt_slice" #[ku idx.length, ki kinds, kb viaRef]
-    return .stack
+  | .slice arr idx false =>
+    match ← rowRead arr idx with
+    | some r => return r
+    | none => lowerSlice arr idx false
+  | .slice arr idx viaRef => lowerSlice arr idx viaRef
   | .select i e viaRef =>
     let _ ← lowerStack e
     rt "a68rt_select" #[ku i, kb viaRef]
@@ -466,6 +578,221 @@ partial def lower (c : Core) : L Res := do
   | .seq a b => lowerVoid a; lower b
   | .hole _ _ => rt "a68rt_push_void"; return .stack
 
+/-- The value of a cell or promoted variable. -/
+partial def readCell (d s : Nat) : L Res := do
+  match ← pvarOf d s with
+  | some pv => return .sc (← readPVar pv)
+  | none =>
+    match (← slotMode d s).bind tyOf with
+    | some _ =>
+      let m := (← slotMode d s).get!
+      return .sc (.v (← rtv (cellFn (← resolve m)) #[ku (← rtd d), ku s]))
+    | none => rt "a68rt_push_cell" #[ku (← rtd d), ku s]; return .stack
+
+/-- The cell a row or structure access is rooted at, when the base is a cell that holds
+    the row (`refCell`) or a name of it (`loadCell`, `deref refCell`). -/
+partial def cellBase (base : Core) : L (Option (Nat × Nat × Bool)) := do
+  match CodeGen.strip base with
+  | .refCell d s => if (← pvarOf d s).isSome then return none else return some (d, s, false)
+  | .loadCell d s => if (← pvarOf d s).isSome then return none else return some (d, s, true)
+  | .deref e =>
+    match CodeGen.strip e with
+    | .refCell d s => if (← pvarOf d s).isSome then return none else return some (d, s, true)
+    | _ => return none
+  | _ => return none
+
+/-- `a[i]` or `a[i, j]` on a row a cell holds, of a primitive element mode: one runtime call
+    that checks the bounds and reads the element (`a68rt_row_int` and its relatives). -/
+partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
+  let some (d, s, viaName) ← cellBase base | return none
+  let some m ← slotMode d s | return none
+  let mr ← resolve m
+  -- a cell holding a name of a row (`REF [] INT` parameter) is not a row the runtime's
+  -- element entry points can subscript directly
+  let rowM ← match viaName, mr with
+    | false, r@(.row _ _ _) => pure (some r)
+    | true, .row _ _ _ => pure none
+    | _, _ => pure none
+  let some (.row dims _ em) := rowM | return none
+  let emr ← resolve em
+  let some ty := tyOf emr | return none
+  if idx.length != dims || dims > 2 then return none
+  let mut is : Array Opnd := #[]
+  for ix in idx do
+    match ix with
+    | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+    | _ => return none
+  let fn := match ty with
+    | .i64 => if emr matches .bits _ then "a68rt_row_bits" else "a68rt_row_int"
+    | .f64 => "a68rt_row_real" | .i1 => "a68rt_row_bool" | .i32 => "a68rt_row_char"
+  let j := is[1]?.getD (ki 0)
+  return some (.sc (.v (← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j])))
+
+/-- The selector chain of `f OF … OF x[i]` rooted at a cell, as the runtime's `sel_*`
+    entry points take it: depth, slot, spec, i, j, fields. -/
+partial def selChain (c : Core) : L (Option (Nat × Nat × Nat × Opnd × Opnd × List Nat × Bool)) := do
+  -- (depth, slot, rank, i, j, fields, viaCellRef)
+  match c with
+  | .at _ e => selChain e
+  | .refCell d s =>
+    if (← pvarOf d s).isSome then return none
+    return some (← rtd d, s, 0, ki 0, ki 0, [], false)
+  | .loadCell d s | .deref (.refCell d s) =>
+    if (← pvarOf d s).isSome then return none
+    return some (← rtd d, s, 0, ki 0, ki 0, [], true)
+  | .slice base idx true =>
+    let some (d, s, rank, _, _, fields, via) ← selChain base | return none
+    if via || rank != 0 || !fields.isEmpty then return none
+    match idx with
+    | [.index a] => return some (d, s, 1, ← toScalar (← lower a) (.int 0), ki 0, [], false)
+    | [.index a, .index b] =>
+      let ia ← toScalar (← lower a) (.int 0)
+      let ib ← toScalar (← lower b) (.int 0)
+      return some (d, s, 2, ia, ib, [], false)
+    | _ => return none
+  | .select f e true =>
+    let some (d, s, rank, i, j, fields, via) ← selChain e | return none
+    if fields.length ≥ 4 || f ≥ 256 then return none
+    return some (d, s, rank, i, j, fields ++ [f], via)
+  | _ => return none
+
+partial def specOf (rank : Nat) (via : Bool) (fields : List Nat) : Nat := rank + (if via then 4 else 0) + 256 * fields.length
+partial def fieldsWord (fields : List Nat) : Nat := Id.run do
+  let mut w := 0
+  let mut k := 0
+  for f in fields do
+    w := w + f * 256 ^ k
+    k := k + 1
+  return w
+
+/-- `f OF … OF x` of a primitive mode, read by one runtime call. -/
+partial def selRead (c : Core) : L (Option Res) := do
+  let some m ← modeOfRef c | return none
+  let mr ← resolve m
+  let some ty := tyOf mr | return none
+  let some (d, s, rank, i, j, fields, via) ← selChain c | return none
+  if fields.isEmpty then return none
+  let fn := match ty with
+    | .i64 => if mr matches .bits _ then "a68rt_sel_bits" else "a68rt_sel_int"
+    | .f64 => "a68rt_sel_real" | .i1 => "a68rt_sel_bool" | .i32 => "a68rt_sel_char"
+  return some (.sc (.v (← rtv fn #[ku d, ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields)])))
+
+/-- The general slice: the row and the indexers on the stack, then the runtime. -/
+partial def lowerSlice (arr : Core) (idx : List CoreIdx) (viaRef : Bool) : L Res := do
+  let _ ← lowerStack arr
+  let mut kinds : Nat := 0
+  let mut i := 0
+  for ix in idx do
+    match ix with
+    | .index e => lowerStackM e (.int 0)
+    | .trim l u a =>
+      let mut bits := 1
+      match l with | some e => lowerStackM e (.int 0); bits := bits + 2 | none => pure ()
+      match u with | some e => lowerStackM e (.int 0); bits := bits + 4 | none => pure ()
+      match a with | some e => lowerStackM e (.int 0); bits := bits + 8 | none => pure ()
+      kinds := kinds + bits * 16 ^ i
+    i := i + 1
+  rt "a68rt_slice" #[ku idx.length, ki kinds, kb viaRef]
+  return .stack
+
+/-- `a[i] := <scalar>` and `f OF … OF x := <scalar>` written in place by one runtime call.
+    Returns whether it applied. -/
+partial def storeTyped (dst src : Core) : L Bool := do
+  let some m ← modeOfRef dst | return false
+  let mr ← resolve m
+  let some ty := tyOf mr | return false
+  match ← modeOf src with
+  | some sm => if (← resolve sm) != mr then return false
+  | none => return false
+  match CodeGen.strip dst with
+  | .slice base idx true =>
+    let some (d, s, false) ← cellBase base | return false
+    let some bm ← slotMode d s | return false
+    let some (.row dims _ _) := some (← resolve bm) | return false
+    if idx.length != dims || dims > 2 then return false
+    let mut is : Array Opnd := #[]
+    for ix in idx do
+      match ix with
+      | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+      | _ => return false
+    let v ← toScalar (← lower src) mr
+    let fn := match ty with
+      | .i64 => if mr matches .bits _ then "a68rt_set_row_bits" else "a68rt_set_row_int"
+      | .f64 => "a68rt_set_row_real" | .i1 => "a68rt_set_row_bool" | .i32 => "a68rt_set_row_char"
+    rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, is[1]?.getD (ki 0), v]
+    return true
+  | .select _ _ true =>
+    let some (d, s, rank, i, j, fields, via) ← selChain dst | return false
+    if fields.isEmpty then return false
+    let v ← toScalar (← lower src) mr
+    let fn := match ty with
+      | .i64 => if mr matches .bits _ then "a68rt_set_sel_bits" else "a68rt_set_sel_int"
+      | .f64 => "a68rt_set_sel_real" | .i1 => "a68rt_set_sel_bool" | .i32 => "a68rt_set_sel_char"
+    rt fn #[ku d, ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields), v]
+    return true
+  | _ => return false
+
+/-- The scalar operation of an assigning operator, with its checks. -/
+partial def assignBin (op : String) (m : Mode) : Option BinOp :=
+  match m, op with
+  | .int _, "+:=" => some .addI | .int _, "-:=" => some .subI | .int _, "*:=" => some .mulI
+  | .int _, "%:=" => some .overI | .int _, "%*:=" => some .modI
+  | .real _, "+:=" => some .addF | .real _, "-:=" => some .subF | .real _, "*:=" => some .mulF
+  | .real _, "/:=" => some .divF
+  | .bits _, "&:=" => some .andU | .bits _, "|:=" => some .orU
+  | _, _ => none
+
+/-- `x +:= e` and its relatives in statement position on a variable of primitive mode: the
+    right operand, then the variable's value, the operation, the write.  Returns whether
+    it applied. -/
+partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := do
+  let .ref tm ← resolve m1 | return false
+  let tmr ← resolve tm
+  let some _ := tyOf tmr | return false
+  let some bop := assignBin op tmr | return false
+  if (tyOf (← resolve m2)).isNone then return false
+  match CodeGen.strip l with
+  | .refCell dd ss =>
+    let rs ← toScalar (← lower r) m2
+    match ← pvarOf dd ss with
+    | some pv =>
+      let cur ← readPVar pv
+      let v ← newVar pv.v.ty
+      emit (.set v (.bin bop cur rs))
+      writePVar pv (.v v)
+      return true
+    | none =>
+      let some sm ← slotMode dd ss | return false
+      if (← resolve sm) != tmr then return false
+      let cur ← rtv (cellFn tmr) #[ku (← rtd dd), ku ss]
+      let v ← newVar cur.ty
+      emit (.set v (.bin bop (.v cur) rs))
+      rt (setCellFn tmr) #[ku (← rtd dd), ku ss, .v v]
+      return true
+  | .slice base idx true =>
+    -- `a[i] +:= e` on a row a cell holds
+    let some (d, s, false) ← cellBase base | return false
+    let some bm ← slotMode d s | return false
+    let .row dims _ em ← resolve bm | return false
+    if (← resolve em) != tmr || idx.length != dims || dims > 2 then return false
+    let mut is : Array Opnd := #[]
+    for ix in idx do
+      match ix with
+      | .index e => is := is.push (← toScalar (← lower e) (.int 0))
+      | _ => return false
+    let rs ← toScalar (← lower r) m2
+    let j := is[1]?.getD (ki 0)
+    let (rd, wr) := match tyOf tmr with
+      | some .i64 => if tmr matches .bits _ then ("a68rt_row_bits", "a68rt_set_row_bits") else ("a68rt_row_int", "a68rt_set_row_int")
+      | some .f64 => ("a68rt_row_real", "a68rt_set_row_real") | some .i1 => ("a68rt_row_bool", "a68rt_set_row_bool")
+      | _ => ("a68rt_row_char", "a68rt_set_row_char")
+    let cur ← rtv rd #[ku (← rtd d), ku s, ku dims, is[0]!, j]
+    let v ← newVar cur.ty
+    emit (.set v (.bin bop (.v cur) rs))
+    rt wr #[ku (← rtd d), ku s, ku dims, is[0]!, j, .v v]
+    return true
+  | _ => return false
+
 /-- Lower `c` and leave its value on the operand stack. -/
 partial def lowerStack (c : Core) : L Unit := do
   match ← lower c with
@@ -517,6 +844,16 @@ partial def lowerLit (v : Value) : L Res := do
 
 /-- `x := e` written straight into the cell when both are of one primitive mode. -/
 partial def storeScalar (dd ss : Nat) (src : Core) : L Bool := do
+  match ← pvarOf dd ss with
+  | some pv =>
+    -- a promoted variable has no cell: this must always apply
+    let ty := pv.v.ty
+    let mr ← resolve pv.m
+    let v ← newVar ty
+    lowerInto (some (ty, v, mr)) src
+    writePVar pv (.v v)
+    return true
+  | none =>
   match ← slotMode dd ss with
   | some m =>
     let mr ← resolve m
@@ -526,7 +863,7 @@ partial def storeScalar (dd ss : Nat) (src : Core) : L Bool := do
       | some sm =>
         if (← resolve sm) == mr then
           let o ← toScalar (← lower src) mr
-          rt (setCellFn mr) #[ku dd, ku ss, o]
+          rt (setCellFn mr) #[ku (← rtd dd), ku ss, o]
           return true
         else return false
       | none => return false
@@ -600,7 +937,15 @@ partial def lowerVoid (c : Core) : L Unit := do
     | .refCell dd ss =>
       if ← storeScalar dd ss s then pure ()
       else do let _ ← lowerAssignGeneral d s flex; rt "a68rt_pop"
-    | _ => let _ ← lowerAssignGeneral d s flex; rt "a68rt_pop"
+    | _ =>
+      if ← storeTyped d s then pure ()
+      else do let _ ← lowerAssignGeneral d s flex; rt "a68rt_pop"
+  | .dyop op m1 m2 l r =>
+    if ← assignOpVoid op m1 m2 l r then pure ()
+    else
+      match ← lower c with
+      | .stack => rt "a68rt_pop"
+      | .sc _ => pure ()
   | .cond cc t e => lowerCondInto none cc t e |> lowerVoidOf
   | .block size stmts _ _ => let _ ← lowerBlock size stmts false
   | .loop slot f b t w body => lowerLoop slot f b t w body
@@ -726,25 +1071,35 @@ partial def lowerLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
     terminate (.condBr (.v stop) exitB bodyB)
   | none => terminate (.br bodyB)
   switchTo bodyB
+  -- the counter stays a variable when nothing inside needs a cell for it
+  let others := CodeGen.hasOtherFn body || (match w with | some e => CodeGen.hasOtherFn e | none => false)
+  let ok := CodeGen.assignsNatively CodeGen.CTy.i64
+  let promote := match slot with
+    | some sl => !others && sl == 0 && !(CodeGen.slotEscapesV ok 0 sl body
+        || (match w with | some e => CodeGen.slotEscapes ok 0 sl e | none => false))
+    | none => !others
+  let pushed := !promote
   let frameSize := if slot.isSome then 1 else 0
-  rt "a68rt_enter" #[ku frameSize]
-  match slot with
-  | some sl => rt "a68rt_set_int" #[ku 0, ku sl, .v i]
-  | none => pure ()
+  if pushed then
+    rt "a68rt_enter" #[ku frameSize]
+    match slot with
+    | some sl => rt "a68rt_set_int" #[ku 0, ku sl, .v i]
+    | none => pure ()
   pushFrame (if slot.isSome then #[some (.int 0)] else #[])
+    (if promote && slot.isSome then #[some { v := i, m := .int 0 }] else #[]) pushed
   match w with
   | some wc =>
     let cnd ← toScalar (← lower wc) .bool
     let go ← newBlock; let leaveB ← newBlock
     terminate (.condBr cnd go leaveB)
     switchTo leaveB
-    rt "a68rt_leave"
+    if pushed then rt "a68rt_leave"
     terminate (.br exitB)
     switchTo go
   | none => pure ()
   lowerVoid body
   popFrame
-  rt "a68rt_leave"
+  if pushed then rt "a68rt_leave"
   terminate (.br stepB)
   switchTo stepB
   let ni ← newVar .i64
@@ -765,6 +1120,21 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     return a
   let hasLabels := stmts.any fun st => match st with | .label _ => true | _ => false
   let onStack := wantValue && stmts.any fun st => match st with | .label _ | .exit => true | _ => false
+  -- which slots become variables: the C back end's escape analysis decides
+  let plan := CodeGen.planFrame 0 size modes stmts wantValue (← get).modeTab
+  let mut pvars : Array (Option PVar) := #[]
+  for i in [0:size] do
+    match (plan.vars[i]?).join, (modes[i]?).join with
+    | some (_, cty, u), some m =>
+      let ty : Ty := match cty with | .i64 => .i64 | .f64 => .f64 | .u8 => .i1 | .u32 => .i32 | .u64 => .i64
+      let v ← newVar ty
+      let flag ← if u then some <$> newVar .i1 else pure none
+      match flag with
+      | some fl => emit (.set fl (.opnd (kb false)))
+      | none => pure ()
+      pvars := pvars.push (some { v := v, m := m, flag := flag })
+    | _, _ => pvars := pvars.push none
+  let pushed := plan.pushed || (List.range size).any fun i => (pvars[i]?.join).isNone
   -- where a jump lands: the depths to return to
   let depths : Option (Var × Var) ← if hasLabels then do
       let e ← rtv "a68rt_env_depth"
@@ -778,8 +1148,8 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     | .label id => lbl := lbl.push (id, ← newBlock)
     | _ => pure ()
   modify fun s => { s with fb := { s.fb with labelBlk := s.fb.labelBlk ++ lbl } }
-  rt "a68rt_enter" #[ku size]
-  pushFrame modes
+  if pushed then rt "a68rt_enter" #[ku size]
+  pushFrame modes pvars pushed
   if onStack then rt "a68rt_push_void"
   let endB ← newBlock
   let vp := CodeGen.voidPositions stmts wantValue
@@ -803,15 +1173,21 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       match CodeGen.strip init, modes[slot]?.join with
       | .routine _ _ _, some pm@(.proc _ _) => modify fun st => { st with procMode := some pm }
       | _, _ => pure ()
-      match modes[slot]?.join with
-      | some m =>
-        if ← storeScalar 0 slot init then pure ()
-        else
-          lowerStackM init m
-          rt "a68rt_store" #[ku 0, ku slot]
+      match (pvars[slot]?).join with
+      | some _ =>
+        match CodeGen.strip init with
+        | .lit .undef => pure ()      -- stays undefined; reads test the flag
+        | _ => let _ ← storeScalar 0 slot init; pure ()
       | none =>
-        let _ ← lowerStack init
-        rt "a68rt_store" #[ku 0, ku slot]
+        match modes[slot]?.join with
+        | some m =>
+          if ← storeScalar 0 slot init then pure ()
+          else
+            lowerStackM init m
+            rt "a68rt_store" #[ku 0, ku slot]
+        | none =>
+          let _ ← lowerStack init
+          rt "a68rt_store" #[ku 0, ku slot]
       modify fun st => { st with procMode := none }
     | .unit e =>
       if vp[i]! == true then lowerVoid e
@@ -828,7 +1204,7 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
         switchTo b
         rt "a68rt_jump_clear"
         let e1 ← newVar .i32
-        emit (.set e1 (.bin .addI (.v e) (ku 1)))
+        emit (.set e1 (.bin .addI (.v e) (ku (if pushed then 1 else 0))))
         rt "a68rt_env_truncate" #[.v e1]
         rt "a68rt_stack_truncate" #[.v s]
         if onStack then rt "a68rt_push_void"
@@ -841,7 +1217,7 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
   terminate (.br endB)
   switchTo endB
   popFrame
-  rt "a68rt_leave"
+  if pushed then rt "a68rt_leave"
   return (if wantValue then result else .stack)
 
 /-- A routine text as a function of its own (boxed convention); returns its index. -/
