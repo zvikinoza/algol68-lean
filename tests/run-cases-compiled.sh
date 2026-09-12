@@ -10,6 +10,8 @@ pass=0; fail=0
 work=$(mktemp -d)
 for f in "$ROOT"/cases/*.a68; do
   base="${f%.a68}"; n=$(basename "$f")
+  # a case marked `evaluator only` uses `evaluate`, which compiled programs do not have
+  if head -1 "$f" | grep -q "evaluator only"; then continue; fi
   exe="$work/p"
   if ! ( cd "$ROOT/cases" && gtimeout 900 "$BIN" compile "$n" "$OPT" -o "$exe" >/dev/null 2>&1 ); then
     # a program a68g rejects is expected not to compile

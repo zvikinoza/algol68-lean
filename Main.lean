@@ -58,6 +58,11 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
     match (← compile file) with
     | none => return 1
     | some (core0, modes, ll) =>
+      -- `evaluate` compiles Algol 68 text while the program runs: it needs the evaluator,
+      -- which a compiled program does not carry
+      if Opt.usesBuiltin "evaluate" core0 then
+        IO.eprintln s!"a68lean: error: {file}: `evaluate` is not available in compiled programs; use `a68lean run`."
+        return 1
       let src ← readSource file
       let toks := A68.lex src
       let core ← Opt.run core0 level
@@ -67,22 +72,7 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
       let cFile := out ++ ".c"
       IO.FS.writeFile cFile cCode
       if cOnly then IO.println s!"wrote {cFile}"; return 0
-      -- link against the Lean runtime and this compiler's runtime library
-      let leanPrefix ← match (← IO.getEnv "LEAN_SYSROOT") with
-        | some p => pure p
-        | none => do
-          let home := (← IO.getEnv "HOME").getD ""
-          let cands := ["lean", home ++ "/.elan/bin/lean"]
-          let mut found := ""
-          for c in cands do
-            if found.isEmpty then
-              try
-                let o ← IO.Process.output { cmd := c, args := #["--print-prefix"] }
-                if o.exitCode == 0 then found := o.stdout.trim
-              catch _ => pure ()
-          if found.isEmpty then
-            IO.eprintln "a68lean: cannot find the Lean toolchain; set LEAN_SYSROOT"
-          pure found
+      -- link against this compiler's runtime library (plain C) and the C library
       let libDir ← match (← IO.getEnv "A68LEAN_LIB") with
         | some p => pure p
         | none => do
@@ -92,10 +82,7 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
           | some root => pure (root / "lib").toString
           | none => pure ((← IO.currentDir) / ".lake" / "build" / "lib").toString
       let cc := (← IO.getEnv "CC").getD "cc"
-      let args := #[cFile, libDir ++ "/libalgol68_A68.a", libDir ++ "/liba68stubs.a", "-I" ++ leanPrefix ++ "/include",
-                    "-L" ++ leanPrefix ++ "/lib/lean", "-L" ++ leanPrefix ++ "/lib",
-                    "-lleancpp", "-lInit", "-lStd", "-lLean", "-lleanrt", "-lc++", "-lLake",
-                    "-lgmp", "-luv", "-lssl", "-lcrypto", "-w", "-O2", "-o", out]
+      let args := #[cFile, libDir ++ "/liba68rt.a", "-lm", "-w", "-O2", "-o", out]
       let r ← IO.Process.output { cmd := cc, args := args }
       if r.exitCode != 0 then
         IO.eprintln s!"a68lean: C compiler failed:\n{r.stderr}"

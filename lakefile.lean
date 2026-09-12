@@ -4,38 +4,36 @@ open Lake DSL System
 package algol68 where
   version := v!"0.2.0"
 
-/-- Default definitions of the two hooks that compiled programs override.
-    They are linked into the `a68lean` executable only; a compiled program
-    provides its own and links just the Lean library. -/
-target stubs.o pkg : FilePath := do
-  let oFile := pkg.buildDir / "csrc" / "stubs.o"
-  let srcJob ← inputTextFile <| pkg.dir / "csrc" / "stubs.c"
-  let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
-  buildO oFile srcJob flags
+/-- The C runtime of compiled programs, plain C (docs/GC-DESIGN.md, docs/ARCHITECTURE.md):
+    values, frames and the collector (rt.c), the tables of a program, transput and the
+    prelude, the general operators, number formatting, multi-precision arithmetic and the
+    operating-system services.  A compiled program links this archive and the C library
+    only; the `a68lean` executable links it too, for the services the evaluator shares. -/
+def rtSources : Array String :=
+  #["rt", "tables", "io", "prelude", "ops", "os", "fmt", "bigint", "mp", "mpmath", "mpfmt", "mprt"]
 
-/-- Operating-system services of the standard environment (processes, pipes, directories,
-    time, regular expressions), linked into `a68lean` and into compiled programs alike. -/
-target sys.o pkg : FilePath := do
-  let oFile := pkg.buildDir / "csrc" / "sys.o"
-  let srcJob ← inputTextFile <| pkg.dir / "csrc" / "sys.c"
-  let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
-  buildO oFile srcJob flags
+extern_lib liba68rt pkg := do
+  let name := nameToStaticLib "a68rt"
+  let mut jobs := #[]
+  for n in rtSources do
+    let oFile := pkg.buildDir / "csrc" / (n ++ ".o")
+    let srcJob ← inputTextFile <| pkg.dir / "csrc" / (n ++ ".c")
+    jobs := jobs.push (← buildO oFile srcJob #["-fPIC", "-O2", "-ffp-contract=off"])
+  buildStaticLib (pkg.staticLibDir / name) jobs
 
-/-- The C runtime of compiled programs: their values, frames and operand stack in C memory
-    (docs/GC-DESIGN.md).  Linked into compiled programs; the interpreter links stubs for the
-    few entry points the Lean side calls. -/
-target rt.o pkg : FilePath := do
-  let oFile := pkg.buildDir / "csrc" / "rt.o"
-  let srcJob ← inputTextFile <| pkg.dir / "csrc" / "rt.c"
-  let flags := #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"]
-  buildO oFile srcJob flags
+/-- The evaluator's side of the C code: the `@[extern]` wrappers of the operating-system
+    services (sys.c) and the hooks compiled programs override (stubs.c).  Linked into
+    `a68lean` only. -/
+def stubSources : Array String := #["stubs", "sys"]
 
 extern_lib liba68stubs pkg := do
   let name := nameToStaticLib "a68stubs"
-  let job ← fetch <| pkg.target ``stubs.o
-  let sysJob ← fetch <| pkg.target ``sys.o
-  let rtJob ← fetch <| pkg.target ``rt.o
-  buildStaticLib (pkg.staticLibDir / name) #[job, sysJob, rtJob]
+  let mut jobs := #[]
+  for n in stubSources do
+    let oFile := pkg.buildDir / "csrc" / (n ++ ".o")
+    let srcJob ← inputTextFile <| pkg.dir / "csrc" / (n ++ ".c")
+    jobs := jobs.push (← buildO oFile srcJob #["-I", (← getLeanIncludeDir).toString, "-fPIC", "-O2"])
+  buildStaticLib (pkg.staticLibDir / name) jobs
 
 @[default_target]
 lean_lib A68 where

@@ -1,0 +1,8 @@
+# evaluator only: a68g `evaluate` compiles Algol 68 text at run time; a68lean compile rejects it #
+# evaluate sees the names of its caller #
+INT n := 6;
+PROC twice = (INT k) INT: 2 * k;
+print((evaluate("n * 7"), newline));
+print((evaluate("n := 9"), n, newline));
+PROC with x = (STRING code, INT x) STRING: evaluate(code);
+print((with x("x ** 2", 5), with x("code", 1), newline));

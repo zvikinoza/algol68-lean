@@ -19,13 +19,6 @@ print((i, r, " ", w, newline));
 STRING src2 := "34 567";
 getsf(src2, ($2d, x, 3d$, i, b));
 print((i, b, newline));
-# evaluate sees the names of its caller #
-INT n := 6;
-PROC twice = (INT k) INT: 2 * k;
-print((evaluate("n * 7"), newline));
-print((evaluate("n := 9"), n, newline));
-PROC with x = (STRING code, INT x) STRING: evaluate(code);
-print((with x("x ** 2", 5), with x("code", 1), newline));
 # BYTES #
 BYTES by = bytes pack("Hello");
 print((STRING(by), "|", UPB STRING(by), 1 ELEM by, ABS (6 ELEM by), newline));

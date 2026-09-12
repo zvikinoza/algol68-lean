@@ -155,6 +155,32 @@ partial def size : Core → Nat
     1 + size f + size b + (t.map size).getD 0 + (w.map size).getD 0 + size body
   | _ => 1
 
+/-- Whether a standard procedure occurs in the program (`a68lean compile` refuses
+    `evaluate`, which compiles Algol 68 text at run time and needs the evaluator). -/
+partial def usesBuiltin (name : String) : Core → Bool
+  | .lit (.builtin n) => n == name
+  | .deref e | .deproc e | .rowOf e | .voiding e | .gen e | .at _ e
+  | .widen _ _ e | .unite _ e | .monop _ _ e | .select _ e _ => usesBuiltin name e
+  | .assign a b _ | .identRel a b _ | .andThen a b | .orElse a b | .seq a b => usesBuiltin name a || usesBuiltin name b
+  | .dyop _ _ _ a b => usesBuiltin name a || usesBuiltin name b
+  | .call f args => usesBuiltin name f || args.any (usesBuiltin name)
+  | .routine _ _ b => usesBuiltin name b
+  | .slice a idx _ => usesBuiltin name a || idx.any (fun
+      | .index e => usesBuiltin name e
+      | .trim l u a => (l.map (usesBuiltin name)).getD false || (u.map (usesBuiltin name)).getD false || (a.map (usesBuiltin name)).getD false)
+  | .newRow bs i _ => usesBuiltin name i || bs.any (fun (l, u) => usesBuiltin name l || usesBuiltin name u)
+  | .block _ stmts _ _ => stmts.toList.any (fun
+      | .decl _ _ c => usesBuiltin name c
+      | .unit c => usesBuiltin name c
+      | _ => false)
+  | .collateral es _ _ => es.any (usesBuiltin name)
+  | .cond c t e => usesBuiltin name c || usesBuiltin name t || usesBuiltin name e
+  | .caseInt s alts o => usesBuiltin name s || alts.any (usesBuiltin name) || usesBuiltin name o
+  | .caseConf s alts o => usesBuiltin name s || alts.any (fun (_, _, c) => usesBuiltin name c) || usesBuiltin name o
+  | .loop _ f b t w body =>
+    usesBuiltin name f || usesBuiltin name b || (t.map (usesBuiltin name)).getD false || (w.map (usesBuiltin name)).getD false || usesBuiltin name body
+  | _ => false
+
 /-! ## Helpers shared by the `-O2` passes -/
 
 /-- The scalar (non-composite) values: exactly the ones a literal may hold. -/

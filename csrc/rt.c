@@ -1,11 +1,10 @@
 /* The C runtime of a compiled program: Algol 68 values in C memory.
 
    A program compiled by a68lean keeps every value here — its frames, its operand stack,
-   its names, rows, structures, unions and closures — and calls the Lean services
-   (`A68/Runtime.lean`) only for what is computed on copies: transput, formatting, the
-   arithmetic of `LONG` modes, the standard prelude.  Values cross in the `A68.Blob`
-   encoding; names, closures and format texts cross as addresses that the Lean side
-   reaches back through (`a68c_load` and its relatives at the end of this file).
+   its names, rows, structures, unions and closures.  The rest of the runtime is plain C
+   too: transput and the prelude (io.c, prelude.c), the general operators and coercions
+   (ops.c), number formatting (fmt.c), multi-precision arithmetic (mp*.c) and the
+   operating-system services (os.c); a compiled program links these and the C library.
 
    The semantics of every entry point are those of the evaluator (`A68/Interp.lean`), whose
    names are quoted where a rule is reproduced.  The representation is described in
@@ -25,59 +24,15 @@
    * The emitted C never holds a heap pointer in a C variable across a call; every live
      value is on the operand stack, in a frame reachable from the environment, or in the
      saved-environment stack.  Those are the collector's roots. */
-#include <lean/lean.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-/* ---------------------------------------------------------------- values */
-
-enum {
-  T_UNDEF = 0, T_INT, T_REAL, T_BOOL, T_CHAR, T_BITS, T_VOID, T_NIL,
-  T_REF, T_ROW, T_STRUCT, T_UNION, T_CPROC, T_FMT, T_BUILTIN, T_FILE,
-  T_MP, T_BIGINT, T_BIGBITS, T_LREF
-};
-
-typedef struct a68_obj a68_obj;
-
-typedef struct a68_val {
-  uint32_t tag;
-  uint32_t aux;    /* REF: offset; UNION: mode; CPROC: fn | nparams << 24; FMT: skeleton;
-                      BUILTIN: string index; FILE: id; LREF: cell */
-  union { int64_t i; double r; uint64_t u; a68_obj* p; } v;
-} a68_val;
-
-static inline int tag_is_ptr(uint32_t t) {
-  return t == T_REF || t == T_ROW || t == T_STRUCT || t == T_UNION || t == T_CPROC
-      || t == T_FMT || t == T_MP || t == T_BIGINT || t == T_BIGBITS;
-}
-
-/* ---------------------------------------------------------------- objects */
-
-enum { K_SLOTS = 1, K_LEAF = 2, K_ROWD = 3, K_FRAME = 4 };
-enum { EK_BYTES = 0xff };           /* a leaf of raw bytes: decimal digits, MP digits */
-
-struct a68_obj {
-  uint8_t  kind;
-  uint8_t  mark;
-  uint16_t ek;      /* leaf: element tag (T_INT … T_BITS) or EK_BYTES */
-  uint32_t n;       /* slots: slot count; leaf: element count; rowd: dimensions; frame: cells */
-  uint32_t rc;      /* store: descriptors sharing it (copy-on-write); others unused */
-  uint32_t size;    /* bytes, header included */
-  a68_obj* next;    /* every object, for the sweep */
-};
-
-typedef struct { a68_obj h; a68_val s[]; } a68_slots;
-typedef struct { a68_obj h; uint8_t d[]; } a68_leaf;     /* elements, then a bitmap of defined ones */
-typedef struct { int64_t l, u, stride; } a68_dim;
-/* `field`: one plus the field a multiple selection through a name picks in every element,
-   0 for a plain row (`Interp.readPath` with `.field` on a row) */
-typedef struct { a68_obj h; a68_obj* base; int64_t off; uint32_t field; uint32_t pad2; a68_dim dim[]; } a68_rowd;
-typedef struct a68_frame { a68_obj h; struct a68_frame* parent; uint32_t depth; uint32_t pad; a68_val c[]; } a68_frame;
-
-#define VIEW_OFF 0xffffffffu        /* a REF whose target is the row a view describes */
+#include "a68rt.h"
+#include "tables.h"
+#include "io.h"
 
 static a68_obj* all_objects = NULL;
 static uint64_t bytes_allocated = 0;      /* since the last collection */
@@ -95,7 +50,7 @@ static double gc_seconds = 0.0;
 static void gc_collect(void);
 #define GC_POLL() do { if (__builtin_expect(gc_wanted, 0)) gc_collect(); } while (0)
 
-static void* xmalloc(size_t n) {
+void*  xmalloc(size_t n) {
   void* p = calloc(1, n ? n : 1);
   if (!p) { fprintf(stderr, "a68lean: out of memory\n"); exit(1); }
   return p;
@@ -120,7 +75,7 @@ static size_t leaf_esize(uint16_t ek) {
   }
 }
 
-static a68_leaf* leaf_alloc(uint16_t ek, uint32_t n) {
+a68_leaf*  leaf_alloc(uint16_t ek, uint32_t n) {
   size_t es = leaf_esize(ek);
   size_t bytes = (size_t) n * es + (ek == EK_BYTES ? 0 : (n + 7) / 8);
   a68_leaf* l = (a68_leaf*) obj_alloc(K_LEAF, sizeof(a68_leaf) + bytes);
@@ -130,161 +85,60 @@ static a68_leaf* leaf_alloc(uint16_t ek, uint32_t n) {
   return l;
 }
 
-static a68_slots* slots_alloc(uint32_t n) {
+a68_slots*  slots_alloc(uint32_t n) {
   a68_slots* s = (a68_slots*) obj_alloc(K_SLOTS, sizeof(a68_slots) + (size_t) n * sizeof(a68_val));
   s->h.n = n;
   return s;
 }
 
-static a68_rowd* rowd_alloc(uint32_t ndims) {
+a68_rowd*  rowd_alloc(uint32_t ndims) {
   a68_rowd* r = (a68_rowd*) obj_alloc(K_ROWD, sizeof(a68_rowd) + (size_t) ndims * sizeof(a68_dim));
   r->h.n = ndims;
   return r;
 }
 
-/* ---------------------------------------------------------------- the Lean services */
+/* ---------------------------------------------------------------- the other modules */
 
-extern uint32_t a68_line_no;
-extern uint32_t a68_jump_flag;
-void a68_set_state(lean_object* s);
-
-lean_object* a68l_boot(lean_object* blob, uint32_t ll, uint8_t reg, lean_object* args, lean_object* w);
-lean_object* a68l_finish(lean_object* w);
-lean_object* a68l_stop(lean_object* w);
-lean_object* a68l_die(lean_object* msg, lean_object* w);
-lean_object* a68l_flush(lean_object* w);
-lean_object* a68l_call(lean_object* name, lean_object* args, uint32_t nargs, lean_object* w);
-lean_object* a68l_dyop(lean_object* op, uint32_t m1, uint32_t m2, lean_object* args, lean_object* w);
-lean_object* a68l_monop(lean_object* op, uint32_t m, lean_object* arg, lean_object* w);
-lean_object* a68l_widen(uint32_t src, uint32_t dst, lean_object* arg, lean_object* w);
-lean_object* a68l_skip(uint32_t m, lean_object* w);
-lean_object* a68l_conform(uint32_t m, uint32_t vm, lean_object* w);
-lean_object* a68l_mode_is_union(uint32_t m, lean_object* w);
-lean_object* a68l_lcell(uint32_t c, lean_object* w);
-lean_object* a68l_lstore(uint32_t c, lean_object* b, lean_object* w);
+uint32_t a68_line_no = 0;      /* the source line the program last reached (`a68rt_line`) */
+uint32_t a68_jump_flag = 0;    /* the label a jump is heading for, plus one; zero when none */
 
 /* supplied by the compiled program */
 void a68_dispatch_proc(size_t fn);
 void a68_dispatch_hole(size_t idx);
 
-#define LW lean_io_mk_world()
+/* ops.c */
+a68_val ops_dyadic(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_val b);
+a68_val ops_monadic(const char* op, uint32_t m, a68_val v);
+a68_val ops_widen(uint32_t src, uint32_t dst, a68_val v);
+a68_val ops_default(uint32_t m);
+int ops_conform(uint32_t m, uint32_t vm);
+int ops_mode_is_union(uint32_t m);
 
-static lean_object* io_ok(lean_object* r) {
-  if (lean_io_result_is_error(r)) { lean_io_result_show_error(r); exit(1); }
-  lean_object* v = lean_io_result_get_value(r);
-  lean_inc(v);
-  lean_dec(r);
-  return v;
-}
-static void io_unit(lean_object* r) {
-  if (lean_io_result_is_error(r)) { lean_io_result_show_error(r); exit(1); }
-  lean_dec(r);
-}
-static uint32_t io_u32(lean_object* r) {
-  if (lean_io_result_is_error(r)) { lean_io_result_show_error(r); exit(1); }
-  uint32_t v = lean_unbox_uint32(lean_io_result_get_value(r));
-  lean_dec(r);
-  return v;
-}
-static uint8_t io_u8(lean_object* r) {
-  if (lean_io_result_is_error(r)) { lean_io_result_show_error(r); exit(1); }
-  uint8_t v = (uint8_t) lean_unbox(lean_io_result_get_value(r));
-  lean_dec(r);
-  return v;
-}
+__attribute__((noreturn)) void die(const char* msg) { io_die(msg); }
 
-__attribute__((noreturn)) static void die(const char* msg) {
-  io_unit(a68l_die(lean_mk_string(msg), LW));
-  exit(1);
-}
-
-__attribute__((noreturn)) static void dief(const char* fmt, int64_t a, int64_t b, int64_t c) {
+__attribute__((noreturn)) void dief(const char* fmt, int64_t a, int64_t b, int64_t c) {
   char buf[256];
   snprintf(buf, sizeof buf, fmt, (long long) a, (long long) b, (long long) c);
   die(buf);
 }
 
-/* Objects the Lean side keeps beyond a call — the name an `associate`d file writes, the
-   routine an `on logical file end` calls — are pinned for the rest of the run. */
-static a68_obj** pins = NULL;
-static size_t npins = 0, pins_cap = 0;
-
-static void pin(a68_obj* o) {
-  if (!o) return;
-  for (size_t i = 0; i < npins; i++) if (pins[i] == o) return;
-  if (npins == pins_cap) {
-    pins_cap = pins_cap ? pins_cap * 2 : 64;
-    pins = (a68_obj**) realloc(pins, pins_cap * sizeof(a68_obj*));
-    if (!pins) { fprintf(stderr, "a68lean: out of memory\n"); exit(1); }
-  }
-  pins[npins++] = o;
-}
-
 /* ---------------------------------------------------------------- tables */
 
-static char** strtab = NULL;       /* the program's string table: literals, names */
-static size_t* strlen_tab = NULL;
-static size_t nstr = 0;
-
-typedef struct { char kind[10]; int64_t len; } mode_info;
-static mode_info* modetab = NULL;
-static size_t nmode = 0;
-
-static int hexval(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-  return 0;
-}
-
-/* Every line of the blob defines one entry of every table (`A68.Serial`): the string and
-   mode tables are read here, the rest stays with the Lean side. */
-static void parse_tables(const char* blob) {
-  size_t lines = 1;
-  for (const char* p = blob; *p; p++) if (*p == '\n') lines++;
-  strtab = (char**) xmalloc(lines * sizeof(char*));
-  strlen_tab = (size_t*) xmalloc(lines * sizeof(size_t));
-  modetab = (mode_info*) xmalloc(lines * sizeof(mode_info));
-  const char* p = blob;
-  size_t i = 0;
-  while (1) {
-    const char* e = strchr(p, '\n');
-    size_t n = e ? (size_t) (e - p) : strlen(p);
-    strtab[i] = (char*) xmalloc(1); strlen_tab[i] = 0;
-    strcpy(modetab[i].kind, ""); modetab[i].len = 0;
-    if (n >= 2 && p[0] == 's' && p[1] == ' ') {
-      size_t hn = n - 2;
-      char* s = (char*) xmalloc(hn / 2 + 1);
-      for (size_t k = 0; k + 1 < hn; k += 2) s[k / 2] = (char) (hexval(p[2 + k]) * 16 + hexval(p[3 + k]));
-      free(strtab[i]);
-      strtab[i] = s; strlen_tab[i] = hn / 2;
-    } else if (n >= 2 && p[0] == 'm' && p[1] == ' ') {
-      char kind[10] = {0};
-      long long len = 0;
-      sscanf(p + 2, "%9s %lld", kind, &len);
-      strcpy(modetab[i].kind, kind);
-      modetab[i].len = len;
-    }
-    i++;
-    if (!e) break;
-    p = e + 1;
-  }
-  nstr = nmode = i;
-}
-
-static lean_object* lstr_of_table(uint32_t i) {
-  return lean_mk_string_from_bytes(strtab[i], strlen_tab[i]);
-}
+char** strtab = NULL;       /* the program's string table: literals, names (tables.c) */
+size_t* strlen_tab = NULL;
+size_t nstr = 0;
 
 /* ---------------------------------------------------------------- stacks */
 
-static a68_val* stack = NULL;
-static size_t sp = 0, stack_cap = 0;
+a68_val* stack = NULL;
+size_t sp = 0;
+static size_t stack_cap = 0;
 
 static a68_frame* env = NULL;              /* the innermost frame */
 static a68_frame** saved = NULL;           /* environments saved by env_set */
 static size_t nsaved = 0, saved_cap = 0;
 
-static inline void push(a68_val v) {
+void  push(a68_val v) {
   if (sp == stack_cap) {
     stack_cap = stack_cap ? stack_cap * 2 : 1024;
     stack = (a68_val*) realloc(stack, stack_cap * sizeof(a68_val));
@@ -293,23 +147,23 @@ static inline void push(a68_val v) {
   stack[sp++] = v;
 }
 
-static inline a68_val pop(void) {
+a68_val  pop(void) {
   if (sp == 0) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
   return stack[--sp];
 }
 
-static inline a68_val* top(void) {
+a68_val*  top(void) {
   if (sp == 0) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
   return &stack[sp - 1];
 }
 
-static a68_val mk_int(int64_t i) { a68_val v; v.tag = T_INT; v.aux = 0; v.v.i = i; return v; }
-static a68_val mk_real(double r) { a68_val v; v.tag = T_REAL; v.aux = 0; v.v.r = r; return v; }
-static a68_val mk_bool(int b) { a68_val v; v.tag = T_BOOL; v.aux = 0; v.v.u = b ? 1 : 0; return v; }
-static a68_val mk_char(uint32_t c) { a68_val v; v.tag = T_CHAR; v.aux = 0; v.v.u = c; return v; }
-static a68_val mk_bits(uint64_t b) { a68_val v; v.tag = T_BITS; v.aux = 0; v.v.u = b; return v; }
-static a68_val mk_tag(uint32_t t) { a68_val v; v.tag = t; v.aux = 0; v.v.u = 0; return v; }
-static a68_val mk_ptr(uint32_t t, a68_obj* p, uint32_t aux) { a68_val v; v.tag = t; v.aux = aux; v.v.p = p; return v; }
+a68_val  mk_int(int64_t i) { a68_val v; v.tag = T_INT; v.aux = 0; v.v.i = i; return v; }
+a68_val  mk_real(double r) { a68_val v; v.tag = T_REAL; v.aux = 0; v.v.r = r; return v; }
+a68_val  mk_bool(int b) { a68_val v; v.tag = T_BOOL; v.aux = 0; v.v.u = b ? 1 : 0; return v; }
+a68_val  mk_char(uint32_t c) { a68_val v; v.tag = T_CHAR; v.aux = 0; v.v.u = c; return v; }
+a68_val  mk_bits(uint64_t b) { a68_val v; v.tag = T_BITS; v.aux = 0; v.v.u = b; return v; }
+a68_val  mk_tag(uint32_t t) { a68_val v; v.tag = t; v.aux = 0; v.v.u = 0; return v; }
+a68_val  mk_ptr(uint32_t t, a68_obj* p, uint32_t aux) { a68_val v; v.tag = t; v.aux = aux; v.v.p = p; return v; }
 
 static a68_frame* frame_alloc(uint32_t n) {
   a68_frame* f = (a68_frame*) obj_alloc(K_FRAME, sizeof(a68_frame) + (size_t) n * sizeof(a68_val));
@@ -329,14 +183,14 @@ static a68_val* cell_of(uint32_t depth, uint32_t slot) {
 
 /* ---------------------------------------------------------------- rows */
 
-static inline a68_obj* rowd_store(const a68_rowd* r) {
+a68_obj*  rowd_store(const a68_rowd* r) {
   return r->base->kind == K_ROWD ? ((a68_rowd*) r->base)->base : r->base;
 }
 static inline a68_rowd* rowd_owner(a68_rowd* r) {
   return r->base->kind == K_ROWD ? (a68_rowd*) r->base : r;
 }
 
-static int64_t row_count(const a68_rowd* r) {
+int64_t  row_count(const a68_rowd* r) {
   int64_t n = 1;
   for (uint32_t k = 0; k < r->h.n; k++) {
     int64_t d = r->dim[k].u - r->dim[k].l + 1;
@@ -347,7 +201,7 @@ static int64_t row_count(const a68_rowd* r) {
 }
 
 /* the store index of the element at flat position `flat` in row-major order of the view */
-static int64_t row_store_index(const a68_rowd* r, int64_t flat) {
+int64_t  row_store_index(const a68_rowd* r, int64_t flat) {
   int64_t idx = r->off;
   for (uint32_t k = r->h.n; k > 0; k--) {
     int64_t ext = r->dim[k - 1].u - r->dim[k - 1].l + 1;
@@ -358,7 +212,7 @@ static int64_t row_store_index(const a68_rowd* r, int64_t flat) {
   return idx;
 }
 
-static a68_val store_get(a68_obj* st, int64_t idx) {
+a68_val  store_get(a68_obj* st, int64_t idx) {
   if (st->kind == K_SLOTS) return ((a68_slots*) st)->s[idx];
   a68_leaf* l = (a68_leaf*) st;
   size_t es = leaf_esize(l->h.ek);
@@ -383,7 +237,7 @@ static int leaf_accepts(uint16_t ek, const a68_val* v) {
   return 1;
 }
 
-static void store_set(a68_obj* st, int64_t idx, a68_val v) {
+void  store_set(a68_obj* st, int64_t idx, a68_val v) {
   if (st->kind == K_SLOTS) { ((a68_slots*) st)->s[idx] = v; return; }
   a68_leaf* l = (a68_leaf*) st;
   size_t es = leaf_esize(l->h.ek);
@@ -401,18 +255,18 @@ static void store_set(a68_obj* st, int64_t idx, a68_val v) {
 }
 
 /* a store of `n` elements able to hold `sample`, and everything a leaf of its kind holds */
-static a68_obj* store_alloc_for(uint32_t n, const a68_val* sample) {
+a68_obj*  store_alloc_for(uint32_t n, const a68_val* sample) {
   if (sample && (sample->tag == T_INT || sample->tag == T_REAL || sample->tag == T_BITS
                  || sample->tag == T_BOOL || (sample->tag == T_CHAR && sample->v.u < 256)))
     return (a68_obj*) leaf_alloc((uint16_t) sample->tag, n);
   return (a68_obj*) slots_alloc(n);
 }
 
-static a68_obj* store_alloc_slots(uint32_t n) { return (a68_obj*) slots_alloc(n); }
+a68_obj*  store_alloc_slots(uint32_t n) { return (a68_obj*) slots_alloc(n); }
 
 /* The element at a store index of the row a descriptor describes, through its field
    selection when it has one. */
-static a68_val rowd_get(const a68_rowd* r, int64_t idx) {
+a68_val  rowd_get(const a68_rowd* r, int64_t idx) {
   a68_val e = store_get(rowd_store(r), idx);
   if (r->field) {
     if (e.tag != T_STRUCT) die("internal: field selection on non-struct element");
@@ -438,7 +292,7 @@ static a68_val* rowd_slot(a68_rowd* r, int64_t idx) {
 }
 
 static void assign_slot(a68_val* s, a68_val v, int flex, int checked);
-static void rowd_put(a68_rowd* r, int64_t idx, a68_val v) {
+void  rowd_put(a68_rowd* r, int64_t idx, a68_val v) {
   a68_val* sl = rowd_slot(r, idx);
   if (sl) assign_slot(sl, v, 1, 0);
   else store_set(rowd_store(r), idx, v);
@@ -482,7 +336,7 @@ static a68_rowd* rowd_share(const a68_rowd* r) {
 }
 
 /* a fresh row with canonical layout holding copies of the elements of `r` */
-static a68_val copy_value(a68_val v);
+a68_val  copy_value(a68_val v);
 static a68_rowd* row_canonical_copy(const a68_rowd* r) {
   int64_t n = row_count(r);
   a68_obj* st = rowd_store(r);
@@ -509,7 +363,7 @@ static a68_rowd* row_canonical_copy(const a68_rowd* r) {
   return c;
 }
 
-static a68_val copy_value(a68_val v) {
+a68_val  copy_value(a68_val v) {
   switch (v.tag) {
     case T_ROW: return mk_ptr(T_ROW, (a68_obj*) rowd_share((a68_rowd*) v.v.p), 0);
     case T_STRUCT: {
@@ -538,7 +392,7 @@ static a68_val* ref_slot(a68_val r) {
   return NULL;
 }
 
-static a68_val ref_load(a68_val r) {
+a68_val  ref_load(a68_val r) {
   a68_obj* b = r.v.p;
   if (b->kind == K_ROWD) {
     a68_rowd* d = (a68_rowd*) b;
@@ -549,19 +403,18 @@ static a68_val ref_load(a68_val r) {
   return copy_value(*s);
 }
 
-static a68_val deref(a68_val r) {
+a68_val  deref(a68_val r) {
   switch (r.tag) {
     case T_REF: return ref_load(r);
     case T_FILE: return r;
     case T_NIL: die("attempt to dereference NIL");
     case T_UNDEF: die("attempt to use an uninitialised REF value");
-    case T_LREF: return r;   /* resolved by the caller through the Lean side */
     default: die("internal: dereferencing a non-REF");
   }
 }
 
 /* The descriptor a row name designates: the variable's own, or a view. */
-static a68_rowd* ref_rowd(a68_val r) {
+a68_rowd*  ref_rowd(a68_val r) {
   a68_obj* b = r.v.p;
   if (b->kind == K_ROWD) {
     if (r.aux == VIEW_OFF) return (a68_rowd*) b;
@@ -662,14 +515,8 @@ static void assign_slot(a68_val* s, a68_val v, int flex, int checked) {
 }
 
 /* `Interp.assignTo`: the checks, then the write. */
-static void assign_ref(a68_val d, a68_val v, int flex) {
+void  assign_ref(a68_val d, a68_val v, int flex) {
   if (d.tag == T_NIL) die("attempt to assign to NIL");
-  if (d.tag == T_LREF) {
-    /* a name the Lean side made: hand the value over */
-    extern lean_object* encode_blob(a68_val v);
-    io_unit(a68l_lstore(d.aux, encode_blob(v), LW));
-    return;
-  }
   if (d.tag != T_REF) die("internal: assignment to a non-REF");
   if (v.tag == T_UNDEF) die("attempt to use an uninitialised value");
   a68_obj* b = d.v.p;
@@ -711,12 +558,7 @@ static void assign_ref(a68_val d, a68_val v, int flex) {
 }
 
 /* `Interp.writeRef`: write without the assignment's checks. */
-static void store_ref(a68_val d, a68_val v) {
-  if (d.tag == T_LREF) {
-    extern lean_object* encode_blob(a68_val v);
-    io_unit(a68l_lstore(d.aux, encode_blob(v), LW));
-    return;
-  }
+void  store_ref(a68_val d, a68_val v) {
   if (d.tag != T_REF) die("internal: assignment to a non-REF");
   a68_obj* b = d.v.p;
   if (b->kind == K_ROWD) {
@@ -746,7 +588,7 @@ static void store_ref(a68_val d, a68_val v) {
 }
 
 /* The name of field `f` of the structure a name refers to. */
-static a68_val ref_field(a68_val r, uint32_t f) {
+a68_val  ref_field(a68_val r, uint32_t f) {
   if (r.tag == T_NIL) die("attempt to select from NIL");
   if (r.tag != T_REF) die("internal: select via non-REF");
   a68_obj* b = r.v.p;
@@ -864,7 +706,7 @@ static void gc_mark(void) {
   for (size_t i = 0; i < sp; i++) gc_push_val(&stack[i]);
   gc_push_obj((a68_obj*) env);
   for (size_t i = 0; i < nsaved; i++) gc_push_obj((a68_obj*) saved[i]);
-  for (size_t i = 0; i < npins; i++) gc_push_obj(pins[i]);
+  io_gc_roots(gc_push_val);
   while (nwork) {
     a68_obj* o = worklist[--nwork];
     switch (o->kind) {
@@ -953,245 +795,26 @@ static void gc_init(void) {
 }
 
 /* a68g's collector procedures: `sweep heap`, `collections`, `garbage`, `garbage seconds` */
-lean_object* a68c_gc(uint32_t what, lean_object* w) {
-  (void) w;
+double a68_gc_query(uint32_t what) {
   switch (what) {
-    case 0: gc_collect(); return lean_io_result_mk_ok(lean_box_float(0.0));
-    case 1: return lean_io_result_mk_ok(lean_box_float((double) gc_collections));
-    case 2: return lean_io_result_mk_ok(lean_box_float((double) gc_freed_bytes));
-    case 3: return lean_io_result_mk_ok(lean_box_float(gc_seconds));
-    default: return lean_io_result_mk_ok(lean_box_float(0.0));
+    case 0: gc_collect(); return 0.0;
+    case 1: return (double) gc_collections;
+    case 2: return (double) gc_freed_bytes;
+    case 3: return gc_seconds;
+    default: return 0.0;
   }
 }
 
-/* ---------------------------------------------------------------- the blob codec */
-
-typedef struct { uint8_t* p; size_t n, cap; } buf;
-
-static void buf_put(buf* b, const void* d, size_t n) {
-  if (b->n + n > b->cap) {
-    b->cap = (b->n + n) * 2 + 64;
-    b->p = (uint8_t*) realloc(b->p, b->cap);
-    if (!b->p) { fprintf(stderr, "a68lean: out of memory\n"); exit(1); }
-  }
-  memcpy(b->p + b->n, d, n);
-  b->n += n;
-}
-static void put8(buf* b, uint8_t x) { buf_put(b, &x, 1); }
-static void put32(buf* b, uint32_t x) { buf_put(b, &x, 4); }
-static void put64(buf* b, uint64_t x) { buf_put(b, &x, 8); }
-static void putstrn(buf* b, const uint8_t* s, uint32_t n) { put32(b, n); buf_put(b, s, n); }
-
-enum { B_UNDEF = 0, B_INT, B_BIGINT, B_REAL, B_BOOL, B_CHAR, B_BITS, B_BIGBITS, B_VOID, B_NIL, B_REF,
-       B_ROW, B_STRUCT, B_UNION, B_CPROC, B_CFMT, B_BUILTIN, B_FILE, B_MP, B_LREF };
-
-static void encode_val(buf* b, a68_val v) {
-  switch (v.tag) {
-    case T_UNDEF: put8(b, B_UNDEF); break;
-    case T_INT: put8(b, B_INT); put64(b, (uint64_t) v.v.i); break;
-    case T_REAL: put8(b, B_REAL); put64(b, v.v.u); break;
-    case T_BOOL: put8(b, B_BOOL); put8(b, (uint8_t) v.v.u); break;
-    case T_CHAR: put8(b, B_CHAR); put32(b, (uint32_t) v.v.u); break;
-    case T_BITS: put8(b, B_BITS); put64(b, v.v.u); break;
-    case T_VOID: put8(b, B_VOID); break;
-    case T_NIL: put8(b, B_NIL); break;
-    case T_REF: put8(b, B_REF); put64(b, (uint64_t) (uintptr_t) v.v.p); put32(b, v.aux); break;
-    case T_LREF: put8(b, B_LREF); put32(b, v.aux); break;
-    case T_BUILTIN: put8(b, B_BUILTIN); putstrn(b, (const uint8_t*) strtab[v.aux], (uint32_t) strlen_tab[v.aux]); break;
-    case T_FILE: put8(b, B_FILE); put32(b, v.aux); break;
-    case T_CPROC: put8(b, B_CPROC); put32(b, v.aux & 0xffffff); put32(b, v.aux >> 24); put64(b, (uint64_t) (uintptr_t) v.v.p); break;
-    case T_FMT: put8(b, B_CFMT); put64(b, (uint64_t) (uintptr_t) v.v.p); put32(b, v.aux); break;
-    case T_BIGINT: case T_BIGBITS: case T_MP: {
-      a68_leaf* l = (a68_leaf*) v.v.p;
-      put8(b, v.tag == T_BIGINT ? B_BIGINT : v.tag == T_BIGBITS ? B_BIGBITS : B_MP);
-      if (v.tag == T_MP) buf_put(b, l->d, l->h.n);   /* stored exactly as it crossed */
-      else putstrn(b, l->d, l->h.n);
-      break;
-    }
-    case T_UNION: {
-      a68_slots* s = (a68_slots*) v.v.p;
-      put8(b, B_UNION); put32(b, v.aux); encode_val(b, s->s[0]);
-      break;
-    }
-    case T_STRUCT: {
-      a68_slots* s = (a68_slots*) v.v.p;
-      put8(b, B_STRUCT); put32(b, s->h.n);
-      for (uint32_t i = 0; i < s->h.n; i++) encode_val(b, s->s[i]);
-      break;
-    }
-    case T_ROW: {
-      a68_rowd* r = (a68_rowd*) v.v.p;
-      put8(b, B_ROW); put32(b, r->h.n);
-      for (uint32_t k = 0; k < r->h.n; k++) { put64(b, (uint64_t) r->dim[k].l); put64(b, (uint64_t) r->dim[k].u); }
-      int64_t n = row_count(r);
-      put32(b, (uint32_t) n);
-
-      for (int64_t i = 0; i < n; i++) encode_val(b, rowd_get(r, row_store_index(r, i)));
-      break;
-    }
-    default: put8(b, B_UNDEF); break;
-  }
-}
-
-lean_object* encode_blob(a68_val v) {
-  buf b = {0};
-  encode_val(&b, v);
-  lean_object* r = lean_alloc_sarray(1, b.n, b.n);
-  memcpy(lean_sarray_cptr(r), b.p, b.n);
-  free(b.p);
-  return r;
-}
-
-typedef struct { const uint8_t* p; size_t n, i; } rd;
-
-static uint8_t get8(rd* r) { if (r->i + 1 > r->n) die("internal: blob truncated"); return r->p[r->i++]; }
-static uint32_t get32(rd* r) { uint32_t x; if (r->i + 4 > r->n) die("internal: blob truncated"); memcpy(&x, r->p + r->i, 4); r->i += 4; return x; }
-static uint64_t get64(rd* r) { uint64_t x; if (r->i + 8 > r->n) die("internal: blob truncated"); memcpy(&x, r->p + r->i, 8); r->i += 8; return x; }
-
-static a68_val decode_val(rd* r) {
-  uint8_t t = get8(r);
-  switch (t) {
-    case B_UNDEF: return mk_tag(T_UNDEF);
-    case B_INT: return mk_int((int64_t) get64(r));
-    case B_REAL: { a68_val v = mk_tag(T_REAL); v.v.u = get64(r); return v; }
-    case B_BOOL: return mk_bool(get8(r));
-    case B_CHAR: return mk_char(get32(r));
-    case B_BITS: return mk_bits(get64(r));
-    case B_VOID: return mk_tag(T_VOID);
-    case B_NIL: return mk_tag(T_NIL);
-    case B_REF: { uint64_t a = get64(r); uint32_t o = get32(r); return mk_ptr(T_REF, (a68_obj*) (uintptr_t) a, o); }
-    case B_LREF: { a68_val v = mk_tag(T_LREF); v.aux = get32(r); return v; }
-    case B_BUILTIN: {
-      uint32_t n = get32(r);
-      if (r->i + n > r->n) die("internal: blob truncated");
-      /* find the name in the string table; add it when the Lean side made one up */
-      for (size_t k = 0; k < nstr; k++)
-        if (strlen_tab[k] == n && memcmp(strtab[k], r->p + r->i, n) == 0) { r->i += n; a68_val v = mk_tag(T_BUILTIN); v.aux = (uint32_t) k; return v; }
-      strtab = (char**) realloc(strtab, (nstr + 1) * sizeof(char*));
-      strlen_tab = (size_t*) realloc(strlen_tab, (nstr + 1) * sizeof(size_t));
-      strtab[nstr] = (char*) xmalloc(n + 1); memcpy(strtab[nstr], r->p + r->i, n); strlen_tab[nstr] = n;
-      r->i += n;
-      a68_val v = mk_tag(T_BUILTIN); v.aux = (uint32_t) nstr; nstr++;
-      return v;
-    }
-    case B_FILE: { a68_val v = mk_tag(T_FILE); v.aux = get32(r); return v; }
-    case B_CPROC: { uint32_t fn = get32(r); uint32_t np = get32(r); uint64_t fr = get64(r); return mk_ptr(T_CPROC, (a68_obj*) (uintptr_t) fr, fn | (np << 24)); }
-    case B_CFMT: { uint64_t fr = get64(r); uint32_t sk = get32(r); return mk_ptr(T_FMT, (a68_obj*) (uintptr_t) fr, sk); }
-    case B_BIGINT: case B_BIGBITS: {
-      uint32_t n = get32(r);
-      if (r->i + n > r->n) die("internal: blob truncated");
-      a68_leaf* l = leaf_alloc(EK_BYTES, n);
-      memcpy(l->d, r->p + r->i, n);
-      r->i += n;
-      return mk_ptr(t == B_BIGINT ? T_BIGINT : T_BIGBITS, (a68_obj*) l, 0);
-    }
-    case B_MP: {
-      /* st (8), ex (8), n (4), n digits (8 each): kept verbatim */
-      if (r->i + 20 > r->n) die("internal: blob truncated");
-      uint32_t n; memcpy(&n, r->p + r->i + 16, 4);
-      size_t bytes = 20 + (size_t) n * 8;
-      if (r->i + bytes > r->n) die("internal: blob truncated");
-      a68_leaf* l = leaf_alloc(EK_BYTES, (uint32_t) bytes);
-      memcpy(l->d, r->p + r->i, bytes);
-      r->i += bytes;
-      return mk_ptr(T_MP, (a68_obj*) l, 0);
-    }
-    case B_UNION: {
-      uint32_t m = get32(r);
-      a68_slots* s = slots_alloc(1);
-      s->s[0] = decode_val(r);
-      return mk_ptr(T_UNION, (a68_obj*) s, m);
-    }
-    case B_STRUCT: {
-      uint32_t n = get32(r);
-      a68_slots* s = slots_alloc(n);
-      for (uint32_t i = 0; i < n; i++) s->s[i] = decode_val(r);
-      return mk_ptr(T_STRUCT, (a68_obj*) s, 0);
-    }
-    case B_ROW: {
-      uint32_t nd = get32(r);
-      a68_rowd* d = rowd_alloc(nd);
-      for (uint32_t k = 0; k < nd; k++) { d->dim[k].l = (int64_t) get64(r); d->dim[k].u = (int64_t) get64(r); }
-      int64_t stride = 1;
-      for (uint32_t k = nd; k > 0; k--) {
-        d->dim[k - 1].stride = stride;
-        int64_t ext = d->dim[k - 1].u - d->dim[k - 1].l + 1;
-        stride *= ext > 0 ? ext : 0;
-      }
-      d->off = 0;
-      uint32_t n = get32(r);
-      a68_val* tmp = (a68_val*) xmalloc((n ? n : 1) * sizeof(a68_val));
-      int leaf_ok = n > 0;
-      for (uint32_t i = 0; i < n; i++) {
-        tmp[i] = decode_val(r);
-        if (i > 0 && tmp[i].tag != tmp[0].tag) leaf_ok = 0;
-        if (tmp[i].tag == T_CHAR && tmp[i].v.u >= 256) leaf_ok = 0;
-      }
-      a68_obj* st = leaf_ok ? store_alloc_for(n, &tmp[0]) : store_alloc_slots(n);
-      if (st->kind == K_SLOTS) for (uint32_t i = 0; i < n; i++) ((a68_slots*) st)->s[i] = tmp[i];
-      else for (uint32_t i = 0; i < n; i++) store_set(st, i, tmp[i]);
-      free(tmp);
-      st->rc = 1;
-      d->base = st;
-      return mk_ptr(T_ROW, (a68_obj*) d, 0);
-    }
-    default: die("internal: bad blob tag");
-  }
-}
-
-static a68_val decode_blob(lean_object* b) {
-  rd r = { lean_sarray_cptr(b), lean_sarray_size(b), 0 };
-  a68_val v = decode_val(&r);
-  lean_dec(b);
-  return v;
-}
-
-/* ---------------------------------------------------------------- the Lean side's view of C names */
-
-static lean_object* bytes12(a68_val r) {
-  lean_object* b = lean_alloc_sarray(1, 12, 12);
-  uint64_t a = (uint64_t) (uintptr_t) r.v.p;
-  memcpy(lean_sarray_cptr(b), &a, 8);
-  memcpy(lean_sarray_cptr(b) + 8, &r.aux, 4);
-  return b;
-}
-
-lean_object* a68c_load(uint64_t a, uint32_t o, lean_object* w) {
-  (void) w;
-  a68_val r = mk_ptr(T_REF, (a68_obj*) (uintptr_t) a, o);
-  return lean_io_result_mk_ok(encode_blob(ref_load(r)));
-}
-
-lean_object* a68c_store(uint64_t a, uint32_t o, lean_object* b, lean_object* w) {
-  (void) w;
-  lean_inc(b);
-  store_ref(mk_ptr(T_REF, (a68_obj*) (uintptr_t) a, o), decode_blob(b));
-  return lean_io_result_mk_ok(lean_box(0));
-}
-
-lean_object* a68c_assign(uint64_t a, uint32_t o, lean_object* b, uint8_t flex, lean_object* w) {
-  (void) w;
-  lean_inc(b);
-  assign_ref(mk_ptr(T_REF, (a68_obj*) (uintptr_t) a, o), decode_blob(b), flex);
-  return lean_io_result_mk_ok(lean_box(0));
-}
-
-lean_object* a68c_field(uint64_t a, uint32_t o, uint32_t i, lean_object* w) {
-  (void) w;
-  return lean_io_result_mk_ok(bytes12(ref_field(mk_ptr(T_REF, (a68_obj*) (uintptr_t) a, o), i)));
-}
-
-/* The name of element `i`, in row-major order of the view, of the row a name refers to. */
-lean_object* a68c_elem(uint64_t a, uint32_t o, uint32_t i, lean_object* w) {
-  (void) w;
-  a68_val r = mk_ptr(T_REF, (a68_obj*) (uintptr_t) a, o);
+/* The name of element `i`, in row-major order of the view, of the row a name refers to
+   (`Interp.refElem`). */
+a68_val ref_elem(a68_val r, uint32_t i) {
   a68_rowd* d = ref_rowd(r);
   if (!d) die("internal: element of a non-row");
   int64_t idx = row_store_index(d, (int64_t) i);
-  return lean_io_result_mk_ok(bytes12(mk_ptr(T_REF, (a68_obj*) d, (uint32_t) idx)));
+  return mk_ptr(T_REF, (a68_obj*) d, (uint32_t) idx);
 }
 
-static void env_set(a68_frame* f) {
+void  env_set(a68_frame* f) {
   if (nsaved == saved_cap) {
     saved_cap = saved_cap ? saved_cap * 2 : 64;
     saved = (a68_frame**) realloc(saved, saved_cap * sizeof(a68_frame*));
@@ -1201,51 +824,25 @@ static void env_set(a68_frame* f) {
   env = f;
 }
 
-static void env_restore(void) {
+size_t env_saved_depth(void) { return nsaved; }
+void env_saved_truncate(size_t n) { if (n < nsaved) { env = saved[n]; nsaved = n; } }
+
+void  env_restore(void) {
   if (nsaved == 0) { fprintf(stderr, "uncaught exception: environment stack underflow\n"); exit(1); }
   env = saved[--nsaved];
-}
-
-lean_object* a68c_call(uint32_t fn, uint32_t np, uint64_t fr, lean_object* args, uint32_t nargs, lean_object* w) {
-  (void) w;
-  lean_inc(args);
-  rd r = { lean_sarray_cptr(args), lean_sarray_size(args), 0 };
-  for (uint32_t i = 0; i < nargs; i++) push(decode_val(&r));
-  lean_dec(args);
-  a68_val f = mk_ptr(T_CPROC, (a68_obj*) (uintptr_t) fr, fn | (np << 24));
-  /* the callee's prologue pops its arguments; when it left by a jump it pushed nothing */
-  env_set((a68_frame*) f.v.p);
-  a68_dispatch_proc(fn);
-  env_restore();
-  a68_val res = a68_jump_flag ? mk_tag(T_UNDEF) : pop();
-  if (a68_jump_flag) { /* discard whatever the arguments left */ }
-  return lean_io_result_mk_ok(encode_blob(res));
-}
-
-lean_object* a68c_hole(uint32_t fn, uint32_t idx, uint64_t fr, lean_object* w) {
-  (void) w; (void) fn;
-  env_set((a68_frame*) (uintptr_t) fr);
-  a68_dispatch_hole(idx);
-  env_restore();
-  a68_val res = a68_jump_flag ? mk_tag(T_UNDEF) : pop();
-  return lean_io_result_mk_ok(encode_blob(res));
 }
 
 /* ---------------------------------------------------------------- start-up and shutdown */
 
 void a68rt_boot(const char* blob, uint32_t ll, uint8_t regression, int argc, char** argv, const char* src) {
   gc_init();
-  parse_tables(blob);
-  lean_object* args = lean_mk_empty_array();
-  args = lean_array_push(args, lean_mk_string("a68g"));
-  args = lean_array_push(args, lean_mk_string(src));
-  for (int i = 1; i < argc; i++) args = lean_array_push(args, lean_mk_string(argv[i]));
-  lean_object* st = io_ok(a68l_boot(lean_mk_string(blob), ll, regression, args, LW));
-  a68_set_state(st);
+  tables_parse(blob, &strtab, &strlen_tab, &nstr);
+  io_init(argc, argv, src, regression != 0, (int) ll);
+  a68_jump_flag = 0;
 }
 
-uint32_t a68rt_finish(int w) { (void) w; return io_u32(a68l_finish(LW)); }
-void a68rt_stop(int w) { (void) w; io_unit(a68l_stop(LW)); exit(0); }
+uint32_t a68rt_finish(int w) { (void) w; return io_finish(); }
+void a68rt_stop(int w) { (void) w; io_stop(); }
 void a68rt_line(uint32_t l, int w) { (void) w; a68_line_no = l; }
 
 /* ---------------------------------------------------------------- jumps */
@@ -1303,7 +900,7 @@ void a68rt_push_bigint(uint32_t i, int w) {
 void a68rt_push_bigbits(uint32_t i, int w) {
   GC_POLL(); (void) w; push(big_of_string(T_BIGBITS, strtab[i], strlen_tab[i])); }
 
-static a68_val string_row(const uint8_t* p, int64_t n, int64_t lwb) {
+a68_val  string_row(const uint8_t* p, int64_t n, int64_t lwb) {
   a68_rowd* d = rowd_alloc(1);
   a68_leaf* l = leaf_alloc(T_CHAR, (uint32_t) n);
   memcpy(l->d, p, (size_t) n);
@@ -1348,7 +945,7 @@ int64_t a68rt_pop_bytes(uint8_t** out, int64_t* lwb, int w) {
 
 /* `SKIP` of a mode: the Lean side knows the default (`Interp.defaultOf`). */
 void a68rt_push_skip(uint32_t m, int w) {
-  GC_POLL(); (void) w; push(decode_blob(io_ok(a68l_skip(m, LW)))); }
+  GC_POLL(); (void) w; push(ops_default(m)); }
 
 void a68rt_pop(int w) { (void) w; (void) pop(); }
 void a68rt_dup(int w) { (void) w; a68_val v = *top(); push(v); }
@@ -1392,28 +989,28 @@ static const char* undef_msg(uint32_t t) {
   }
 }
 
-static int64_t as_int(a68_val v) {
+int64_t  as_int(a68_val v) {
   if (v.tag == T_INT) return v.v.i;
   if (v.tag == T_UNDEF) die(undef_msg(T_INT));
   fprintf(stderr, "uncaught exception: INT expected\n"); exit(1);
 }
-static double as_real(a68_val v) {
+double  as_real(a68_val v) {
   if (v.tag == T_REAL) return v.v.r;
   if (v.tag == T_INT) return (double) v.v.i;
   if (v.tag == T_UNDEF) die(undef_msg(T_REAL));
   fprintf(stderr, "uncaught exception: REAL expected\n"); exit(1);
 }
-static uint8_t as_bool(a68_val v) {
+uint8_t  as_bool(a68_val v) {
   if (v.tag == T_BOOL) return (uint8_t) v.v.u;
   if (v.tag == T_UNDEF) die(undef_msg(T_BOOL));
   fprintf(stderr, "uncaught exception: BOOL expected\n"); exit(1);
 }
-static uint32_t as_char(a68_val v) {
+uint32_t  as_char(a68_val v) {
   if (v.tag == T_CHAR) return (uint32_t) v.v.u;
   if (v.tag == T_UNDEF) die(undef_msg(T_CHAR));
   fprintf(stderr, "uncaught exception: CHAR expected\n"); exit(1);
 }
-static uint64_t as_bits(a68_val v) {
+uint64_t  as_bits(a68_val v) {
   if (v.tag == T_BITS) return v.v.u;
   if (v.tag == T_UNDEF) die(undef_msg(T_BITS));
   fprintf(stderr, "uncaught exception: BITS expected\n"); exit(1);
@@ -1665,6 +1262,15 @@ void a68rt_append(uint32_t d, uint32_t s, int w) {
   if (!ok) die("internal: append to a value that is not a string variable");
 }
 
+/* append elements in place through a name of a string variable (`Interp.appendInPlace`
+   as `fileOut` uses it); 0 when the name is not a plain cell */
+int ref_append_values(a68_val r, const a68_val* vs, int64_t n) {
+  if (r.tag != T_REF) return 0;
+  a68_obj* b = r.v.p;
+  if (b->kind != K_SLOTS && b->kind != K_FRAME) return 0;
+  return append_in_place(ref_slot(r), vs, n);
+}
+
 /* ---------------------------------------------------------------- errors reported by native code */
 
 void a68rt_undef_error(uint32_t kind, int w) {
@@ -1708,14 +1314,12 @@ void a68rt_deref(int w) {
   GC_POLL();
   (void) w;
   a68_val r = pop();
-  a68_val v;
-  if (r.tag == T_LREF) v = decode_blob(io_ok(a68l_lcell(r.aux, LW)));
-  else v = deref(r);
+  a68_val v = deref(r);
   if (v.tag == T_UNDEF) die("attempt to use an uninitialised value");
   push(v);
 }
 
-static void call_value(a68_val f, uint32_t nargs) {
+void  call_value(a68_val f, uint32_t nargs) {
   switch (f.tag) {
     case T_CPROC: {
       /* the arguments are on top of the stack, above `f`'s former place */
@@ -1727,20 +1331,12 @@ static void call_value(a68_val f, uint32_t nargs) {
       return;
     }
     case T_BUILTIN: {
-      const char* name = strtab[f.aux];
-      if (strcmp(name, "associate") == 0 || strcmp(name, "onlogicalfileend") == 0 || strcmp(name, "onfileend") == 0
-          || strcmp(name, "onphysicalfileend") == 0 || strcmp(name, "onvalueerror") == 0 || strcmp(name, "onlineend") == 0)
-        for (size_t i = sp - nargs; i < sp; i++) if (tag_is_ptr(stack[i].tag)) pin(stack[i].v.p);
-      buf b = {0};
-      for (size_t i = sp - nargs; i < sp; i++) encode_val(&b, stack[i]);
-      lean_object* args = lean_alloc_sarray(1, b.n, b.n);
-      memcpy(lean_sarray_cptr(args), b.p, b.n);
-      free(b.p);
-      /* the arguments stay on the stack, rooted, until the call returns: the Lean side may
+      /* the arguments stay on the stack, rooted, until the call returns: the prelude may
          call back into compiled code, which may collect */
-      lean_object* r = io_ok(a68l_call(lstr_of_table(f.aux), args, nargs, LW));
-      a68_val res = decode_blob(r);
-      sp -= nargs;
+      size_t base = sp - nargs;
+      a68_val res;
+      call_builtin(f.aux, nargs, &res);
+      sp = base;
       push(res);
       return;
     }
@@ -1767,24 +1363,21 @@ void a68rt_widen(uint32_t src, uint32_t dst, int w) {
   GC_POLL();
   (void) w;
   a68_val v = pop();
-  const mode_info* s = &modetab[src];
-  const mode_info* d = &modetab[dst];
-  if (v.tag == T_INT && strcmp(s->kind, "int") == 0 && s->len <= 0 && strcmp(d->kind, "real") == 0 && d->len <= 0) {
+  const a68_mode* s = mode_at(src);
+  const a68_mode* d = mode_at(dst);
+  if (v.tag == T_INT && s->k == M_INT && s->len <= 0 && d->k == M_REAL && d->len <= 0) {
     push(mk_real((double) v.v.i));
     return;
   }
-  if (strcmp(s->kind, d->kind) == 0 && s->len == d->len) { push(v); return; }
-  push(v);   /* rooted while the Lean side widens */
-  a68_val res = decode_blob(io_ok(a68l_widen(src, dst, encode_blob(v), LW)));
-  (void) pop();
-  push(res);
+  if (s->k == d->k && s->len == d->len && s->k != M_NAMED) { push(v); return; }
+  push(ops_widen(src, dst, v));
 }
 
 void a68rt_row_of(int w) {
   GC_POLL();
   (void) w;
   a68_val v = pop();
-  if (v.tag == T_REF || v.tag == T_LREF) { push(v); return; }
+  if (v.tag == T_REF) { push(v); return; }
   a68_rowd* d = rowd_alloc(1);
   a68_obj* st = store_alloc_for(1, &v);
   store_set(st, 0, v);
@@ -1821,7 +1414,6 @@ void a68rt_ident_rel(uint8_t isnt, int w) {
   a68_val a = pop();
   int same;
   if (a.tag == T_REF && b.tag == T_REF) same = a.v.p == b.v.p && a.aux == b.aux;
-  else if (a.tag == T_LREF && b.tag == T_LREF) same = a.aux == b.aux;
   else if (a.tag == T_NIL && b.tag == T_NIL) same = 1;
   else same = 0;
   push(mk_bool(isnt ? !same : same));
@@ -1837,10 +1429,8 @@ void a68rt_ident_rel(uint8_t isnt, int w) {
 
 #define A68_MAXINT 2147483647LL
 
-static int mode_is(uint32_t m, const char* kind, int64_t len) {
-  return m < nmode && strcmp(modetab[m].kind, kind) == 0 && modetab[m].len == len;
-}
-static int mode_kind(uint32_t m, const char* kind) { return m < nmode && strcmp(modetab[m].kind, kind) == 0; }
+static int mode_is(uint32_t m, a68_mkind k, int64_t len) { return mode_at(m)->k == k && mode_at(m)->len == len; }
+static int mode_kind(uint32_t m, a68_mkind k) { return mode_at(m)->k == k; }
 
 static int64_t int_range(int64_t r) {
   if (r > A68_MAXINT || r < -A68_MAXINT) die("INT value overflow, result too large");
@@ -1897,12 +1487,12 @@ static a68_val mk_compl(double re, double im) {
   return mk_ptr(T_STRUCT, (a68_obj*) c, 0);
 }
 
-static int is_string_row(a68_val v) {
+int  is_string_row(a68_val v) {
   return v.tag == T_ROW && ((a68_rowd*) v.v.p)->h.n == 1;
 }
 
 /* the characters of a string value, checked as `Interp.checkChars` checks them */
-static uint8_t* string_bytes(a68_val v, int64_t* n) {
+uint8_t*  string_bytes(a68_val v, int64_t* n) {
   a68_rowd* d = (a68_rowd*) v.v.p;
   *n = row_count(d);
   uint8_t* b = (uint8_t*) xmalloc((size_t) *n + 1);
@@ -1929,10 +1519,11 @@ static int is_cmp(const char* op) {
       || strcmp(op, "<=") == 0 || strcmp(op, ">") == 0 || strcmp(op, ">=") == 0;
 }
 
-/* Try the operator natively; 1 when done (the result is in `*out`), 0 for the Lean side. */
+/* The common cases of the primitive modes, answered here; 1 when done (the result is in
+   `*out`), 0 for the general path in ops.c. */
 static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_val b, a68_val* out) {
-  if (a.tag == T_UNDEF || b.tag == T_UNDEF) return 0;   /* the Lean side reports it in the mode's words */
-  if (mode_is(m1, "int", 0) && mode_is(m2, "int", 0) && a.tag == T_INT && b.tag == T_INT) {
+  if (a.tag == T_UNDEF || b.tag == T_UNDEF) return 0;   /* the general path reports it in the mode's words */
+  if (mode_is(m1, M_INT, 0) && mode_is(m2, M_INT, 0) && a.tag == T_INT && b.tag == T_INT) {
     int64_t x = a.v.i, y = b.v.i;
     if (strcmp(op, "+") == 0) { *out = mk_int(int_range(x + y)); return 1; }
     if (strcmp(op, "-") == 0) { *out = mk_int(int_range(x - y)); return 1; }
@@ -1943,7 +1534,7 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     if (is_cmp(op)) { *out = mk_bool(cmp_op(op, x < y ? -1 : x > y ? 1 : 0)); return 1; }
     return 0;
   }
-  if (mode_is(m1, "real", 0) && mode_is(m2, "real", 0) && (a.tag == T_REAL || a.tag == T_INT) && (b.tag == T_REAL || b.tag == T_INT)) {
+  if (mode_is(m1, M_REAL, 0) && mode_is(m2, M_REAL, 0) && (a.tag == T_REAL || a.tag == T_INT) && (b.tag == T_REAL || b.tag == T_INT)) {
     double x = as_real(a), y = as_real(b);
     if (strcmp(op, "+") == 0) { *out = mk_real(real_check(x + y)); return 1; }
     if (strcmp(op, "-") == 0) { *out = mk_real(real_check(x - y)); return 1; }
@@ -1960,13 +1551,13 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     if (is_cmp(op)) { *out = mk_bool(cmp_op(op, x < y ? -1 : x > y ? 1 : 0)); return 1; }
     return 0;
   }
-  if (mode_is(m1, "real", 0) && mode_is(m2, "int", 0) && (a.tag == T_REAL || a.tag == T_INT) && b.tag == T_INT) {
+  if (mode_is(m1, M_REAL, 0) && mode_is(m2, M_INT, 0) && (a.tag == T_REAL || a.tag == T_INT) && b.tag == T_INT) {
     double x = as_real(a);
     if (strcmp(op, "**") == 0) { *out = mk_real(pow_real_int(x, b.v.i)); return 1; }
     if (strcmp(op, "I") == 0) { *out = mk_compl(x, (double) b.v.i); return 1; }
     return 0;
   }
-  if (mode_kind(m1, "bool") && mode_kind(m2, "bool") && a.tag == T_BOOL && b.tag == T_BOOL) {
+  if (mode_kind(m1, M_BOOL) && mode_kind(m2, M_BOOL) && a.tag == T_BOOL && b.tag == T_BOOL) {
     int x = a.v.u != 0, y = b.v.u != 0;
     if (strcmp(op, "AND") == 0) { *out = mk_bool(x && y); return 1; }
     if (strcmp(op, "OR") == 0) { *out = mk_bool(x || y); return 1; }
@@ -1974,11 +1565,11 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     if (strcmp(op, "=") == 0) { *out = mk_bool(x == y); return 1; }
     return 0;
   }
-  if (mode_kind(m1, "char") && mode_kind(m2, "char") && a.tag == T_CHAR && b.tag == T_CHAR) {
+  if (mode_kind(m1, M_CHAR) && mode_kind(m2, M_CHAR) && a.tag == T_CHAR && b.tag == T_CHAR) {
     if (is_cmp(op)) { *out = mk_bool(cmp_op(op, a.v.u < b.v.u ? -1 : a.v.u > b.v.u ? 1 : 0)); return 1; }
     return 0;
   }
-  if (mode_kind(m1, "row") && mode_kind(m2, "row") && is_string_row(a) && is_string_row(b)
+  if (mode_kind(m1, M_ROW) && mode_kind(m2, M_ROW) && is_string_row(a) && is_string_row(b)
       && rowd_store((a68_rowd*) a.v.p)->kind == K_LEAF && rowd_store((a68_rowd*) a.v.p)->ek == T_CHAR
       && rowd_store((a68_rowd*) b.v.p)->kind == K_LEAF && rowd_store((a68_rowd*) b.v.p)->ek == T_CHAR) {
     /* two strings whose stores are leaves of characters: a mode of `row` of `char` is what
@@ -2006,7 +1597,7 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     }
     return 0;
   }
-  if (mode_is(m1, "int", 0) && mode_kind(m2, "row") && a.tag == T_INT && b.tag == T_ROW) {
+  if (mode_is(m1, M_INT, 0) && mode_kind(m2, M_ROW) && a.tag == T_INT && b.tag == T_ROW) {
     a68_rowd* d = (a68_rowd*) b.v.p;
     int64_t k = a.v.i;
     if (strcmp(op, "LWB") == 0 || strcmp(op, "UPB") == 0) {
@@ -2016,7 +1607,7 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     }
     return 0;
   }
-  if (mode_is(m1, "bits", 0) && mode_is(m2, "bits", 0) && a.tag == T_BITS && b.tag == T_BITS) {
+  if (mode_is(m1, M_BITS, 0) && mode_is(m2, M_BITS, 0) && a.tag == T_BITS && b.tag == T_BITS) {
     uint64_t x = a.v.u, y = b.v.u, mask = 0xffffffffu;
     if (strcmp(op, "AND") == 0) { *out = mk_bits(x & y); return 1; }
     if (strcmp(op, "OR") == 0) { *out = mk_bits((x | y) & mask); return 1; }
@@ -2027,7 +1618,7 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     if (strcmp(op, ">=") == 0) { *out = mk_bool((x & y) == y); return 1; }
     return 0;
   }
-  if (mode_is(m1, "bits", 0) && mode_is(m2, "int", 0) && a.tag == T_BITS && b.tag == T_INT) {
+  if (mode_is(m1, M_BITS, 0) && mode_is(m2, M_INT, 0) && a.tag == T_BITS && b.tag == T_INT) {
     uint64_t x = a.v.u, mask = 0xffffffffu;
     int64_t k = b.v.i;
     int64_t ak = k < 0 ? -k : k;
@@ -2040,7 +1631,7 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
     }
     return 0;
   }
-  if (mode_is(m1, "int", 0) && mode_is(m2, "bits", 0) && a.tag == T_INT && b.tag == T_BITS) {
+  if (mode_is(m1, M_INT, 0) && mode_is(m2, M_BITS, 0) && a.tag == T_INT && b.tag == T_BITS) {
     if (strcmp(op, "ELEM") == 0) {
       int64_t k = a.v.i;
       if (k < 1 || k > 32) die("ELEM index out of range");
@@ -2056,10 +1647,10 @@ static int native_dyop(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_
    variable: the value, the operation, the write, and the name as the result. */
 static int native_assign_op(const char* op, uint32_t m1, uint32_t m2, a68_val a, a68_val b, a68_val* out) {
   (void) m2;
-  if (a.tag != T_REF || !mode_kind(m1, "ref")) return 0;
+  if (a.tag != T_REF || !mode_kind(m1, M_REF)) return 0;
   /* the mode line of a REF names the mode referred to by its index */
-  uint32_t target = (uint32_t) modetab[m1].len;
-  int t_int = mode_is(target, "int", 0), t_real = mode_is(target, "real", 0), t_row = mode_kind(target, "row");
+  uint32_t target = mode_at(m1)->sub;
+  int t_int = mode_is(target, M_INT, 0), t_real = mode_is(target, M_REAL, 0), t_row = mode_kind(target, M_ROW);
   if (!t_int && !t_real && !t_row) return 0;
   if (t_row && strcmp(op, "+:=") == 0 && b.tag == T_ROW && is_string_row(b)) {
     /* appending to a string variable: in place when the cell holds a plain row */
@@ -2103,7 +1694,7 @@ static int native_assign_op(const char* op, uint32_t m1, uint32_t m2, a68_val a,
 
 static int native_monop(const char* op, uint32_t m, a68_val v, a68_val* out) {
   if (v.tag == T_UNDEF) return 0;
-  if (mode_is(m, "int", 0) && v.tag == T_INT) {
+  if (mode_is(m, M_INT, 0) && v.tag == T_INT) {
     int64_t x = v.v.i;
     if (strcmp(op, "-") == 0) { *out = mk_int(int_range(-x)); return 1; }
     if (strcmp(op, "+") == 0) { *out = v; return 1; }
@@ -2118,7 +1709,7 @@ static int native_monop(const char* op, uint32_t m, a68_val v, a68_val* out) {
     }
     return 0;
   }
-  if (mode_is(m, "real", 0) && (v.tag == T_REAL || v.tag == T_INT)) {
+  if (mode_is(m, M_REAL, 0) && (v.tag == T_REAL || v.tag == T_INT)) {
     double x = as_real(v);
     if (strcmp(op, "-") == 0) { *out = mk_real(-x); return 1; }
     if (strcmp(op, "+") == 0) { *out = mk_real(x); return 1; }
@@ -2140,21 +1731,21 @@ static int native_monop(const char* op, uint32_t m, a68_val v, a68_val* out) {
     }
     return 0;
   }
-  if (mode_kind(m, "bool") && v.tag == T_BOOL) {
+  if (mode_kind(m, M_BOOL) && v.tag == T_BOOL) {
     if (strcmp(op, "NOT") == 0) { *out = mk_bool(!v.v.u); return 1; }
     if (strcmp(op, "ABS") == 0) { *out = mk_int(v.v.u ? 1 : 0); return 1; }
     return 0;
   }
-  if (mode_kind(m, "char") && v.tag == T_CHAR) {
+  if (mode_kind(m, M_CHAR) && v.tag == T_CHAR) {
     if (strcmp(op, "ABS") == 0) { *out = mk_int((int64_t) v.v.u); return 1; }
     return 0;
   }
-  if (mode_is(m, "bits", 0) && v.tag == T_BITS) {
+  if (mode_is(m, M_BITS, 0) && v.tag == T_BITS) {
     if (strcmp(op, "NOT") == 0) { *out = mk_bits(0xffffffffu ^ v.v.u); return 1; }
     if (strcmp(op, "ABS") == 0) { *out = mk_int(v.v.u >= 2147483648u ? (int64_t) v.v.u - 4294967296LL : (int64_t) v.v.u); return 1; }
     return 0;
   }
-  if (mode_kind(m, "row") && v.tag == T_ROW) {
+  if (mode_kind(m, M_ROW) && v.tag == T_ROW) {
     a68_rowd* d = (a68_rowd*) v.v.p;
     if (strcmp(op, "LWB") == 0) { *out = mk_int(d->dim[0].l); return 1; }
     if (strcmp(op, "UPB") == 0) { *out = mk_int(d->dim[0].u); return 1; }
@@ -2164,7 +1755,6 @@ static int native_monop(const char* op, uint32_t m, a68_val v, a68_val* out) {
   return 0;
 }
 
-/* the operands stay on the stack while the Lean side computes */
 void a68rt_dyop(uint32_t op, uint32_t m1, uint32_t m2, int w) {
   GC_POLL();
   (void) w;
@@ -2179,13 +1769,8 @@ void a68rt_dyop(uint32_t op, uint32_t m1, uint32_t m2, int w) {
       return;
     }
   }
-  buf b = {0};
-  encode_val(&b, stack[sp - 2]);
-  encode_val(&b, stack[sp - 1]);
-  lean_object* args = lean_alloc_sarray(1, b.n, b.n);
-  memcpy(lean_sarray_cptr(args), b.p, b.n);
-  free(b.p);
-  a68_val res = decode_blob(io_ok(a68l_dyop(lstr_of_table(op), m1, m2, args, LW)));
+  /* the operands stay on the stack while the general path computes */
+  a68_val res = ops_dyadic(strtab[op], m1, m2, stack[sp - 2], stack[sp - 1]);
   sp -= 2;
   push(res);
 }
@@ -2197,7 +1782,7 @@ void a68rt_monop(uint32_t op, uint32_t m, int w) {
     a68_val res;
     if (native_monop(strtab[op], m, *top(), &res)) { (void) pop(); push(res); return; }
   }
-  a68_val res = decode_blob(io_ok(a68l_monop(lstr_of_table(op), m, encode_blob(*top()), LW)));
+  a68_val res = ops_monadic(strtab[op], m, *top());
   (void) pop();
   push(res);
 }
@@ -2422,7 +2007,7 @@ static size_t nconform = 0, conform_cap = 0;
 static int conforms(uint32_t m, uint32_t vm) {
   for (size_t i = 0; i < nconform; i++)
     if (conform_cache[i].m == m && conform_cache[i].vm == vm) return conform_cache[i].ok;
-  uint8_t ok = io_u8(a68l_conform(m, vm, LW));
+  uint8_t ok = (uint8_t) ops_conform(m, vm);
   if (nconform == conform_cap) {
     conform_cap = conform_cap ? conform_cap * 2 : 64;
     conform_cache = (conform_entry*) realloc(conform_cache, conform_cap * sizeof(conform_entry));
@@ -2441,7 +2026,7 @@ uint8_t a68rt_conform(uint32_t m, uint8_t bind, int w) {
   a68_val inner = union_content(v, &vm);
   int ok = conforms(m, vm);
   if (ok && bind) {
-    if (io_u8(a68l_mode_is_union(m, LW))) push(copy_value(v));
+    if (ops_mode_is_union(m)) push(copy_value(v));
     else push(copy_value(inner));
   }
   return ok ? 1 : 0;

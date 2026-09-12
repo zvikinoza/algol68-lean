@@ -61,6 +61,17 @@ a68_val mp_leaf(const a68_mp* x) {
   return mk_ptr(T_MP, (a68_obj*) l, 0);
 }
 
+/* A view writes its digits into the leaf but keeps the status and exponent on the stack:
+   they are written back with this before the fresh value is returned. */
+static a68_val mp_commit(a68_val r, const a68_mp* x) {
+  a68_leaf* l = (a68_leaf*) r.v.p;
+  int32_t digs = x->digs;
+  memcpy(l->d, &x->st, 4);
+  memcpy(l->d + 4, &digs, 4);
+  memcpy(l->d + 8, &x->ex, 8);
+  return r;
+}
+
 /* A fresh value holding `x` extended to at least `digs` digits, viewed for writing. */
 static a68_val fresh_copy(a68_val v, int digs, a68_mp* view) {
   a68_mp x = mp_view(v);
@@ -266,7 +277,7 @@ a68_val mp_dyadic(const char* op, int64_t longness, a68_val xv, a68_val yv) {
     if (mp_is_nan(&x)) die2(real_mode(longness), "value is not a number");
   } else if (strcmp(op, "**") == 0) check(mp_pow(&x, &x, &y, digs, err), err);
   else die2("internal:", op);
-  return r;
+  return mp_commit(r, &x);
 }
 
 /* `Interp.mpMonadic`. */
@@ -289,7 +300,7 @@ a68_val mp_monadic(const char* op, int64_t longness, a68_val xv) {
       a68_mp z;
       r = fresh_nil(MP_LONG_DIGITS, &z);
       check(mp_shorten(&z, MP_LONG_DIGITS, &x, digs, err), err);
-      return r;
+      return mp_commit(r, &z);
     }
   }
   r = fresh_copy(xv, digs, &x);
@@ -298,7 +309,7 @@ a68_val mp_monadic(const char* op, int64_t longness, a68_val xv) {
   else if (strcmp(op, "ENTIER") == 0) { check(mp_entier(&x, &x, digs, err), err); return long_int_of(&x); }
   else if (strcmp(op, "ROUND") == 0) { check(mp_round(&x, &x, digs, err), err); return long_int_of(&x); }
   else die2("internal: monadic operator", op);
-  return r;
+  return mp_commit(r, &x);
 }
 
 /* `Interp.mpComplDyadic`. */
@@ -330,7 +341,7 @@ a68_val mp_compl_dyadic(const char* op, int64_t longness, a68_val av, a68_val bv
     eq = mp_dig(&ar, 1) == 0.0 && mp_dig(&ai, 1) == 0.0;
     return mk_bool(strcmp(op, "=") == 0 ? eq : !eq);
   } else die2("internal: LONG COMPL operator", op);
-  return compl_of(rr, ri);
+  return compl_of(mp_commit(rr, &ar), mp_commit(ri, &ai));
 }
 
 /* `Interp.mpComplPow`: `LONG COMPLEX ** INT`. */
@@ -346,7 +357,7 @@ a68_val mp_compl_pow(int64_t longness, a68_val av, int64_t j) {
   { a68_mp x = mp_view(aiv); mp_move(&im, &x, digs); }
   check(mp_cpow_int(&re, &im, j, digs, err), err);
   if (j < 0 && (mp_is_nan(&re) || mp_is_nan(&im))) die2(compl_mode(longness), "value is not finite");
-  return compl_of(rr, ri);
+  return compl_of(mp_commit(rr, &re), mp_commit(ri, &im));
 }
 
 /* `Interp.mpComplMonadic`. */
@@ -362,26 +373,26 @@ a68_val mp_compl_monadic(const char* op, int64_t longness, a68_val v) {
   if (strcmp(op, "-") == 0) {
     rr = fresh_copy(rev, 0, &re); ri = fresh_copy(imv, 0, &im);
     mp_negate1(&re); mp_negate1(&im);
-    return compl_of(rr, ri);
+    return compl_of(mp_commit(rr, &re), mp_commit(ri, &im));
   }
   if (strcmp(op, "CONJ") == 0) {
     rr = fresh_copy(rev, 0, &re); ri = fresh_copy(imv, 0, &im);
     mp_negate1(&im);
-    return compl_of(rr, ri);
+    return compl_of(mp_commit(rr, &re), mp_commit(ri, &im));
   }
   if (strcmp(op, "ABS") == 0 || strcmp(op, "ARG") == 0) {
     a68_val r = fresh_nil(digs, &t);
     re = mp_view(rev); im = mp_view(imv);
     if (op[1] == 'B') check(mp_hypot(&t, &re, &im, digs, err), err);
     else check(mp_atan2(&t, &re, &im, digs, err), err);
-    return r;
+    return mp_commit(r, &t);
   }
   if (strcmp(op, "SHORTEN") == 0) {
     if (longness <= 1) return compl_of(mk_real(mp_to_real(rev, longness)), mk_real(mp_to_real(imv, longness)));
     rr = fresh_nil(MP_LONG_DIGITS, &re); ri = fresh_nil(MP_LONG_DIGITS, &im);
     { a68_mp x = mp_view(rev); check(mp_shorten(&re, MP_LONG_DIGITS, &x, digs, err), err); }
     { a68_mp x = mp_view(imv); check(mp_shorten(&im, MP_LONG_DIGITS, &x, digs, err), err); }
-    return compl_of(rr, ri);
+    return compl_of(mp_commit(rr, &re), mp_commit(ri, &im));
   }
   die2("internal: monadic operator", op);
 }
@@ -427,7 +438,7 @@ int mp_math_fn(const char* name, a68_val xv, a68_val* out) {
   check(f(&x, &x, digs, err), err);
   if (mp_is_nan(&x)) die2(real_mode(n), "value is not a number");
   if (!mp_is_finite(&x)) die2(real_mode(n), "value is not finite");
-  *out = r;
+  *out = mp_commit(r, &x);
   return 1;
 }
 
@@ -456,7 +467,7 @@ int mp_compl_fn(const char* name, a68_val xv, a68_val* out) {
   ri = fresh_copy(imv, digs, &im);
   check(f(&re, &im, digs, err), err);
   if (!mp_is_finite(&re) || !mp_is_finite(&im)) die2("math error in", compl_mode(n));
-  *out = compl_of(rr, ri);
+  *out = compl_of(mp_commit(rr, &re), mp_commit(ri, &im));
   return 1;
 }
 
@@ -492,6 +503,7 @@ int mp_const(const char* name, a68_val* out) {
     *out = fresh_nil(digs, &z);
     mp_set_nan(&z);
   } else return 0;
+  mp_commit(*out, &z);
   return 1;
 }
 
@@ -515,7 +527,7 @@ a68_val mp_arctan2(const char* name, a68_val av, a68_val bv) {
     check(rc, err);
   }
   if (mp_is_nan(&x)) die2(real_mode(n), "invalid argument");
-  return r;
+  return mp_commit(r, &x);
 }
 
 /* `genie_long_next_random`: the REAL widened. */
@@ -553,7 +565,7 @@ a68_val mp_widen(a68_val v, int64_t from_longness, int64_t to_longness) {
       a68_mp x = mp_view(v);
       a68_val r = fresh_nil(a68_ll_digits, &z);
       mp_move(&z, &x, MP_LONG_DIGITS);
-      return r;
+      return mp_commit(r, &z);
     }
     return v;
   }

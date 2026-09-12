@@ -2849,17 +2849,17 @@ end
 
 /-- The fixed part of every generated program. -/
 def prelude : String := "
-#include <lean/lean.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <string.h>
 #include <math.h>
 
 
-/* The C runtime (csrc/rt.c).  Every entry point takes a trailing dummy argument `W`, a
-   leftover of the Lean-backed runtime this one replaced, kept so that the generator's
-   call sites read the same. */
+/* The C runtime (csrc/rt.c and its companions), plain C: a compiled program links it and
+   the C library only.  Every entry point takes a trailing dummy argument `W`, a leftover of
+   the Lean-backed runtime this one replaced, kept so that the generator's call sites read
+   the same. */
 #define W 0
 void a68rt_boot(const char* blob, uint32_t ll, uint8_t reg, int argc, char** argv, const char* src);
 uint32_t a68rt_finish(int w);
@@ -2974,21 +2974,9 @@ int64_t a68rt_pop_bytes(uint8_t** out, int64_t* l, int w);
 #define a68_u64(x) (x)
 
 
-void lean_initialize_runtime_module(void);
-void lean_io_mark_end_initialization(void);
-void lean_init_task_manager(void);
-char** lean_setup_args(int argc, char** argv);
-
 extern uint32_t a68_line_no;
 #define a68_line(n) (a68_line_no = (n))
 extern uint32_t a68_jump_flag;
-lean_object* initialize_algol68_A68_Runtime(uint8_t builtin);
-void a68_set_state(lean_object* s);
-
-static void a68_fail(lean_object* r) {
-  lean_io_result_show_error(r);
-  exit(1);
-}
 #define a68_jump()        a68_jump_flag
 #define a68_jump_clear()  (a68_jump_flag = 0)
 #define a68_env_depth()   a68_u32(a68rt_env_depth(W))
@@ -3325,10 +3313,6 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
   for e in echoes do
     out := out ++ "  fputs(" ++ cstring (e ++ "\n") ++ ", stdout);\n"
   if !echoes.isEmpty then out := out ++ "  fflush(stdout);\n"
-  out := out ++ "  argv = lean_setup_args(argc, argv);\n  lean_initialize_runtime_module();\n"
-  out := out ++ "  lean_object* ir = initialize_algol68_A68_Runtime(1);\n"
-  out := out ++ "  if (lean_io_result_is_error(ir)) { a68_fail(ir); }\n  lean_dec_ref(ir);\n"
-  out := out ++ "  lean_io_mark_end_initialization();\n  lean_init_task_manager();\n"
   -- the program sees the arguments a68g would give it: `a68g`, the source file, and then
   -- the arguments the binary was run with, as `a68lean run` does; the runtime builds that
   out := out ++ s!"  a68rt_boot(A68_BLOB, {ll}, {if regression then 1 else 0}, argc, argv, " ++ cstring srcName ++ ");\n"

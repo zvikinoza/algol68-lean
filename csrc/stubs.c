@@ -15,7 +15,7 @@
    plain store to this variable rather than a call into the runtime, so that reaching a
    statement costs nothing at all when the statement does not fail.  It stays zero while
    the evaluator runs, which is how the error reporter knows to use its own position. */
-uint32_t a68_line_no = 0;
+extern uint32_t a68_line_no;   /* defined in rt.c */
 
 uint32_t a68_get_line(lean_object* w) {
   (void) w;
@@ -56,7 +56,7 @@ lean_object* a68_dispatch_hole(size_t fn, size_t idx, lean_object* env, lean_obj
    Every call site in compiled code tests this, so it lives here as a plain variable that
    the generated C reads directly, rather than behind a runtime entry point that would
    allocate an IO result for each test. */
-uint32_t a68_jump_flag = 0;
+extern uint32_t a68_jump_flag;   /* defined in rt.c */
 
 uint32_t a68_get_jump(lean_object* u) {
   (void) u;
