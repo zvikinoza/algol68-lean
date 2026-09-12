@@ -314,18 +314,11 @@ static a68_obj* store_copy(a68_obj* st) {
 }
 
 /* before writing through a variable's descriptor: give it a store of its own */
-/* A share of a store is given back only when the collector sweeps the descriptor that
-   held it, so a large store that a value merely looked at (`UPB d`, a row passed on)
-   would be copied at its next write.  Before copying a store of any size, the variable
-   collects once: if the sharer was dead, the store is its own again.  A store whose
-   sharer survives the collection is copied, and the copy is fresh, so the collection
-   is paid at most once per genuine share. */
+/* A store's share count is exact for shares kept in cells and containers; values on the
+   operand stack only borrow (see `rowd_borrow`), so a variable is copied at a write only
+   when another kept value really shares its store. */
 static void own_store(a68_rowd* owner) {
   a68_obj* st = owner->base;
-  if (st->rc > 1 && st->size >= 4096 && !gc_off && bytes_allocated > 0) {
-    gc_collect();
-    st = owner->base;
-  }
   if (st->rc > 1) {
     a68_obj* c = store_copy(st);
     st->rc--;
@@ -1148,7 +1141,7 @@ static a68_val row_field_select(a68_val v, uint32_t idx) {
   for (int64_t i = 0; i < n; i++) {
     a68_val e = rowd_get(r, row_store_index(r, i));
     if (e.tag != T_STRUCT) die("internal: field selection on non-struct element");
-    st->s[i] = copy_value(((a68_slots*) e.v.p)->s[idx]);
+    st->s[i] = unborrow(copy_value(((a68_slots*) e.v.p)->s[idx]));
   }
   st->h.rc = 1;
   d->base = (a68_obj*) st;
@@ -1943,7 +1936,7 @@ void a68rt_new_row(uint32_t ndims, uint8_t flex, int w) {
   int64_t n = row_count(d);
   a68_obj* st = store_alloc_for((uint32_t) n, &init);
   if (st->kind == K_LEAF) { for (int64_t i = 0; i < n; i++) store_set(st, i, init); }
-  else for (int64_t i = 0; i < n; i++) ((a68_slots*) st)->s[i] = copy_value(init);
+  else for (int64_t i = 0; i < n; i++) ((a68_slots*) st)->s[i] = unborrow(copy_value(init));
   st->rc = 1;
   d->base = st;
   push(mk_ptr(T_ROW, (a68_obj*) d, 0));
