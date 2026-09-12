@@ -1,0 +1,13 @@
+# a row value taken while its variable is later written keeps what it saw #
+[1:5]INT d; FOR i TO 5 DO d[i] := i OD;
+[]INT v = d;
+UNION(INT, []INT) u := d;
+STRUCT(INT k, [1:5]INT r) s := (1, d);
+[][]INT rr = (d, d);
+[1:5]INT e := d;
+d[1] := 99;
+print((v[1], " ", (u | ([]INT w): w[1]), " ", (r OF s)[1], " ", rr[1][1], " ", e[1], " ", d[1], newline));
+# bounds enquiries in a loop do not copy the row #
+[1:200000]INT big; FOR i TO UPB big DO big[i] := i OD;
+INT t := 0; FOR i TO UPB big DO IF i <= UPB big THEN t +:= big[i] MOD 7 FI OD;
+print((t, newline))

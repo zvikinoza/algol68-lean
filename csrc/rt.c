@@ -237,8 +237,9 @@ static int leaf_accepts(uint16_t ek, const a68_val* v) {
   return 1;
 }
 
+static a68_val unborrow(a68_val v);
 void  store_set(a68_obj* st, int64_t idx, a68_val v) {
-  if (st->kind == K_SLOTS) { ((a68_slots*) st)->s[idx] = v; return; }
+  if (st->kind == K_SLOTS) { ((a68_slots*) st)->s[idx] = unborrow(v); return; }
   a68_leaf* l = (a68_leaf*) st;
   size_t es = leaf_esize(l->h.ek);
   uint8_t* bits = l->d + (size_t) l->h.n * es;
@@ -313,8 +314,18 @@ static a68_obj* store_copy(a68_obj* st) {
 }
 
 /* before writing through a variable's descriptor: give it a store of its own */
+/* A share of a store is given back only when the collector sweeps the descriptor that
+   held it, so a large store that a value merely looked at (`UPB d`, a row passed on)
+   would be copied at its next write.  Before copying a store of any size, the variable
+   collects once: if the sharer was dead, the store is its own again.  A store whose
+   sharer survives the collection is copied, and the copy is fresh, so the collection
+   is paid at most once per genuine share. */
 static void own_store(a68_rowd* owner) {
   a68_obj* st = owner->base;
+  if (st->rc > 1 && st->size >= 4096 && !gc_off && bytes_allocated > 0) {
+    gc_collect();
+    st = owner->base;
+  }
   if (st->rc > 1) {
     a68_obj* c = store_copy(st);
     st->rc--;
@@ -333,6 +344,29 @@ static a68_rowd* rowd_share(const a68_rowd* r) {
   n->field = r->field;
   memcpy(n->dim, r->dim, (size_t) r->h.n * sizeof(a68_dim));
   return n;
+}
+
+/* A value taken from a variable for the operand stack borrows the store: the descriptor
+   is fresh, but the store's share count is not raised, so the variable is not copied at
+   its next write on account of a value that only looked (`UPB d`, `d` passed on).  A
+   borrow that is kept — stored in a cell, a structure, a union or a row — becomes a
+   share first (`unborrow`); the sweep gives nothing back for a borrow. */
+static a68_rowd* rowd_borrow(const a68_rowd* r) {
+  a68_rowd* n = rowd_alloc(r->h.n);
+  n->base = rowd_store(r);
+  n->pad2 = 1;
+  n->off = r->off;
+  n->field = r->field;
+  memcpy(n->dim, r->dim, (size_t) r->h.n * sizeof(a68_dim));
+  return n;
+}
+
+static a68_val unborrow(a68_val v) {
+  if (v.tag == T_ROW) {
+    a68_rowd* d = (a68_rowd*) v.v.p;
+    if (d->pad2) { d->pad2 = 0; d->base->rc++; }
+  }
+  return v;
 }
 
 /* a fresh row with canonical layout holding copies of the elements of `r` */
@@ -365,17 +399,17 @@ static a68_rowd* row_canonical_copy(const a68_rowd* r) {
 
 a68_val  copy_value(a68_val v) {
   switch (v.tag) {
-    case T_ROW: return mk_ptr(T_ROW, (a68_obj*) rowd_share((a68_rowd*) v.v.p), 0);
+    case T_ROW: return mk_ptr(T_ROW, (a68_obj*) rowd_borrow((a68_rowd*) v.v.p), 0);
     case T_STRUCT: {
       a68_slots* s = (a68_slots*) v.v.p;
       a68_slots* c = slots_alloc(s->h.n);
-      for (uint32_t i = 0; i < s->h.n; i++) c->s[i] = copy_value(s->s[i]);
+      for (uint32_t i = 0; i < s->h.n; i++) c->s[i] = unborrow(copy_value(s->s[i]));
       return mk_ptr(T_STRUCT, (a68_obj*) c, 0);
     }
     case T_UNION: {
       a68_slots* s = (a68_slots*) v.v.p;
       a68_slots* c = slots_alloc(1);
-      c->s[0] = copy_value(s->s[0]);
+      c->s[0] = unborrow(copy_value(s->s[0]));
       return mk_ptr(T_UNION, (a68_obj*) c, v.aux);
     }
     default: return v;
@@ -738,7 +772,7 @@ static void gc_sweep(void) {
   for (a68_obj* o = all_objects; o; o = o->next)
     if (!o->mark && o->kind == K_ROWD) {
       a68_obj* b = ((a68_rowd*) o)->base;
-      if (b && b->mark && b->kind != K_ROWD && b->rc > 0) b->rc--;
+      if (b && b->mark && b->kind != K_ROWD && b->rc > 0 && !((a68_rowd*) o)->pad2) b->rc--;
     }
   a68_obj** link = &all_objects;
   uint64_t live = 0;
@@ -1409,7 +1443,7 @@ void a68rt_unite(uint32_t m, int w) {
   (void) w;
   a68_val v = pop();
   a68_slots* s = slots_alloc(1);
-  s->s[0] = v;
+  s->s[0] = unborrow(v);
   push(mk_ptr(T_UNION, (a68_obj*) s, m));
 }
 
@@ -1931,7 +1965,7 @@ void a68rt_collateral(uint32_t n, uint8_t is_struct, uint32_t dims, int w) {
   const a68_val* vs = &stack[sp - n];
   if (is_struct) {
     a68_slots* s = slots_alloc(n);
-    for (uint32_t i = 0; i < n; i++) s->s[i] = vs[i];
+    for (uint32_t i = 0; i < n; i++) s->s[i] = unborrow(vs[i]);
     sp -= n;
     push(mk_ptr(T_STRUCT, (a68_obj*) s, 0));
     return;

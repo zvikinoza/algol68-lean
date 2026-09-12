@@ -280,5 +280,11 @@ reported separately by the test scripts.
   (a random program that triples a string 36 times is the case the fuzzer found).
   Where a68g stops depends on its garbage collector's accounting, which is not
   reproduced.
+* **A row passed to a routine aliases its argument in a68g.** With
+  `PROC p = ([]INT a) INT: (d[2] := 77; a[2])`, a68g's `p (d)` gives 77: the
+  parameter is a descriptor over the same storage. Both back ends here give the
+  value the row had at the call, 2, which is what the language's identity
+  declaration `[]INT a = d` means. A value kept in a variable, a structure, a
+  union or a row display keeps what it saw in both a68g and a68lean.
 * **Runtime error messages** are not byte-identical; only standard output
   and the non-zero exit status are.
