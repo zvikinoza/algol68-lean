@@ -52,6 +52,26 @@ structure FrameInfo where
   cells  : Option Var := none
   /-- a frame of the enclosing function, kept for its `procs`: its cells are captured -/
   outer  : Bool := false
+  /-- a number unique to the frame, for the row caches -/
+  fid    : Nat := 0
+  deriving Inhabited
+
+/-- What a loop keeps in variables about a row a cell holds, so that the elements are
+    reached without re-reading the cell and the descriptor at every access (`recache`
+    computes it; a slow path recomputes it).  `ek` is the leaf kind expected, 0 when the
+    store must be one of slots. -/
+structure RowCache where
+  fid   : Nat
+  slot  : Nat
+  ek    : Int
+  dims  : Nat
+  valid : Var                     -- the cell holds a row whose store is as expected
+  rcOK  : Var                     -- valid, and the store is unshared (a write may go inline)
+  r     : Var                     -- the descriptor
+  store : Var
+  off   : Var
+  dim   : Array (Var × Var × Var)  -- l, u, stride per dimension
+  n     : Var                     -- the store's element count
   deriving Inhabited
 
 /-- The function under construction. -/
@@ -82,6 +102,10 @@ structure St where
   modeTab  : Mode.Table := {}
   procMode : Option Mode := none
   rowHint  : Option Int := none            -- the leaf kind of the row generator being lowered
+  nextFid  : Nat := 1
+  caches   : List RowCache := []           -- the row caches in scope, innermost first
+  rowUses  : Array (Nat × Nat × Int × Nat) := #[]   -- rows accessed inline: fid, slot, store kind, dims
+  slowRanges : Array (Nat × Nat) := #[]    -- block ranges [from, to) that are slow paths
   deriving Inhabited
 
 abbrev L := StateM St
@@ -233,6 +257,14 @@ def finishHoist : L Unit :=
     let instrs := b0.instrs.extract 0 fb.hoistAt ++ fb.hoist ++ b0.instrs.extract fb.hoistAt b0.instrs.size
     { st with fb := { fb with blocks := fb.blocks.set! 0 { b0 with instrs := instrs }, hoist := #[] } }
 
+/-- The frame id of cell `(d, s)`'s frame: a captured frame gets an id of its own. -/
+def cellFid (d : Nat) : L Nat := do
+  let fb := (← get).fb
+  let own := (fb.frames.takeWhile (!·.outer)).length
+  match fb.frames[d]? with
+  | some f => if !f.outer then return f.fid else return 1000000 + (d - own)
+  | none => return 1000000 + (d - own)
+
 -- ## Memory: the runtime's objects, addressed inline
 
 /-- What a memory access touches, for the printer's alias information: accesses of
@@ -376,6 +408,116 @@ def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : Ele
 def T_NIL : Int := 7
 def K_FRAME : Int := 4
 
+/-- The cache in scope for the row cell `(fid, slot)` with store kind `ek`. -/
+def lookupCache (fid slot : Nat) (ek : Int) : L (Option RowCache) := do
+  return (← get).caches.find? fun c => c.fid == fid && c.slot == slot && c.ek == ek
+
+/-- Note an inline access to a row, for the loop that may cache it. -/
+def noteRowUse (fid slot : Nat) (ek : Int) (dims : Nat) : L Unit :=
+  modify fun st => { st with rowUses := st.rowUses.push (fid, slot, ek, dims) }
+
+/-- A slow path: the block `slow` and every block created by `act` are marked as such, so
+    that a loop does not count their runtime calls against caching; afterwards the caches
+    of the cell `key` (all of them when `key` is `none`) are recomputed, since the call
+    may have changed the cell or its store. -/
+def slowPath (slow : Nat) (key : Option (Nat × Nat)) (act : L Unit) : L Unit := do
+  let a := (← get).fb.blocks.size
+  act
+  -- recompute the caches this call may have invalidated
+  let cs := (← get).caches.filter fun c => match key with
+    | some (fid, slot) => c.fid == fid && c.slot == slot
+    | none => true
+  for c in cs do recache c
+  let b := (← get).fb.blocks.size
+  modify fun st => { st with slowRanges := (st.slowRanges.push (slow, slow + 1)).push (a, b) }
+where
+  /-- compute the cache from the cell: valid only when everything is as the accesses expect -/
+  recache (c : RowCache) : L Unit := do
+    let done ← newBlock
+    emit (.set c.valid (.opnd (kb false)))
+    emit (.set c.rcOK (.opnd (kb false)))
+    let fb := (← get).fb
+    -- the cell's address: this frame's cells, or a captured frame's
+    let d? := (List.range fb.frames.length).find? fun d => match fb.frames[d]? with
+      | some f => !f.outer && f.fid == c.fid
+      | none => false
+    let addr : Option (Var × Int) ← match d? with
+      | some d => cellAddr d c.slot
+      | none =>
+        if c.fid ≥ 1000000 then
+          let own := (fb.frames.takeWhile (!·.outer)).length
+          cellAddr (own + (c.fid - 1000000)) c.slot
+        else pure none
+    match addr with
+    | none => terminate (.br done); switchTo done
+    | some (b, off) =>
+      let tag ← ld "i32" .i64 b (ki off) KCELL
+      guard (.v (← binv .i1 .eq (.v tag) (ki T_ROW))) done
+      let r ← ld "ptr" .ptr b (ki (off + 8)) KCELL
+      emit (.set c.r (.opnd (.v r)))
+      let field ← ld "i32" .i64 r (ki 40) KHDR
+      guard (.v (← binv .i1 .eq (.v field) (ki 0))) done
+      let off0 ← ld "i64" .i64 r (ki 32) KHDR
+      emit (.set c.off (.opnd (.v off0)))
+      for k in [0:c.dims] do
+        let (lv, uv, sv) := c.dim[k]!
+        let l ← ld "i64" .i64 r (ki (48 + 24 * k)) KHDR
+        let u ← ld "i64" .i64 r (ki (56 + 24 * k)) KHDR
+        let stride ← ld "i64" .i64 r (ki (64 + 24 * k)) KHDR
+        emit (.set lv (.opnd (.v l))); emit (.set uv (.opnd (.v u))); emit (.set sv (.opnd (.v stride)))
+      let store ← rowStore r
+      emit (.set c.store (.opnd (.v store)))
+      let sk ← ld "i8" .i64 store (ki 0) KHDR
+      if c.ek == 0 then
+        guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) done
+      else
+        guard (.v (← binv .i1 .eq (.v sk) (ki K_LEAF))) done
+        let ek ← ld "i16" .i64 store (ki 2) KHDR
+        guard (.v (← binv .i1 .eq (.v ek) (ki c.ek))) done
+      let n ← ld "i32" .i64 store (ki 4) KHDR
+      emit (.set c.n (.opnd (.v n)))
+      emit (.set c.valid (.opnd (kb true)))
+      let rc ← ld "i32" .i64 store (ki 8) KHDR
+      let ok ← binv .i1 .le (.v rc) (ki 1)
+      emit (.set c.rcOK (.opnd (.v ok)))
+      terminate (.br done)
+      switchTo done
+
+/-- The store index of `a[i]` or `a[i, j]` from a cache, with the subscript checks. -/
+def rowIndexCached (c : RowCache) (is : Array Opnd) : L Var := do
+  let mut idx : Var := c.off
+  for k in [0:c.dims] do
+    let (l, u, stride) := c.dim[k]!
+    let i := is[k]!
+    let ge ← binv .i1 .ge i (.v l)
+    let le ← binv .i1 .le i (.v u)
+    let inb ← binv .i1 .andB (.v ge) (.v le)
+    let errB ← newBlock
+    guard (.v inb) errB
+    let cur := (← get).fb.cur
+    switchTo errB
+    rt "a68rt_index_error" #[i, .v l, .v u]
+    terminate .unreachable
+    switchTo cur
+    let t ← binv .i64 .subW i (.v l)
+    let m ← binv .i64 .mulW (.v t) (.v stride)
+    idx ← binv .i64 .addW (.v idx) (.v m)
+  return idx
+
+/-- `rowLeafElem` through the loop's cache when there is one: the store, the index, and
+    the store's element count when it is known. -/
+def rowLeafElemC (fid : Nat) (b : Var) (off : Int) (s dims : Nat) (is : Array Opnd) (info : ElemInfo) (slow : Nat) : L (Var × Var × Option Var × Option RowCache) := do
+  noteRowUse fid s info.ek dims
+  match ← lookupCache fid s info.ek with
+  | some c =>
+    guard (.v c.valid) slow
+    let idx ← rowIndexCached c is
+    return (c.store, idx, some c.n, some c)
+  | none =>
+    let (_, store, idx) ← rowLeafElem b off dims is info slow
+    return (store, idx, none, none)
+
+
 /-- The address of the value the name in cell `(b, off)` refers to: a slot of a structure
     object or a cell of a frame (`rt.c: ref_slot`); `slow` for NIL, an undefined name, or
     a name into a row (which the runtime resolves). -/
@@ -400,17 +542,30 @@ def refTarget (b : Var) (off : Int) (slow : Nat) : L (Var × Opnd) := do
   let o ← binv .i64 .addW (.v base) (.v aux)
   return (obj, .v o)
 
-def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) (via : Bool := false) : L (Var × Opnd × Nat) := do
+def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) (via : Bool := false)
+    (key : Option (Nat × Nat) := none) : L (Var × Opnd × Nat) := do
   let mut cur : Var × Opnd × Nat := (b, ki off, KCELL)
   if via then
     let (p, o) ← refTarget b off slow
     cur := (p, o, KANY)
   if rank > 0 then
-    let r ← cellRowd b off slow
-    let idx ← rowIndex r rank is slow
-    let store ← rowStore r
-    let sk ← ld "i8" .i64 store (ki 0) KHDR
-    guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
+    let cached : Option RowCache ← match key with
+      | some (fid, slot) =>
+        noteRowUse fid slot 0 rank
+        lookupCache fid slot 0
+      | none => pure none
+    let (store, idx) ← match cached with
+      | some c =>
+        guard (.v c.valid) slow
+        let idx ← rowIndexCached c is
+        pure (c.store, idx)
+      | none =>
+        let r ← cellRowd b off slow
+        let idx ← rowIndex r rank is slow
+        let store ← rowStore r
+        let sk ← ld "i8" .i64 store (ki 0) KHDR
+        guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
+        pure (store, idx)
     let eo ← binv .i64 .mulW (.v idx) (ki 16)
     let eo ← binv .i64 .addW (.v eo) (ki 24)
     cur := (store, .v eo, KSLOT)
@@ -444,8 +599,10 @@ def valSet (p : Var) (off : Opnd) (info : ElemInfo) (v : Opnd) (kind : Nat := 0)
 
 /-- The byte of the leaf's defined bitmap for store index `idx`, its offset, and the mask
     of the element's bit. -/
-def leafBit (store idx : Var) (es : Nat) : L (Var × Var × Var) := do
-  let n ← ld "i32" .i64 store (ki 4) KHDR
+def leafBit (store idx : Var) (es : Nat) (n? : Option Var := none) : L (Var × Var × Var) := do
+  let n ← match n? with
+    | some n => pure n
+    | none => ld "i32" .i64 store (ki 4) KHDR
   let bytes ← binv .i64 .mulW (.v n) (ki es)
   let hi ← binv .i64 .shrW (.v idx) (ki 3)
   let o1 ← binv .i64 .addW (.v bytes) (.v hi)
@@ -457,8 +614,8 @@ def leafBit (store idx : Var) (es : Nat) : L (Var × Var × Var) := do
 
 /-- The element at store index `idx` of a leaf, as a value of the element's MIR type;
     an undefined element is reported as the evaluator reports it. -/
-def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) : L Var := do
-  let (byte, _, mask) ← leafBit store idx info.es
+def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) (n? : Option Var := none) : L Var := do
+  let (byte, _, mask) ← leafBit store idx info.es n?
   let bit ← binv .i64 .andW (.v byte) (.v mask)
   let undefB ← newBlock
   guard (.v (← binv .i1 .ne (.v bit) (ki 0))) undefB
@@ -476,8 +633,8 @@ def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) : L Var := do
   | _ => return raw
 
 /-- Write the element at store index `idx` of a leaf and mark it defined. -/
-def leafSet (store idx : Var) (info : ElemInfo) (v : Opnd) : L Unit := do
-  let (byte, boff, mask) ← leafBit store idx info.es
+def leafSet (store idx : Var) (info : ElemInfo) (v : Opnd) (n? : Option Var := none) : L Unit := do
+  let (byte, boff, mask) ← leafBit store idx info.es n?
   let nb ← binv .i64 .orW (.v byte) (.v mask)
   st "i8" store (.v boff) (.v nb) KLEAF
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
@@ -491,15 +648,19 @@ def rowWrite (d s dims : Nat) (is : Array Opnd) (mr : Mode) (v : Opnd) (fn : Str
   let j := is[1]?.getD (ki 0)
   match ← cellAddr d s, elemInfo mr with
   | some (b, off), some info =>
+    let fid ← cellFid d
     let slow ← newBlock; let done ← newBlock
-    let (_, store, idx) ← rowLeafElem b off dims is info slow
-    let rc ← ld "i32" .i64 store (ki 8) KHDR
-    guard (.v (← binv .i1 .le (.v rc) (ki 1))) slow
+    let (store, idx, n?, c?) ← rowLeafElemC fid b off s dims is info slow
+    match c? with
+    | some c => guard (.v c.rcOK) slow
+    | none =>
+      let rc ← ld "i32" .i64 store (ki 8) KHDR
+      guard (.v (← binv .i1 .le (.v rc) (ki 1))) slow
     if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
-    leafSet store idx info v
+    leafSet store idx info v n?
     terminate (.br done)
     switchTo slow
-    rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, j, v]
+    slowPath slow (some (fid, s)) do rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, j, v]
     terminate (.br done)
     switchTo done
   | _, _ => rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, j, v]
@@ -792,7 +953,9 @@ def jumpCheck : L Unit := do
 
 def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true)
     (cells : Option Var := none) : L Unit :=
-  modify fun s => { s with fb := { s.fb with frames := { modes := modes, vars := vars, pushed := pushed, cells := cells } :: s.fb.frames } }
+  modify fun s =>
+    let f : FrameInfo := { modes := modes, vars := vars, pushed := pushed, cells := cells, fid := s.nextFid }
+    { s with nextFid := s.nextFid + 1, fb := { s.fb with frames := f :: s.fb.frames } }
 
 /-- The routines the innermost frame's slots are known to hold. -/
 def setProcs (procs : Array (Option (Nat × CodeGen.NatSig))) : L Unit :=
@@ -801,6 +964,38 @@ def setProcs (procs : Array (Option (Nat × CodeGen.NatSig))) : L Unit :=
     | [] => s
 def popFrame : L Unit :=
   modify fun s => { s with fb := { s.fb with frames := s.fb.frames.tail } }
+
+/-- The runtime entry points that change no cell and no row store: a loop calling only
+    these (outside its slow paths) may keep what it knows about a row in variables. -/
+def harmlessRt : List String :=
+  [ "a68rt_enter", "a68rt_leave", "a68rt_set_int", "a68rt_set_cell_int", "a68rt_set_cell_real",
+    "a68rt_set_cell_bool", "a68rt_set_cell_char", "a68rt_set_cell_bits", "a68rt_cell_int",
+    "a68rt_cell_real", "a68rt_cell_bool", "a68rt_cell_char", "a68rt_cell_bits", "a68rt_cell_isnil",
+    "a68rt_cell_cproc", "a68rt_push_int", "a68rt_push_real", "a68rt_push_bool", "a68rt_push_char",
+    "a68rt_push_bits", "a68rt_pop_int", "a68rt_pop_real", "a68rt_pop_bool", "a68rt_pop_char",
+    "a68rt_pop_bits", "a68rt_pop", "a68rt_jump_pending", "a68rt_jump_clear", "a68rt_index_error",
+    "a68rt_undef_error", "a68rt_arith_error", "a68rt_conforms", "a68rt_frame_cells",
+    "a68rt_env_depth", "a68rt_stack_depth", "a68rt_env_truncate", "a68rt_stack_truncate" ]
+
+/-- Does every runtime call in blocks `[from, to)` outside the slow paths leave cells and
+    row stores alone?  A call of a routine may do anything. -/
+def callFree (from_ to : Nat) : L Bool := do
+  let st ← get
+  let slow (b : Nat) : Bool := st.slowRanges.any fun (a, z) => a ≤ b && b < z
+  let ok (f : Callee) : Bool := match f with
+    | .rt name => harmlessRt.contains name
+    | .nat _ => true
+    | _ => false
+  for b in [from_:to] do
+    if slow b then continue
+    let some blk := st.fb.blocks[b]? | continue
+    for ins in blk.instrs do
+      match ins with
+      | .call f _ => if !ok f then return false
+      | .set _ (.call f _) => if !ok f then return false
+      | _ => pure ()
+  return true
+
 
 -- ## Expressions
 
@@ -876,8 +1071,9 @@ partial def lower (c : Core) : L Res := do
           emit (.set z (.opnd (.v isNil)))
           terminate (.br done)
           switchTo slow
-          let r ← rtv "a68rt_cell_isnil" #[ku (← rtd d), ku s]
-          emit (.set z (.opnd (.v r)))
+          slowPath slow none do
+            let r ← rtv "a68rt_cell_isnil" #[ku (← rtd d), ku s]
+            emit (.set z (.opnd (.v r)))
           terminate (.br done)
           switchTo done
         | none =>
@@ -1043,14 +1239,16 @@ partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
   | some (b, off), some info =>
     -- inline when the cell holds a row over a leaf store, else the runtime
     let res ← newVar ty
+    let fid ← cellFid d
     let slow ← newBlock; let done ← newBlock
-    let (_, store, idx) ← rowLeafElem b off dims is info slow
-    let v ← leafGet store idx info ty
+    let (store, idx, n?, _) ← rowLeafElemC fid b off s dims is info slow
+    let v ← leafGet store idx info ty n?
     emit (.set res (.opnd (.v v)))
     terminate (.br done)
     switchTo slow
-    let sv ← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j]
-    emit (.set res (.opnd (.v sv)))
+    slowPath slow (some (fid, s)) do
+      let sv ← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j]
+      emit (.set res (.opnd (.v sv)))
     terminate (.br done)
     switchTo done
     return some (.sc (.v res))
@@ -1109,14 +1307,16 @@ partial def selRead (c : Core) : L (Option Res) := do
     -- inline through the name, the row element and the structure objects when every tag
     -- is as expected, else the runtime
     let res ← newVar ty
+    let fid ← cellFid d
     let slow ← newBlock; let done ← newBlock
-    let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via
+    let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via (some (fid, s))
     let v ← valGet p o info ty slow pk
     emit (.set res (.opnd (.v v)))
     terminate (.br done)
     switchTo slow
-    let sv ← slowCall
-    emit (.set res (.opnd (.v sv)))
+    slowPath slow (some (fid, s)) do
+      let sv ← slowCall
+      emit (.set res (.opnd (.v sv)))
     terminate (.br done)
     switchTo done
     return some (.sc (.v res))
@@ -1176,13 +1376,14 @@ partial def storeTyped (dst src : Core) : L Bool := do
     let slowCall : L Unit := do rt fn #[ku (← rtd d), ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields), v]
     match ← cellAddr d s, elemInfo mr with
     | some (b, off), some info =>
+      let fid ← cellFid d
       let slow ← newBlock; let done ← newBlock
-      let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via
+      let (p, o, pk) ← selAddr b off rank #[i, j] fields slow via (some (fid, s))
       if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
       valSet p o info v pk
       terminate (.br done)
       switchTo slow
-      slowCall
+      slowPath slow (some (fid, s)) slowCall
       terminate (.br done)
       switchTo done
     | _, _ => slowCall
@@ -1406,8 +1607,9 @@ partial def storeRef (dst : Core) (dd ss : Nat) (src : Core) (flex : Bool) : L B
     st "i64" db (ki (doff + 8)) (.v w1) KCELL
     terminate (.br done)
     switchTo slow
-    let _ ← lowerAssignGeneral dst src flex
-    rt "a68rt_pop"
+    slowPath slow none do
+      let _ ← lowerAssignGeneral dst src flex
+      rt "a68rt_pop"
     terminate (.br done)
     switchTo done
     return true
@@ -1495,16 +1697,32 @@ partial def rowBound (isUpb : Bool) (k : Nat) (e : Core) (slowAct : L Unit) : L 
   let .row dims _ _ ← resolve m | return none
   if k < 1 || k > dims then return none
   let some (b, off) ← cellAddr d s | return none
+  let fid ← cellFid d
   let res ← newVar .i64
   let slow ← newBlock; let done ← newBlock
-  let r ← cellRowd b off slow
-  let v ← ld "i64" .i64 r (ki (48 + 24 * (k - 1) + (if isUpb then 8 else 0))) KHDR
-  emit (.set res (.opnd (.v v)))
+  -- a cache of the row (of either store kind) has the bound
+  let cached : Option RowCache ← do
+    match ← lookupCache fid s 0 with
+    | some c => pure (some c)
+    | none =>
+      match (← get).caches.find? (fun c => c.fid == fid && c.slot == s) with
+      | some c => pure (some c)
+      | none => pure none
+  match cached with
+  | some c =>
+    guard (.v c.valid) slow
+    let (l, u, _) := c.dim[k - 1]!
+    emit (.set res (.opnd (.v (if isUpb then u else l))))
+  | none =>
+    let r ← cellRowd b off slow
+    let v ← ld "i64" .i64 r (ki (48 + 24 * (k - 1) + (if isUpb then 8 else 0))) KHDR
+    emit (.set res (.opnd (.v v)))
   terminate (.br done)
   switchTo slow
-  slowAct
-  let sv ← rtv "a68rt_pop_int"
-  emit (.set res (.opnd (.v sv)))
+  slowPath slow (some (fid, s)) do
+    slowAct
+    let sv ← rtv "a68rt_pop_int"
+    emit (.set res (.opnd (.v sv)))
   terminate (.br done)
   switchTo done
   return some (.sc (.v res))
@@ -1715,7 +1933,6 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
     match dest with
     | .stack => let _ ← lowerStack out; rt "a68rt_nip"
     | _ => lowerInto dest out; rt "a68rt_pop"
-    terminate (.br done)
   -- can the alternatives be taken inline?
   let mut infos : Array (ElemInfo × Ty) := #[]
   let mut inlineOk := true
@@ -1747,24 +1964,19 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
   match inlineOk, src with
   | true, some (d, s, idx, viaRef) =>
     match ← cellAddr d s with
-    | none => let _ ← lowerStack sel; general
+    | none => let _ ← lowerStack sel; general; terminate (.br done)
     | some (b, off) =>
       let i : Option Opnd ← match idx with
         | some e => pure (some (← toScalar (← lower e) (.int 0)))
         | none => pure none
       let slow ← newBlock
       -- the address of the united value
+      let fid ← cellFid d
       let (p, o, pk) : Var × Opnd × Nat ← match i with
         | none => pure (b, ki off, KCELL)
         | some iv =>
-          let r ← cellRowd b off slow
-          let ix ← rowIndex r 1 #[iv] slow
-          let store ← rowStore r
-          let sk ← ld "i8" .i64 store (ki 0) KHDR
-          guard (.v (← binv .i1 .eq (.v sk) (ki K_SLOTS))) slow
-          let eo ← binv .i64 .mulW (.v ix) (ki 16)
-          let eo ← binv .i64 .addW (.v eo) (ki 24)
-          pure (store, .v eo, KSLOT)
+          let (store, eo, _) ← selAddr b off 1 #[iv] [] slow false (some (fid, s))
+          pure (store, eo, KSLOT)
       let tag ← ld "i32" .i64 p o pk
       guard (.v (← binv .i1 .eq (.v tag) (ki T_UNION))) slow
       let ao ← binv .i64 .addW o (ki 4)
@@ -1798,16 +2010,18 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
       terminate (.br done)
       switchTo slow
       -- the general path, with the index already evaluated
-      match i with
-      | none => let _ ← lowerStack sel
-      | some iv =>
-        match CodeGen.strip sel with
-        | .slice base _ _ => let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]
-        | .deref (.slice base _ _) =>
-          let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]; rt "a68rt_deref"
-        | _ => let _ ← lowerStack sel
-      general
-  | _, _ => let _ ← lowerStack sel; general
+      slowPath slow none do
+        match i with
+        | none => let _ ← lowerStack sel
+        | some iv =>
+          match CodeGen.strip sel with
+          | .slice base _ _ => let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]
+          | .deref (.slice base _ _) =>
+            let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]; rt "a68rt_deref"
+          | _ => let _ ← lowerStack sel
+        general
+      terminate (.br done)
+  | _, _ => let _ ← lowerStack sel; general; terminate (.br done)
   switchTo done
 
 partial def lowerGoto (l : Nat) : L Unit := do
@@ -1827,6 +2041,43 @@ partial def lowerLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
   let to_ : Option Opnd ← match t with
     | some tc => pure (some (← toScalar (← lower tc) (.int 0)))
     | none => pure none
+  -- Which rows does the body reach inline, and does it call anything that could change a
+  -- cell or a store?  A trial lowering tells; then, for each such row whose frame exists
+  -- before the loop, the descriptor and store are read once before the loop and kept in
+  -- variables (recomputed after any slow path), so that the accesses are register-based.
+  let snapshot ← get
+  modify fun st => { st with rowUses := #[], slowRanges := #[] }
+  let blk0 := (← get).fb.blocks.size
+  lowerLoopBody slot from_ by_ to_ w body
+  let blk1 := (← get).fb.blocks.size
+  let uses := (← get).rowUses
+  let safe ← callFree blk0 blk1
+  set snapshot
+  let mut added : List RowCache := []
+  if safe then
+    let fids := (← get).fb.frames.map (·.fid)
+    let mut seen : List (Nat × Nat × Int) := []
+    for (fid, sl, ek, dims) in uses do
+      if seen.contains (fid, sl, ek) then continue
+      seen := (fid, sl, ek) :: seen
+      -- only a frame in place before the loop, and no cache of it already in scope
+      if !(fids.contains fid || fid ≥ 1000000) then continue
+      if (← lookupCache fid sl ek).isSome then continue
+      let valid ← newVar .i1; let rcOK ← newVar .i1
+      let r ← newVar .ptr; let store ← newVar .ptr; let off ← newVar .i64; let n ← newVar .i64
+      let mut dim : Array (Var × Var × Var) := #[]
+      for _ in [0:dims] do
+        dim := dim.push (← newVar .i64, ← newVar .i64, ← newVar .i64)
+      let c : RowCache := { fid := fid, slot := sl, ek := ek, dims := dims, valid := valid, rcOK := rcOK,
+                            r := r, store := store, off := off, dim := dim, n := n }
+      slowPath.recache c
+      added := c :: added
+  modify fun st => { st with caches := added ++ st.caches }
+  lowerLoopBody slot from_ by_ to_ w body
+  modify fun st => { st with caches := st.caches.drop added.length }
+
+/-- The loop proper, from its evaluated bounds. -/
+partial def lowerLoopBody (slot : Option Nat) (from_ by_ : Opnd) (to_ : Option Opnd) (w : Option Core) (body : Core) : L Unit := do
   let i ← newVar .i64
   emit (.set i (.opnd from_))
   let head ← newBlock; let bodyB ← newBlock; let exitB ← newBlock; let stepB ← newBlock
