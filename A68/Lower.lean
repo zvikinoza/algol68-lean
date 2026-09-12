@@ -365,8 +365,36 @@ def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : Ele
 /-- The address (object, byte offset) of the value `f OF … OF x[i]` names, for the cell
     `(b, off)` holding the value itself: the row element, then each field through the
     structure object (`rt.c: sel_read`); `slow` when a tag is not as expected. -/
-def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) : L (Var × Opnd) := do
+def T_NIL : Int := 7
+def K_FRAME : Int := 4
+
+/-- The address of the value the name in cell `(b, off)` refers to: a slot of a structure
+    object or a cell of a frame (`rt.c: ref_slot`); `slow` for NIL, an undefined name, or
+    a name into a row (which the runtime resolves). -/
+def refTarget (b : Var) (off : Int) (slow : Nat) : L (Var × Opnd) := do
+  let tag ← ld "i32" .i64 b (ki off)
+  guard (.v (← binv .i1 .eq (.v tag) (ki T_REF))) slow
+  let aux ← ld "i32" .i64 b (ki (off + 4))
+  let obj ← ld "ptr" .ptr b (ki (off + 8))
+  let kind ← ld "i8" .i64 obj (ki 0)
+  let base ← newVar .i64
+  let isSlots ← binv .i1 .eq (.v kind) (ki K_SLOTS)
+  let slotsB ← newBlock; let notSlots ← newBlock; let cont ← newBlock
+  terminate (.condBr (.v isSlots) slotsB notSlots)
+  switchTo slotsB
+  emit (.set base (.opnd (ki 24)))
+  terminate (.br cont)
+  switchTo notSlots
+  guard (.v (← binv .i1 .eq (.v kind) (ki K_FRAME))) slow
+  emit (.set base (.opnd (ki 40)))
+  terminate (.br cont)
+  switchTo cont
+  let o ← binv .i64 .addW (.v base) (.v aux)
+  return (obj, .v o)
+
+def selAddr (b : Var) (off : Int) (rank : Nat) (is : Array Opnd) (fields : List Nat) (slow : Nat) (via : Bool := false) : L (Var × Opnd) := do
   let mut cur : Var × Opnd := (b, ki off)
+  if via then cur ← refTarget b off slow
   if rank > 0 then
     let r ← cellRowd b off slow
     let idx ← rowIndex r rank is slow
@@ -826,7 +854,25 @@ partial def lower (c : Core) : L Res := do
     match side with
     | some (d, s) =>
       if (← pvarOf d s).isNone then
-        let z ← rtv "a68rt_cell_isnil" #[ku (← rtd d), ku s]
+        let z ← newVar .i1
+        match ← cellAddr d s with
+        | some (b, off) =>
+          -- the cell's tag says: NIL, or a name; anything else the runtime reports
+          let slow ← newBlock; let done ← newBlock
+          let tag ← ld "i32" .i64 b (ki off)
+          let isNil ← binv .i1 .eq (.v tag) (ki T_NIL)
+          let isRef ← binv .i1 .eq (.v tag) (ki T_REF)
+          guard (.v (← binv .i1 .orB (.v isNil) (.v isRef))) slow
+          emit (.set z (.opnd (.v isNil)))
+          terminate (.br done)
+          switchTo slow
+          let r ← rtv "a68rt_cell_isnil" #[ku (← rtd d), ku s]
+          emit (.set z (.opnd (.v r)))
+          terminate (.br done)
+          switchTo done
+        | none =>
+          let r ← rtv "a68rt_cell_isnil" #[ku (← rtd d), ku s]
+          emit (.set z (.opnd (.v r)))
         if isnt then
           let v ← newVar .i1
           emit (.set v (.un .notB (.v z)))
@@ -1048,13 +1094,13 @@ partial def selRead (c : Core) : L (Option Res) := do
     | .i64 => if mr matches .bits _ then "a68rt_sel_bits" else "a68rt_sel_int"
     | .f64 => "a68rt_sel_real" | .i1 => "a68rt_sel_bool" | .i32 => "a68rt_sel_char" | .ptr => ""
   let slowCall : L Var := do rtv fn #[ku (← rtd d), ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields)]
-  match via, ← cellAddr d s, elemInfo mr with
-  | false, some (b, off), some info =>
-    -- inline through the row element and the structure objects when every tag is as
-    -- expected, else the runtime
+  match ← cellAddr d s, elemInfo mr with
+  | some (b, off), some info =>
+    -- inline through the name, the row element and the structure objects when every tag
+    -- is as expected, else the runtime
     let res ← newVar ty
     let slow ← newBlock; let done ← newBlock
-    let (p, o) ← selAddr b off rank #[i, j] fields slow
+    let (p, o) ← selAddr b off rank #[i, j] fields slow via
     let v ← valGet p o info ty slow
     emit (.set res (.opnd (.v v)))
     terminate (.br done)
@@ -1064,7 +1110,7 @@ partial def selRead (c : Core) : L (Option Res) := do
     terminate (.br done)
     switchTo done
     return some (.sc (.v res))
-  | _, _, _ => return some (.sc (.v (← slowCall)))
+  | _, _ => return some (.sc (.v (← slowCall)))
 
 /-- The general slice: the row and the indexers on the stack, then the runtime. -/
 partial def lowerSlice (arr : Core) (idx : List CoreIdx) (viaRef : Bool) : L Res := do
@@ -1118,10 +1164,10 @@ partial def storeTyped (dst src : Core) : L Bool := do
       | .i64 => if mr matches .bits _ then "a68rt_set_sel_bits" else "a68rt_set_sel_int"
       | .f64 => "a68rt_set_sel_real" | .i1 => "a68rt_set_sel_bool" | .i32 => "a68rt_set_sel_char" | .ptr => ""
     let slowCall : L Unit := do rt fn #[ku (← rtd d), ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields), v]
-    match via, ← cellAddr d s, elemInfo mr with
-    | false, some (b, off), some info =>
+    match ← cellAddr d s, elemInfo mr with
+    | some (b, off), some info =>
       let slow ← newBlock; let done ← newBlock
-      let (p, o) ← selAddr b off rank #[i, j] fields slow
+      let (p, o) ← selAddr b off rank #[i, j] fields slow via
       if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
       valSet p o info v
       terminate (.br done)
@@ -1129,7 +1175,7 @@ partial def storeTyped (dst src : Core) : L Bool := do
       slowCall
       terminate (.br done)
       switchTo done
-    | _, _, _ => slowCall
+    | _, _ => slowCall
     return true
   | _ => return false
 
@@ -1289,6 +1335,73 @@ partial def storeScalar (dd ss : Nat) (src : Core) : L Bool := do
       | none => return false
     | none => return false
   | none => return false
+
+/-- `p := q`, `p := f OF … OF x` or `p := NIL` on a cell of a REF mode: the 16-byte value
+    is copied inline, once its tag is seen to be a name or NIL (a name is a value: the
+    runtime's `slot_put` copies it as it is).  Returns whether it applied. -/
+partial def storeRef (dst : Core) (dd ss : Nat) (src : Core) (flex : Bool) : L Bool := do
+  if (← pvarOf dd ss).isSome then return false
+  let some m ← slotMode dd ss | return false
+  let .ref _ ← resolve m | return false
+  let some (db, doff) ← cellAddr dd ss | return false
+  -- where the source value is
+  let srcAddr : Option (L (Nat × (Var × Opnd))) ← do   -- the slow block, then the address
+    match CodeGen.strip src with
+    | .lit .nil => pure none
+    | .loadCell d s | .deref (.refCell d s) =>
+      if (← pvarOf d s).isSome then pure none else
+      match ← slotMode d s with
+      | some sm =>
+        match ← resolve sm with
+        | .ref _ =>
+          match ← cellAddr d s with
+          | some (b, off) => pure (some (do let slow ← newBlock; pure (slow, (b, ki off))))
+          | none => pure none
+        | _ => pure none
+      | none => pure none
+    | .deref e =>
+      match ← modeOfRef e with
+      | some rm =>
+        match ← resolve rm with
+        | .ref _ =>
+          match ← selChain e with
+          | some (d, s, rank, i, j, fields, via) =>
+            if fields.isEmpty then pure none else
+            match ← cellAddr d s with
+            | some (b, off) => pure (some (do
+                let slow ← newBlock
+                let (p, o) ← selAddr b off rank #[i, j] fields slow via
+                pure (slow, (p, o))))
+            | none => pure none
+          | none => pure none
+        | _ => pure none
+      | none => pure none
+    | _ => pure none
+  match CodeGen.strip src, srcAddr with
+  | .lit .nil, _ =>
+    st "i64" db (ki doff) (ki T_NIL)
+    st "i64" db (ki (doff + 8)) (ki 0)
+    return true
+  | _, some act =>
+    let (slow, (p, o)) ← act
+    let done ← newBlock
+    let tag ← ld "i32" .i64 p o
+    let isNil ← binv .i1 .eq (.v tag) (ki T_NIL)
+    let isRef ← binv .i1 .eq (.v tag) (ki T_REF)
+    guard (.v (← binv .i1 .orB (.v isNil) (.v isRef))) slow
+    let w0 ← ld "i64" .i64 p o
+    let o8 ← binv .i64 .addW o (ki 8)
+    let w1 ← ld "i64" .i64 p (.v o8)
+    st "i64" db (ki doff) (.v w0)
+    st "i64" db (ki (doff + 8)) (.v w1)
+    terminate (.br done)
+    switchTo slow
+    let _ ← lowerAssignGeneral dst src flex
+    rt "a68rt_pop"
+    terminate (.br done)
+    switchTo done
+    return true
+  | _, none => return false
 
 partial def lowerAssignGeneral (d s : Core) (flex : Bool) : L Res := do
   let _ ← lowerStack d
@@ -1481,6 +1594,7 @@ partial def lowerVoid (c : Core) : L Unit := do
     match CodeGen.strip d with
     | .refCell dd ss =>
       if ← storeScalar dd ss s then pure ()
+      else if ← storeRef d dd ss s flex then pure ()
       else do let _ ← lowerAssignGeneral d s flex; rt "a68rt_pop"
     | _ =>
       if ← storeTyped d s then pure ()
@@ -1609,7 +1723,7 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
       match ← slotMode d s with
       | some m => if (← resolve m) matches .union _ then pure (some (d, s, none, false)) else pure none
       | none => pure none
-    | .slice base [.index e] viaRef =>
+    | .slice base [.index e] viaRef | .deref (.slice base [.index e] viaRef) =>
       match ← cellBase base with
       | some (d, s, _) =>
         match ← slotMode d s with
@@ -1679,6 +1793,8 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
       | some iv =>
         match CodeGen.strip sel with
         | .slice base _ _ => let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]
+        | .deref (.slice base _ _) =>
+          let _ ← lowerStack base; rt "a68rt_push_int" #[iv]; rt "a68rt_slice" #[ku 1, ki 0, kb viaRef]; rt "a68rt_deref"
         | _ => let _ ← lowerStack sel
       general
   | _, _ => let _ ← lowerStack sel; general
