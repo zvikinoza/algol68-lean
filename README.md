@@ -10,6 +10,28 @@ reference implementation, **byte for byte** on its standard output. An evaluator
 Lean (`a68lean run`) executes the same core representation directly and is the
 specification the compiled program is tested against.
 
+**Optimisations, in short** (the full catalogue with source locations is in
+[docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)):
+
+* scalars and non-escaping locals in registers; routines with primitive signatures as
+  plain functions called directly, with no jump check after routines that cannot jump;
+* rows that never escape as native arrays (structure-of-arrays for rows of structures)
+  with bounds in registers; other rows, structures, unions, strings and names accessed
+  inline through the runtime's object layout, with descriptors cached per loop;
+* conformity clauses resolved at compile time; strings appended in place; a
+  free-list allocator in the collector;
+* in counted loops: an interval analysis that removes subscript checks a loop cannot
+  violate, a definedness analysis that removes undefined-element tests once every
+  element has been assigned, every remaining check deferred to one flag (with a checked
+  second run on failure, so a failing program prints exactly what a68g prints) so the
+  loop body has no early exit, and one finiteness test per REAL chain instead of one per
+  operation;
+* verified MIR passes: copy and constant propagation, constant and branch folding, dead
+  assignment and unreachable block elimination.
+
+Result: within 1.0x–2x of hand-written C on 27 of the 32 benchmarks, 1.0x on dot
+products, and a68g's output byte for byte on every test corpus.
+
 Lean was chosen so that the implementation is verifiable: every function is
 total unless marked `partial`, the type checker rules out whole classes of
 bugs, and the parts of the design most prone to subtle errors are backed by
@@ -244,6 +266,7 @@ docs/                architecture, compatibility notes, testing, verification
 ## Documentation
 
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the compilation pipeline and runtime model
+* [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) — every optimisation and analysis, where it lives, what it is worth
 * [docs/LLVM-DESIGN.md](docs/LLVM-DESIGN.md) — MIR, the verified passes, the LLVM back end and its status
 * [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — how a68g's behaviour was reproduced, and known differences
 * [docs/TESTING.md](docs/TESTING.md) — corpora, methodology, results, fuzzing
