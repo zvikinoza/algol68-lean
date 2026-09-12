@@ -45,7 +45,7 @@ struct a68_obj {
 };
 
 typedef struct { a68_obj h; a68_val s[]; } a68_slots;
-typedef struct { a68_obj h; uint8_t d[]; } a68_leaf;     /* elements, then a bitmap of defined ones */
+typedef struct { a68_obj h; uint8_t d[]; } a68_leaf;     /* elements, then one defined byte per element */
 typedef struct { int64_t l, u, stride; } a68_dim;
 /* `field`: one plus the field a multiple selection through a name picks in every element,
    0 for a plain row (`Interp.readPath` with `.field` on a row) */

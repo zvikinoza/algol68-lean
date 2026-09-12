@@ -78,7 +78,7 @@ static size_t leaf_esize(uint16_t ek) {
 
 a68_leaf*  leaf_alloc(uint16_t ek, uint32_t n) {
   size_t es = leaf_esize(ek);
-  size_t bytes = (size_t) n * es + (ek == EK_BYTES ? 0 : (n + 7) / 8);
+  size_t bytes = (size_t) n * es + (ek == EK_BYTES ? 0 : n);   /* elements, then a defined byte each */
   a68_leaf* l = (a68_leaf*) obj_alloc(K_LEAF, sizeof(a68_leaf) + bytes);
   l->h.ek = ek;
   l->h.n = n;
@@ -221,8 +221,8 @@ a68_val  store_get(a68_obj* st, int64_t idx) {
   if (st->kind == K_SLOTS) return ((a68_slots*) st)->s[idx];
   a68_leaf* l = (a68_leaf*) st;
   size_t es = leaf_esize(l->h.ek);
-  const uint8_t* bits = l->d + (size_t) l->h.n * es;
-  if (!(bits[idx >> 3] & (1u << (idx & 7)))) return mk_tag(T_UNDEF);
+  const uint8_t* flags = l->d + (size_t) l->h.n * es;
+  if (!flags[idx]) return mk_tag(T_UNDEF);
   const uint8_t* e = l->d + (size_t) idx * es;
   switch (l->h.ek) {
     case T_INT: { int64_t x; memcpy(&x, e, 8); return mk_int(x); }
@@ -247,10 +247,10 @@ void  store_set(a68_obj* st, int64_t idx, a68_val v) {
   if (st->kind == K_SLOTS) { ((a68_slots*) st)->s[idx] = unborrow(v); return; }
   a68_leaf* l = (a68_leaf*) st;
   size_t es = leaf_esize(l->h.ek);
-  uint8_t* bits = l->d + (size_t) l->h.n * es;
+  uint8_t* flags = l->d + (size_t) l->h.n * es;
   uint8_t* e = l->d + (size_t) idx * es;
-  if (v.tag == T_UNDEF) { bits[idx >> 3] &= (uint8_t) ~(1u << (idx & 7)); return; }
-  bits[idx >> 3] |= (uint8_t) (1u << (idx & 7));
+  if (v.tag == T_UNDEF) { flags[idx] = 0; return; }
+  flags[idx] = 1;
   switch (l->h.ek) {
     case T_INT: memcpy(e, &v.v.i, 8); break;
     case T_REAL: memcpy(e, &v.v.r, 8); break;
@@ -314,7 +314,7 @@ static a68_obj* store_copy(a68_obj* st) {
   a68_leaf* l = (a68_leaf*) st;
   a68_leaf* c = leaf_alloc(l->h.ek, l->h.n);
   size_t es = leaf_esize(l->h.ek);
-  memcpy(c->d, l->d, (size_t) l->h.n * es + (l->h.ek == EK_BYTES ? 0 : (l->h.n + 7) / 8));
+  memcpy(c->d, l->d, (size_t) l->h.n * es + (l->h.ek == EK_BYTES ? 0 : l->h.n));
   return (a68_obj*) c;
 }
 
@@ -977,7 +977,7 @@ a68_val  string_row(const uint8_t* p, int64_t n, int64_t lwb) {
   a68_rowd* d = rowd_alloc(1);
   a68_leaf* l = leaf_alloc(T_CHAR, (uint32_t) n);
   memcpy(l->d, p, (size_t) n);
-  memset(l->d + n, 0xff, ((size_t) n + 7) / 8);
+  memset(l->d + n, 1, (size_t) n);
   l->h.rc = 1;
   d->base = (a68_obj*) l;
   d->off = 0;

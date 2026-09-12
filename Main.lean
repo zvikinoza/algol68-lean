@@ -51,7 +51,7 @@ def compile (file : String) : IO (Option (Core × Mode.Table × Nat)) := do
 
 /-- Compile to C and link a native binary (`a68lean [compile] prog.a68 [-o out] [-c] [-O0|-O1|-O2]`). -/
 def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
-    -- a68lean compile prog.a68 [-o out] [-c]   (-c keeps the generated C only)
+    -- a68lean compile prog.a68 [-o out] [-c] [--c]   (-c keeps the generated IR or C only; --c: the C back end)
     let out := match rest.dropWhile (· != "-o") with
       | _ :: o :: _ => o
       | _ => (file.splitOn ".").head!
@@ -70,7 +70,8 @@ def compileToBinary (file : String) (rest : List String) : IO UInt32 := do
       let core ← Opt.run core0 level
       if rest.contains "-v" then
         IO.println s!"core nodes: {Opt.size core0} -> {Opt.size core}"
-      let llvm := rest.contains "--llvm"
+      -- the LLVM back end is the compiler; `--c` selects the C back end
+      let llvm := !rest.contains "--c"
       let cFile := if llvm then out ++ ".ll" else out ++ ".c"
       if llvm then
         let mir := Lower.program core modes ll (A68.isRegression toks) (A68.echoesOf toks) file
@@ -148,4 +149,4 @@ def main (args : List String) : IO UInt32 := do
   | file :: rest =>
     -- the bare form compiles, as a C compiler would; `run` executes directly
     compileToBinary file rest
-  | _ => IO.println "usage: a68lean [compile|run|check|dump] file.a68 [-o out] [-c] [-O0|-O1|-O2]"; return 2
+  | _ => IO.println "usage: a68lean [compile|run|check|dump|dump-mir] file.a68 [-o out] [-c] [--c] [-O0|-O1|-O2]"; return 2

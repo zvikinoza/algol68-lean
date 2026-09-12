@@ -6,7 +6,8 @@
 #   a68g     Algol 68 Genie, interpreted
 #   a68gO    Algol 68 Genie with --compile (skipped where the platform cannot link it)
 #   interp   a68lean's evaluator
-#   comp0/1/2  a68lean compiled at -O0, -O1, -O2
+#   llvm0/1/2  a68lean compiled at -O0, -O1, -O2 (the LLVM back end, the default)
+#   comp0/1/2  the C back end (`--c`) at -O0, -O1, -O2
 #
 # Every run is checked against the native program's output, so a benchmark that
 # computes the wrong thing cannot post a good time.  Results go to
@@ -116,11 +117,11 @@ for name in $progs; do
   fi
   fi
 
-  # comp<n>: the C back end; llvm<n>: the LLVM back end (`--llvm`)
+  # llvm<n>: the compiler (LLVM back end); comp<n>: the C back end (`--c`)
   for v in comp0 comp1 comp2 llvm0 llvm1 llvm2; do
     want "$v" || continue
     lvl=${v: -1}
-    extra=""; case "$v" in llvm*) extra="--llvm";; esac
+    extra=""; case "$v" in comp*) extra="--c";; esac
     exe=$DIR/build/$name.$v
     if "$BIN" compile "$src" -O$lvl $extra -o "$exe" >/dev/null 2>&1; then
       if gtimeout 300 "$exe" > "$o" 2>/dev/null; then

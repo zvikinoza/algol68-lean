@@ -6,7 +6,7 @@
 ROOT=$(cd "$(dirname "$0")" && pwd)
 BIN=${A68LEAN:-$ROOT/../.lake/build/bin/a68lean}
 OPT=${1:--O2}
-# extra options for every compilation, e.g. A68LEAN_OPTS=--llvm
+# extra options for every compilation, e.g. A68LEAN_OPTS=--c for the C back end
 EXTRA=${A68LEAN_OPTS:-}
 pass=0; fail=0
 work=$(mktemp -d)

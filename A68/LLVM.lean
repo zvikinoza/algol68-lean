@@ -57,6 +57,8 @@ structure P where
   tmp  : Nat := 0
   used : List String := []      -- runtime and native functions referenced
   nfnSigs : Array (Array Ty × Option Ty) := #[]   -- the plain routines' signatures
+  curLine : Option Nat := none  -- the line number in force (MIR `line`), once one is
+  storedLine : Option Nat := none   -- the line number last stored in this basic block
   deriving Inhabited
 
 abbrev M := StateM P
@@ -65,6 +67,18 @@ def getNfnSig (i : Nat) : M (Array Ty × Option Ty) := do
   return (← get).nfnSigs[i]?.getD (#[], none)
 
 def line (s : String) : M Unit := modify fun p => { p with out := p.out.push s }
+
+/-- A basic block begins: what was stored to the line number no longer holds. -/
+def label (name : String) : M Unit := modify fun p => { p with out := p.out.push (name ++ ":"), storedLine := none }
+
+/-- Store the line number in force, before anything that may report an error: the
+    runtime reads it only then, so pure code between calls needs no store. -/
+def lineStore : M Unit := do
+  let p ← get
+  let some n := p.curLine | return
+  if p.storedLine == some n then return
+  line s!"  store i32 {n}, ptr @a68_line_no, !tbaa !16"
+  modify fun p => { p with storedLine := some n }
 def fresh : M String := do
   let p ← get
   set { p with tmp := p.tmp + 1 }
@@ -89,10 +103,13 @@ def trapIf (cond : String) (kind : Nat) : M Unit := do
   let tb := "trap" ++ n.drop 2
   let cb := "cont" ++ n.drop 2
   line s!"  br i1 {cond}, label %{tb}, label %{cb}"
-  line s!"{tb}:"
+  let saved := (← get).storedLine
+  label tb
   use "a68rt_arith_error"
+  lineStore
   line s!"  call void @a68rt_arith_error(i32 {kind}, i32 0)"
   line "  unreachable"
+  modify fun p => { p with storedLine := saved }
   line s!"{cb}:"
 
 /-- The INT range check of `a68_rng`. -/
@@ -235,6 +252,10 @@ def natCall (name : String) (args : Array Opnd) (dst : Option Var) : M Unit := d
 /-- A call; the C `uint8_t` arguments and results are `i8`. -/
 def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
   match f with
+  | .nat name =>
+    if name.startsWith "mem_" || name == "jump_flag" then pure () else lineStore
+  | _ => lineStore
+  match f with
   | .fn i => line s!"  call void @a68_fn{i}()"
   | .hole i => line s!"  call void @a68_hole{i}()"
   | .nfn i =>
@@ -251,6 +272,11 @@ def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
     | some d, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"; store d t
     | _, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"
     | _, none => line s!"  call void {fp}({argText})"
+  | .nat "jump_flag" =>
+    let some d := dst | return
+    let t ← fresh; line s!"  {t} = load i32, ptr @a68_jump_flag"
+    if d.ty == Ty.i32 then store d t
+    else do let z ← fresh; line s!"  {z} = zext i32 {t} to i64"; store d z
   | .nat name =>
     if name.startsWith "mem_" then memOp name args dst else natCall name args dst
   | .rt name => natCall name args dst
@@ -350,7 +376,7 @@ def un (d : Var) (op : UnOp) (a : Opnd) : M Unit := do
 
 def instr (i : Instr) : M Unit := do
   match i with
-  | .line n => line s!"  store i32 {n}, ptr @a68_line_no, !tbaa !16"
+  | .line n => modify fun p => { p with curLine := some n }
   | .call f args => call f args none
   | .set d rhs =>
     match rhs with
@@ -381,7 +407,7 @@ def term (t : Term) : M Unit := do
   | .unreachable => line "  unreachable"
 
 def func (f : Func) : M Unit := do
-  modify fun p => { p with tmp := 0 }
+  modify fun p => { p with tmp := 0, curLine := none, storedLine := none }
   let plist := ", ".intercalate ((List.range f.params.size).map fun i => s!"{tyName f.params[i]!} %p{i}")
   line ("define " ++ retTyName f.ret ++ " @" ++ f.name ++ "(" ++ plist ++ ") {")
   line "entry:"
@@ -392,7 +418,7 @@ def func (f : Func) : M Unit := do
   line "  br label %b0"
   for i in [0:f.blocks.size] do
     let b := f.blocks[i]!
-    line s!"b{i}:"
+    label s!"b{i}"
     for ins in b.instrs do instr ins
     term b.term
   line "}"
@@ -449,6 +475,7 @@ def print (p : Program) : String := Id.run do
   head := head.push "target triple = \"arm64-apple-macosx\""
   head := head.push ""
   head := head.push "@a68_line_no = external global i32"
+  head := head.push "@a68_jump_flag = external global i32"
   let blobBytes := p.blob.utf8ByteSize + 1
   head := head.push s!"@A68_BLOB = private constant [{blobBytes} x i8] {cstr (p.blob ++ "\x00")}"
   head := head.push s!"@A68_SRC = private constant [{p.src.utf8ByteSize + 1} x i8] {cstr (p.src ++ "\x00")}"
@@ -469,7 +496,7 @@ def print (p : Program) : String := Id.run do
       let as := (sg.args.toList.map cTyName) ++ ["i32"]
       head := head.push s!"declare {retName sg.ret} @{n}({", ".intercalate as})"
     | none =>
-      if n.startsWith "mem_" then continue
+      if n.startsWith "mem_" || n == "jump_flag" then continue
       match natSigs.find? (·.1 == n) with
       | some (_, sg) =>
         let as := sg.args.toList.map cTyName

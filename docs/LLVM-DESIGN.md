@@ -131,15 +131,26 @@ batches) and the golden corpus (the same 763 of 773 as the C back end):
   register-based. The inline accesses carry alias information (TBAA: a frame cell, an
   object header, leaf data, a slot value never overlap) for LLVM's own hoisting.
 
-Benchmarks (`benchmarks/bench.sh`, `VARIANTS="native comp2 llvm2"`, quiet machine),
-LLVM back end relative to the C back end: `calls` 1.0, `ctl_fib` 1.5, `ctl_hof` 1.0,
-`ctl_mutual` 1.2, `ctl_goto` 1.0, `ctl_case` 0.75, `num_power` 1.0, `num_mandel` 0.67,
-`num_real` 0.5, `intloop` 0.9, `arraysum` 1.3, `data_matmul` 1.0, `data_slice` 0.7,
-`data_list` 0.07, `data_union` 2.0, `data_struct` 3.0, `sieve` 3.0, `data_string` 7.0.
-Relative to hand-written C, every benchmark but the last four is within 1.0x–3.0x. The
-last four are where the C back end promotes whole rows, rows of structures and strings to
-C arrays and buffers (no tags, no defined bits, no bounds words); doing the same in MIR
-for rows that never escape is the next step of milestone 2.
+  Routines that cannot complete a jump to a label outside themselves (no jump to a
+  foreign label, calls only of builtins and of such sibling routines — a fixpoint over
+  a block's routines) are called without a check of the jump flag afterwards, and the
+  flag itself is read inline. The printer stores the line number lazily: only before a
+  call and in trap blocks, since the runtime reads it only to report an error. A leaf
+  store keeps a defined byte per element (not a bit), so an element write is two plain
+  stores.
+
+`a68lean compile` is the LLVM back end; `--c` selects the C back end, kept as the second
+implementation the suites compare against. Benchmarks (`benchmarks/bench.sh`,
+`VARIANTS="native comp2 llvm2"`), LLVM back end relative to the C back end: `calls` 0.75,
+`ctl_fib` 0.75, `ctl_mutual` 0.9, `ctl_hof` 1.0, `ctl_goto` 1.0, `ctl_case` 0.86,
+`num_mandel` 0.5, `num_real` 0.75, `num_divmod` 0.7, `intloop` 0.94, `arraysum` 1.2,
+`data_matmul` 1.1, `data_slice` 0.7, `data_list` 0.07, `sieve` 1.5, `data_union` 1.8,
+`data_struct` 2.0, `data_string` 6.0. Relative to hand-written C: 1.0x–1.8x on eighteen
+of the twenty-two, `sieve` and `data_union` about 3x, `data_struct` 6x, `data_string` 12x.
+What is left on rows is the per-access bounds check, index arithmetic and defined byte
+(the C twins have none), and on strings the runtime's row representation; both are
+addressed by the next step of milestone 2, promoting rows and strings that never
+escape to native arrays and buffers in MIR.
 
 Not done: the remainder of milestone 2 (promotion of non-escaping rows and strings to
 native arrays; statepoints once pointers live across calls); milestone 3 (further

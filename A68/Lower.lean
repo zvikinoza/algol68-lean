@@ -47,7 +47,7 @@ structure FrameInfo where
   pushed : Bool := true
   /-- per slot: the routine it certainly holds and its plain entry point, once a call can
       see its declaration -/
-  procs  : Array (Option (Nat × CodeGen.NatSig)) := #[]
+  procs  : Array (Option (Nat × CodeGen.NatSig × Bool)) := #[]   -- entry point, signature, cannot jump out
   /-- the first cell of the run-time frame, when it is pushed: cells are addressed from it -/
   cells  : Option Var := none
   /-- a frame of the enclosing function, kept for its `procs`: its cells are captured -/
@@ -90,6 +90,7 @@ structure FnB where
   hoistAt  : Nat := 0                      -- where in block 0 they go
   entryDepth : Nat := 0                    -- how many frames the entry pushes (0 or 1)
   outerCells : List (Nat × Var) := []      -- per captured frame (0 = the declaring one): its cells
+  lastLine : Option Nat := none            -- the line number in force since the block began or the last call
   deriving Inhabited
 
 structure St where
@@ -125,17 +126,28 @@ def newBlock : L Nat := do
   set { s with fb := { s.fb with blocks := s.fb.blocks.push { term := .unreachable } } }
   return id
 
+/-- Append an instruction to the current block.  A line-number store that repeats the one
+    in force is dropped: the number is read only by the runtime's error reporting, and a
+    call resets what is known since the callee sets its own. -/
 def emit (i : Instr) : L Unit :=
   modify fun s =>
-    let b := s.fb.blocks[s.fb.cur]!
-    { s with fb := { s.fb with blocks := s.fb.blocks.set! s.fb.cur { b with instrs := b.instrs.push i } } }
+    match i with
+    | .line n =>
+      if s.fb.lastLine == some n then s else
+      let b := s.fb.blocks[s.fb.cur]!
+      { s with fb := { s.fb with blocks := s.fb.blocks.set! s.fb.cur { b with instrs := b.instrs.push i }, lastLine := some n } }
+    | _ =>
+      let isCall := match i with | .call _ _ | .set _ (.call _ _) => true | _ => false
+      let b := s.fb.blocks[s.fb.cur]!
+      { s with fb := { s.fb with blocks := s.fb.blocks.set! s.fb.cur { b with instrs := b.instrs.push i },
+                                 lastLine := if isCall then none else s.fb.lastLine } }
 
 def terminate (t : Term) : L Unit :=
   modify fun s =>
     let b := s.fb.blocks[s.fb.cur]!
     { s with fb := { s.fb with blocks := s.fb.blocks.set! s.fb.cur { b with term := t } } }
 
-def switchTo (b : Nat) : L Unit := modify fun s => { s with fb := { s.fb with cur := b } }
+def switchTo (b : Nat) : L Unit := modify fun s => { s with fb := { s.fb with cur := b, lastLine := none } }
 
 /-- Leave the current block for `b` and continue there. -/
 def jumpTo (b : Nat) : L Unit := do terminate (.br b); switchTo b
@@ -597,28 +609,22 @@ def valSet (p : Var) (off : Opnd) (info : ElemInfo) (v : Opnd) (kind : Nat := 0)
   let vo ← binv .i64 .addW off (ki 8)
   st (if info.w == "f64" then "f64" else "i64") p (.v vo) v kind
 
-/-- The byte of the leaf's defined bitmap for store index `idx`, its offset, and the mask
-    of the element's bit. -/
-def leafBit (store idx : Var) (es : Nat) (n? : Option Var := none) : L (Var × Var × Var) := do
+/-- The offset of the defined byte of store index `idx` in a leaf: after the elements. -/
+def leafFlag (store idx : Var) (es : Nat) (n? : Option Var := none) : L Var := do
   let n ← match n? with
     | some n => pure n
     | none => ld "i32" .i64 store (ki 4) KHDR
   let bytes ← binv .i64 .mulW (.v n) (ki es)
-  let hi ← binv .i64 .shrW (.v idx) (ki 3)
-  let o1 ← binv .i64 .addW (.v bytes) (.v hi)
-  let boff ← binv .i64 .addW (.v o1) (ki 24)
-  let byte ← ld "i8" .i64 store (.v boff) KLEAF
-  let lo ← binv .i64 .andW (.v idx) (ki 7)
-  let mask ← binv .i64 .shlW (ki 1) (.v lo)
-  return (byte, boff, mask)
+  let o1 ← binv .i64 .addW (.v bytes) (.v idx)
+  binv .i64 .addW (.v o1) (ki 24)
 
 /-- The element at store index `idx` of a leaf, as a value of the element's MIR type;
     an undefined element is reported as the evaluator reports it. -/
 def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) (n? : Option Var := none) : L Var := do
-  let (byte, _, mask) ← leafBit store idx info.es n?
-  let bit ← binv .i64 .andW (.v byte) (.v mask)
+  let foff ← leafFlag store idx info.es n?
+  let flag ← ld "i8" .i64 store (.v foff) KLEAF
   let undefB ← newBlock
-  guard (.v (← binv .i1 .ne (.v bit) (ki 0))) undefB
+  guard (.v (← binv .i1 .ne (.v flag) (ki 0))) undefB
   let cur := (← get).fb.cur
   switchTo undefB
   rt "a68rt_undef_error" #[ku info.kind]
@@ -634,9 +640,8 @@ def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) (n? : Option Var := no
 
 /-- Write the element at store index `idx` of a leaf and mark it defined. -/
 def leafSet (store idx : Var) (info : ElemInfo) (v : Opnd) (n? : Option Var := none) : L Unit := do
-  let (byte, boff, mask) ← leafBit store idx info.es n?
-  let nb ← binv .i64 .orW (.v byte) (.v mask)
-  st "i8" store (.v boff) (.v nb) KLEAF
+  let foff ← leafFlag store idx info.es n?
+  st "i8" store (.v foff) (ki 1) KLEAF
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
   let eoff ← binv .i64 .addW (.v eoff) (ki 24)
   st info.w store (.v eoff) v KLEAF
@@ -669,7 +674,7 @@ def rowWrite (d s dims : Nat) (is : Array Opnd) (mr : Mode) (v : Opnd) (fn : Str
     called right here: the callee is a slot known to hold that routine, and the frame the
     slot lives in is the innermost run-time frame, so the environment the routine captured
     is the one in effect and the call needs no environment switch. -/
-def staticNat (f : Core) : L (Option (Nat × CodeGen.NatSig)) := do
+def staticNat (f : Core) : L (Option (Nat × CodeGen.NatSig × Bool)) := do
   match CodeGen.strip f with
   | .loadCell d s =>
     let some fr := (← get).fb.frames[d]? | return none
@@ -700,7 +705,7 @@ def dynNat (f : Core) : L (Option CodeGen.NatSig) := do
 /-- The mode of a call whose callee has a plain entry point. -/
 def natResultMode (f : Core) : L (Option Mode) := do
   match ← staticNat f with
-  | some (_, sg) => return sg.rty.map CodeGen.CTy.toMode
+  | some (_, sg, _) => return sg.rty.map CodeGen.CTy.toMode
   | none =>
     match ← dynNat f with
     | some sg => return sg.rty.map CodeGen.CTy.toMode
@@ -904,6 +909,9 @@ def isPlus (op : String) : Bool := op == "+"
 
 -- ## Jumps
 
+/-- The pending jump, read from the runtime's flag inline. -/
+def jumpFlag : L Var := natv "jump_flag" .i32 #[]
+
 /-- Leave the function: a plain routine returns a dummy of its result type. -/
 def retFn : L Unit := do
   terminate (match (← get).fb.retTy with | some t => .retVal (.k t (.i 0)) | none => .ret)
@@ -917,7 +925,7 @@ def dispatchBlock : L Nat := do
     let b ← newBlock
     modify fun s => { s with fb := { s.fb with dispatch := some b } }
     switchTo b
-    let f ← rtv "a68rt_jump_pending"
+    let f ← jumpFlag
     let k ← newVar .i32
     emit (.set k (.bin .subI (.v f) (ku 1)))
     let outB ← newBlock
@@ -943,7 +951,7 @@ def finishDispatch : L Unit := do
 
 /-- After a call that may have left a jump pending. -/
 def jumpCheck : L Unit := do
-  let f ← rtv "a68rt_jump_pending"
+  let f ← jumpFlag
   let c ← newVar .i1
   emit (.set c (.bin .ne (.v f) (ku 0)))
   let d ← dispatchBlock
@@ -958,10 +966,41 @@ def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) 
     { s with nextFid := s.nextFid + 1, fb := { s.fb with frames := f :: s.fb.frames } }
 
 /-- The routines the innermost frame's slots are known to hold. -/
-def setProcs (procs : Array (Option (Nat × CodeGen.NatSig))) : L Unit :=
+def setProcs (procs : Array (Option (Nat × CodeGen.NatSig × Bool))) : L Unit :=
   modify fun s => match s.fb.frames with
     | f :: fs => { s with fb := { s.fb with frames := { f with procs := procs } :: fs } }
     | [] => s
+
+/-- Can the routine `body` complete a jump to a label outside itself?  Not when every jump
+    in it goes to one of its own labels and every call is of a builtin or of a sibling
+    routine in `known` (its declaring frame is `depth` frames out); anything else — a
+    format, a deprocedure, a call through a value — may. -/
+partial def mayJumpOut (labels : List Nat) (known : Nat → Bool) (depth : Nat) (c : Core) : Bool :=
+  match c with
+  | .goto l => !labels.contains l
+  | .fmt _ | .deproc _ => true
+  | .call f args =>
+    let calleeOk := match CodeGen.strip f with
+      | .lit (.builtin _) => true
+      | .loadCell d s => d == depth && known s
+      | _ => false
+    !calleeOk || args.any (mayJumpOut labels known depth)
+  | .routine _ _ _ => false   -- a routine text does nothing until called
+  | _ => (CodeGen.childrenD c).any fun (k, ch) => mayJumpOut labels known (depth + k) ch
+
+/-- Which of a block's routines (slot, body) cannot jump out: the greatest set closed under
+    the calls its members make. -/
+partial def jumpFreeSet (rs : List (Nat × Core)) : List Nat := Id.run do
+  let mut known := rs.map (·.1)
+  let mut changed := true
+  while changed do
+    changed := false
+    for (sl, body) in rs do
+      if known.contains sl && mayJumpOut (CodeGen.labelsOf body) (known.contains ·) 1 body then
+        known := known.filter (· != sl)
+        changed := true
+  return known
+
 def popFrame : L Unit :=
   modify fun s => { s with fb := { s.fb with frames := s.fb.frames.tail } }
 
@@ -1641,18 +1680,18 @@ partial def natArgs (ptys : Array CodeGen.CTy) (args : List Core) : L (Array Opn
     call is not a plain one. -/
 partial def natCall (f : Core) (args : List Core) : L (Option (Option Opnd)) := do
   match ← staticNat f with
-  | some (k, sg) =>
+  | some (k, sg, jumpFree) =>
     if args.length != sg.ptys.size then return none
     let as ← natArgs sg.ptys args
     match sg.rty with
     | some t =>
       let v ← newVar (tyOfC t)
       emit (.set v (.call (.nfn k) as))
-      jumpCheck
+      if !jumpFree then jumpCheck
       return some (some (.v v))
     | none =>
       emit (.call (.nfn k) as)
-      jumpCheck
+      if !jumpFree then jumpCheck
       return some none
   | none =>
   match ← dynNat f, CodeGen.strip f with
@@ -2165,10 +2204,18 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
   -- the routines with plain entry points this block declares; a routine sees those of its
   -- own run of consecutive routine declarations and of the runs before it, since no unit
   -- can run between the declarations of a run
-  let mut procsAll : Array (Option (Nat × CodeGen.NatSig)) := Array.replicate size none
+  let mut procsAll : Array (Option (Nat × CodeGen.NatSig × Bool)) := Array.replicate size none
   let mut runOf : Array Nat := Array.replicate size 0
   let mut runNo := 0
   let mut inRun := false
+  -- the routines that cannot complete a jump to a label outside themselves: a call of
+  -- one needs no check of the jump flag afterwards
+  let routines : List (Nat × Core) := stmts.toList.filterMap fun st => match st with
+    | .decl sl _ init => match CodeGen.strip init with
+      | .routine _ _ body => some (sl, body)
+      | _ => none
+    | _ => none
+  let jumpFree := jumpFreeSet routines
   for st in stmts do
     match st with
     | .decl sl dm init =>
@@ -2180,12 +2227,12 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
         | some sg =>
           if sl < size && pushed && (pvars[sl]?.join).isNone then
             let k ← reserveNative
-            procsAll := procsAll.set! sl (some (k, sg))
+            procsAll := procsAll.set! sl (some (k, sg, jumpFree.contains sl))
             runOf := runOf.set! sl runNo
         | none => pure ()
       | _, _ => inRun := false
     | _ => inRun := false
-  let visible (r : Nat) : Array (Option (Nat × CodeGen.NatSig)) :=
+  let visible (r : Nat) : Array (Option (Nat × CodeGen.NatSig × Bool)) :=
     (Array.range size).map fun i => if runOf[i]! ≤ r then procsAll[i]! else none
   runNo := 0
   inRun := false
@@ -2272,7 +2319,7 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
           rt "a68rt_store" #[ku 0, ku slot]
       modify fun st => { st with procMode := none, rowHint := none }
       match CodeGen.strip init, procsAll[slot]?.join with
-      | .routine np _ body, some (k, sg) =>
+      | .routine np _ body, some (k, sg, _) =>
         lowerNative k sg np body
         if !CodeGen.outerRef 1 body then
           modify fun st => { st with nfnOf := st.nfnOf.push (boxedIdx, k) }

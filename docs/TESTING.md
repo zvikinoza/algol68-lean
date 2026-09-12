@@ -66,9 +66,11 @@ The evaluator additionally exceeds the limit on 12 programs that pass compiled
 a direct interpreter of the core representation, and those programs run for minutes
 in it.
 
-## 3a. The C back end
+## 3a. The compiled program
 
-A compiled program runs on a C runtime that transcribes the evaluator (`csrc/`), so
+`a68lean compile` is the LLVM back end (§3c); `--c` selects the C back end, the proof of
+concept it grew out of, which the suites still run as a second implementation. Either
+way, a compiled program runs on a C runtime that transcribes the evaluator (`csrc/`), so
 running the corpus compiled checks both the compiled structure — frames, control
 flow, jumps, promoted variables — and the transcription. Two parts of the runtime
 have differential tests of their own against the Lean they transcribe: the number
@@ -102,11 +104,10 @@ the time spent.
 
 ## 3c. The LLVM back end
 
-`a68lean compile --llvm` (docs/LLVM-DESIGN.md) emits LLVM IR instead of C, through the
-same runtime. Every suite above runs through it by setting `A68LEAN_OPTS=--llvm`:
-`A68LEAN_OPTS=--llvm tests/run-cases-compiled.sh -O2` (also at `-O0`, and under
-`A68LEAN_GC=stress,verify`), `A68LEAN_OPTS=--llvm fuzz/run-compiled.sh START COUNT -O2`,
-and the corpus runner. The MIR the back end lowers to can be inspected with
+`a68lean compile` (docs/LLVM-DESIGN.md) emits LLVM IR through the same runtime. Every
+suite runs through it by default: `tests/run-cases-compiled.sh -O2` (also at `-O0`, and
+under `A68LEAN_GC=stress,verify`), `fuzz/run-compiled.sh START COUNT -O2`, and the corpus
+runner; `A68LEAN_OPTS=--c` runs the same suites through the C back end. The MIR the back end lowers to can be inspected with
 `a68lean dump-mir prog.a68 -O2`; the verified MIR passes (`A68/Verified/MIR.lean`) are
 applied unless `-O0` is given. What is proved and what is tested is stated in
 docs/LLVM-DESIGN.md §4.
@@ -154,8 +155,8 @@ COMPATIBILITY.md).
 brew install algol68g coreutils        # a68g 3.13.3 and gtimeout
 lake build
 tests/run-cases.sh
-tests/run-cases-compiled.sh -O2
-A68LEAN_OPTS=--llvm tests/run-cases-compiled.sh -O2
+tests/run-cases-compiled.sh -O2                 # the LLVM back end
+A68LEAN_OPTS=--c tests/run-cases-compiled.sh -O2  # the C back end
 ( cd tests/fmt && python3 gen.py 1 300 && a68g cases.a68 > expected.txt \
   && ../../.lake/build/bin/a68lean fmttest cases.txt > actual.txt && diff expected.txt actual.txt )
 tests/fetch-corpus.sh                  # ~20 minutes: clones, records a68g output

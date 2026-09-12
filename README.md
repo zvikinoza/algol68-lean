@@ -33,45 +33,35 @@ pass compiled. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Speed of the compiled program
 
-`a68lean compile` produces a native binary, and for most code that binary is close
-to hand-written C. Every benchmark in `benchmarks/` ships with a C twin computing
-the same answer, which is the ceiling the emitted code is measured against.
+`a68lean compile` produces a native binary through LLVM (`docs/LLVM-DESIGN.md`): the
+elaborated core is lowered to MIR, a typed register-machine IR with a semantics in Lean
+and optimisation passes each proved to preserve it, printed as LLVM IR and compiled by
+clang against the C runtime. Values of primitive mode are native, locals that cannot
+escape are registers, routines with primitive signatures are plain functions called
+directly, and rows, structures, unions, strings and names are reached inline through
+the runtime's own object layout, with the runtime as the fallback whenever a value is
+not as expected. Every benchmark in `benchmarks/` ships with a C twin computing the same
+answer, which is the ceiling the emitted code is measured against.
 
-| benchmark | vs hand-written C | faster than a68g |
-|---|---:|---:|
-| `intloop`, integer arithmetic in a loop | 1.3x | 16x |
-| `arraysum`, 40 million row element accesses | 1.5x | 30x |
-| `data_matmul`, matrix multiplication | 1.8x | 31x |
-| `data_union`, a row of a union dispatched by conformity | 1.5x | 43x |
-| `data_string`, building and comparing strings | ~2x | 146x |
-| `ctl_fib`, 18 million recursive calls | 2.0x | 82x |
-| `ctl_case`, a twelve-way case clause | 2.0x | 31x |
-| `ctl_hof`, a procedure passed as a parameter | 1.5x | 25x |
-| `data_slice`, a sliding window taken by slicing | 2.7x | 11x |
-| `data_list`, walking a linked list of `HEAP` nodes | 24x | 2x |
+| benchmark | LLVM back end vs hand-written C |
+|---|---:|
+| `intloop`, integer arithmetic in a loop | 1.3x |
+| `num_real`, `num_divmod`, real and integer arithmetic | 1.0x |
+| `ctl_fib`, 18 million recursive calls | 1.5x |
+| `ctl_mutual`, three mutually recursive routines | 1.3x |
+| `calls`, `ctl_hof`, procedure calls and procedures as parameters | 1.5x–2x |
+| `arraysum`, 40 million row element accesses | 1.7x |
+| `data_matmul`, matrix multiplication | 1.8x |
+| `data_list`, walking a linked list of `HEAP` nodes | 1.7x |
+| `data_slice`, a sliding window taken by slicing | 1.8x |
+| `sieve`, a sieve over 2 million `BOOL`s | 3x |
+| `data_union`, `data_struct`, `data_string` | 3x–7x |
 
-Values of primitive mode are computed in native C types, locals that cannot
-escape become C variables, rows, rows of structures and rows of unions become C
-arrays, strings become C buffers, choices become C conditionals and switches, and
-routines with primitive signatures are plain C functions called directly; everything
-else goes through a C runtime over C memory with a mark–sweep collector. Twenty-one
-of the twenty-two benchmarks are within about 1.1x to 3x of C; structures reached
-through `REF` still go through the runtime. See
-[benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for all 22 and for what is left.
-
-### The LLVM back end
-
-`a68lean compile --llvm` emits LLVM IR instead of C (docs/LLVM-DESIGN.md): a typed
-register-machine IR (MIR) with a Lean semantics and verified optimisation passes,
-printed as textual IR and compiled by clang against the same runtime. Scalars are
-native, routines with primitive signatures are plain functions called directly or
-through a table, and rows, structures, unions, strings and names are accessed inline
-through the runtime's own object layout, with the runtime as the fallback. Measured
-against the C back end on the same programs it is within 0.7x–1.4x on nineteen of
-the twenty-two benchmarks (`data_list` 14x faster, since names are followed inline),
-and 2x–6x slower on `data_union`, `sieve`, `data_struct` and `data_string`, where the C
-back end promotes whole rows and strings to C arrays and buffers. The same test
-suites, corpus and fuzzers run through it (docs/TESTING.md §3c).
+The C back end (`--c`) was the proof of concept for the compiled structure — frames,
+control flow, jumps, promoted variables — and stays as a second implementation the
+test suites run for comparison; the evaluator (`a68lean run`) is the specification both
+are checked against. See [benchmarks/ROOFLINE.md](benchmarks/ROOFLINE.md) for all 22
+programs and for what is left.
 
 ## Quick start
 
@@ -79,9 +69,11 @@ suites, corpus and fuzzers run through it (docs/TESTING.md §3c).
 # toolchain: Lean 4 via elan (https://github.com/leanprover/elan)
 lake build                                    # builds the compiler and checks all proofs
 .lake/build/bin/a68lean run hello.a68         # compile and run in one step
-.lake/build/bin/a68lean compile hello.a68     # compile to C and link a native binary
+.lake/build/bin/a68lean compile hello.a68     # compile to LLVM IR and link a native binary
 ./hello                                       # …then run it
-.lake/build/bin/a68lean compile hello.a68 -c  # keep the generated C only
+.lake/build/bin/a68lean compile hello.a68 -c  # keep the generated LLVM IR only
+.lake/build/bin/a68lean compile hello.a68 --c # the C back end instead
+.lake/build/bin/a68lean dump-mir hello.a68 -O2   # print the MIR the back end optimises
 .lake/build/bin/a68lean check hello.a68       # parse + mode check only
 .lake/build/bin/a68lean dump hello.a68        # print the elaborated core representation
 ```
