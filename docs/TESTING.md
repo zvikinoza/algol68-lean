@@ -48,21 +48,23 @@ its two reference runs agree: a68g seeds its generator from the clock, so such a
 program is only reproducible by accident. Programs that seed with `first random`
 are reproduced exactly: a68lean implements a68g's taus113 generator.
 
-The eight programs that do not match when compiled:
+The ten programs that do not match when compiled:
 
 * **The clock and the machine** (4): `Date-format`, `System-time`, `Hostname` and the
   test set's `end-of-time` print the date, the host name or a speed measured while
-  running. Their recorded output cannot be reproduced by a68g itself either.
+  running (`end-of-time` now overflows an `INT` with the speed the compiled program
+  reaches). Their recorded output cannot be reproduced by a68g itself either.
 * **`PAR`** (1): `Concurrent-computing` prints in whatever order a68g's threads ran.
 * **Unsupported extensions** (2): `HTTP` fetches a web page with `http content`, and
   `Metered-concurrency` uses semaphores (`DOWN`, `UP`) between parallel units.
-* **Time** (1): `Square-form-factorization` gives a68g's output but needs about 150
-  seconds of `LONG INT` arithmetic, which is a68g's multi-precision code re-done in
-  Lean and slower than a68g's C.
+* **`evaluate`** (3): the `Runtime-evaluation` programs compile Algol 68 text while
+  they run, which needs the evaluator; `a68lean compile` refuses them and `a68lean
+  run` reproduces them.
 
-The evaluator additionally exceeds the limit on 13 programs that pass compiled
-(Erdős–Nicolas numbers, Ulam numbers, safe primes and others): it is a direct
-interpreter of the core representation, and those programs run for minutes in it.
+The evaluator additionally exceeds the limit on 12 programs that pass compiled
+(Erdős–Nicolas numbers, Ulam numbers, Square-form factorization and others): it is
+a direct interpreter of the core representation, and those programs run for minutes
+in it.
 
 ## 3a. The C back end
 
