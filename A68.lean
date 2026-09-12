@@ -11,11 +11,14 @@ import A68.Interp
 import A68.Pretty
 import A68.Serial
 import A68.CodeGen
+import A68.MIR.Sem
+import A68.MIR.Opt
 import A68.Verified.StackMachine
 import A68.Verified.Opt
 import A68.Verified.Numfmt
 import A68.Verified.MP
 import A68.Verified.GC
+import A68.Verified.MIR
 
 /-!
 # a68lean — an Algol 68 compiler written in Lean 4
