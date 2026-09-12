@@ -11,7 +11,7 @@ for ((s=START; s<START+COUNT; s++)); do
   python3 "$DIR/gen.py" "$s" "$f"
   exp=$(mktemp); act=$(mktemp); bin=$(mktemp -d)
   ( cd "$DIR/cases" && gtimeout 30 a68g "f$s.a68" </dev/null >"$exp" 2>/dev/null ); erc=$?
-  if ( cd "$DIR/cases" && gtimeout 120 "$BIN" compile "f$s.a68" $OPT -o "$bin/p" >/dev/null 2>&1 ); then
+  if ( cd "$DIR/cases" && gtimeout 120 "$BIN" compile "f$s.a68" $OPT ${A68LEAN_OPTS:-} -o "$bin/p" >/dev/null 2>&1 ); then
     ( cd "$DIR/cases" && gtimeout 30 "$bin/p" </dev/null >"$act" 2>/dev/null ); arc=$?
   else
     arc=99; : > "$act"
