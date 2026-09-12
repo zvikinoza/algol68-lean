@@ -57,8 +57,25 @@ void*  xmalloc(size_t n) {
   return p;
 }
 
+/* Small objects are recycled through free lists by size class (16-byte steps up to
+   FREE_MAX bytes) instead of going back to the C heap at every sweep: a block on a
+   list has its class's capacity and is zeroed again when reused, as calloc would. */
+#define FREE_STEP 16
+#define FREE_MAX 512
+#define FREE_CLASSES (FREE_MAX / FREE_STEP)
+static a68_obj* free_lists[FREE_CLASSES + 1];
+
 static a68_obj* obj_alloc(uint8_t kind, size_t size) {
-  a68_obj* o = (a68_obj*) xmalloc(size);
+  a68_obj* o;
+  if (size <= FREE_MAX) {
+    size_t cls = (size + FREE_STEP - 1) / FREE_STEP;
+    size = cls * FREE_STEP;
+    if (free_lists[cls]) {
+      o = free_lists[cls];
+      free_lists[cls] = o->next;
+      memset(o, 0, size);
+    } else o = (a68_obj*) xmalloc(size);
+  } else o = (a68_obj*) xmalloc(size);
   o->kind = kind;
   o->size = (uint32_t) size;
   o->next = all_objects;
@@ -66,6 +83,15 @@ static a68_obj* obj_alloc(uint8_t kind, size_t size) {
   bytes_allocated += size;
   if (!gc_off && (gc_stress || bytes_allocated > gc_min_between + 2 * bytes_live)) gc_wanted = 1;
   return o;
+}
+
+/* a dead object: to its size class's free list, or back to the C heap */
+static void obj_release(a68_obj* o) {
+  if (o->size <= FREE_MAX) {
+    size_t cls = o->size / FREE_STEP;
+    o->next = free_lists[cls];
+    free_lists[cls] = o;
+  } else free(o);
 }
 
 static size_t leaf_esize(uint16_t ek) {
@@ -789,7 +815,7 @@ static void gc_sweep(void) {
     if (gc_verify) {   /* kept, poisoned, released after QUARANTINE collections */
       size_t slot = (size_t) (gc_collections % QUARANTINE);
       o->kind = K_FREED; o->next = quarantine[slot]; quarantine[slot] = o;
-    } else free(o);
+    } else obj_release(o);
   }
   bytes_live = live;
 }
@@ -1284,7 +1310,11 @@ static int append_in_place(a68_val* c, const a68_val* elems, int64_t n) {
     a68_obj* ns;
     if (st->kind == K_LEAF) {
       ns = (a68_obj*) leaf_alloc(st->ek, (uint32_t) cap);
-      for (int64_t i = 0; i < cur; i++) store_set(ns, i, store_get(st, i));
+      /* same kind: the elements and their defined bytes move as they are */
+      size_t es = leaf_esize(st->ek);
+      memcpy(((a68_leaf*) ns)->d, ((a68_leaf*) st)->d, (size_t) cur * es);
+      if (st->ek != EK_BYTES)
+        memcpy(((a68_leaf*) ns)->d + (size_t) cap * es, ((a68_leaf*) st)->d + (size_t) st->n * es, (size_t) cur);
     } else {
       ns = store_alloc_slots((uint32_t) cap);
       memcpy(((a68_slots*) ns)->s, ((a68_slots*) st)->s, (size_t) cur * sizeof(a68_val));
@@ -1582,7 +1612,17 @@ uint8_t*  string_bytes(a68_val v, int64_t* n) {
   a68_rowd* d = (a68_rowd*) v.v.p;
   *n = row_count(d);
   uint8_t* b = (uint8_t*) xmalloc((size_t) *n + 1);
-
+  /* a contiguous leaf of CHAR with every element defined copies as it is; anything else
+     — a view with a stride, a slots store, an undefined element — goes element by element,
+     which reports what is wrong */
+  if (d->h.n == 1 && !d->field && d->dim[0].stride == 1 && d->base->kind == K_LEAF && d->base->ek == T_CHAR
+      && d->off >= 0 && d->off + *n <= (int64_t) d->base->n) {
+    a68_leaf* l = (a68_leaf*) d->base;
+    const uint8_t* flags = l->d + (size_t) l->h.n;
+    int64_t i = 0;
+    while (i < *n && flags[d->off + i]) i++;
+    if (i == *n) { memcpy(b, l->d + d->off, (size_t) *n); return b; }
+  }
   for (int64_t i = 0; i < *n; i++) {
     a68_val e = rowd_get(d, row_store_index(d, i));
     if (e.tag == T_UNDEF) { free(b); die("attempt to use an uninitialised CHAR value"); }

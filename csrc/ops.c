@@ -342,8 +342,33 @@ static void check_chars(a68_rowd* d) {
 }
 
 /* `Interp.compareChars` */
+/* The bytes of a one-dimensional row of CHAR over a leaf store, contiguous and every
+   element defined: NULL when the row is not of that shape (a view, a slots store, an
+   undefined element), which the general path handles and reports. */
+static const uint8_t* char_bytes(a68_rowd* r, int64_t* n) {
+  if (r->h.n != 1 || r->field || r->dim[0].stride != 1 || r->base->kind != K_LEAF || r->base->ek != T_CHAR) return NULL;
+  a68_leaf* l = (a68_leaf*) r->base;
+  int64_t cnt = row_count(r);
+  if (r->off < 0 || r->off + cnt > (int64_t) l->h.n) return NULL;
+  const uint8_t* flags = l->d + (size_t) l->h.n;
+  for (int64_t i = 0; i < cnt; i++) if (!flags[r->off + i]) return NULL;
+  *n = cnt;
+  return l->d + r->off;
+}
+
 static int compare_chars(a68_val a, a68_val b) {
   a68_rowd* x = row_of(a); a68_rowd* y = row_of(b);
+  {
+    int64_t nx, ny;
+    const uint8_t* px = char_bytes(x, &nx);
+    const uint8_t* py = px ? char_bytes(y, &ny) : NULL;
+    if (px && py) {
+      int64_t n = nx < ny ? nx : ny;
+      int c = n ? memcmp(px, py, (size_t) n) : 0;
+      if (c) return c < 0 ? -1 : 1;
+      return nx < ny ? -1 : nx > ny ? 1 : 0;
+    }
+  }
   check_chars(x); check_chars(y);
   int64_t nx = row_count(x), ny = row_count(y);
   int64_t n = nx < ny ? nx : ny;

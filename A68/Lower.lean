@@ -110,6 +110,7 @@ structure St where
   caches   : List RowCache := []           -- the row caches in scope, innermost first
   rowUses  : Array (Nat × Nat × Int × Nat) := #[]   -- rows accessed inline: fid, slot, store kind, dims
   slowRanges : Array (Nat × Nat) := #[]    -- block ranges [from, to) that are slow paths
+  cellCalls : Array (Nat × Nat) := #[]     -- (block, instruction) of runtime calls that change one named cell only
   deriving Inhabited
 
 abbrev L := StateM St
@@ -522,6 +523,20 @@ where
       terminate (.br done)
       switchTo done
 
+/-- Recompute the caches of cell `(fid, slot)`. -/
+def recacheFor (fid slot : Nat) : L Unit := do
+  for c in (← get).caches do
+    if c.fid == fid && c.slot == slot then slowPath.recache c
+
+/-- A runtime call whose only effect is on the cell `(fid, slot)` it names (`a68rt_append*`):
+    a loop's caches of other rows survive it, and this cell's are recomputed after it. -/
+def rtCell (name : String) (fid slot : Nat) (args : Array Opnd) : L Unit := do
+  let fb := (← get).fb
+  let at_ := (fb.cur, fb.blocks[fb.cur]!.instrs.size)
+  rt name args
+  modify fun st => { st with cellCalls := st.cellCalls.push at_ }
+  recacheFor fid slot
+
 /-- The store index of `a[i]` or `a[i, j]` from a cache, with the subscript checks. -/
 def rowIndexCached (c : RowCache) (is : Array Opnd) : L Var := do
   let mut idx : Var := c.off
@@ -672,6 +687,66 @@ def leafSet (store idx : Var) (info : ElemInfo) (v : Opnd) (n? : Option Var := n
   let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
   let eoff ← binv .i64 .addW (.v eoff) (ki 24)
   st info.w store (.v eoff) v KLEAF
+
+/-- `s +:= v` for one element `v` on the row variable cell `(d, s)` holds: inline when the
+    row starts at 1, is its own owner, unshared, over a leaf store of the element's kind
+    with room to spare (`rt.c: append_in_place`): the element and its defined byte are
+    written after the last one and the upper bound moves up; otherwise the runtime, which
+    grows the store or takes the operator's way. -/
+def appendElem (d s : Nat) (em : Mode) (v : Opnd) (fn : String) : L Unit := do
+  let fid ← cellFid d
+  match ← cellAddr d s, elemInfo em with
+  | some (b, off), some info =>
+    noteRowUse fid s info.ek 1
+    let slow ← newBlock; let done ← newBlock
+    let (r, store, u, n?, uv?) : Var × Var × Var × Option Var × Option Var ← match ← lookupCache fid s info.ek with
+      | some c =>
+        guard (.v c.valid) slow
+        guard (.v c.rcOK) slow
+        let (l, u, stride) := c.dim[0]!
+        guard (.v (← binv .i1 .eq (.v l) (ki 1))) slow
+        guard (.v (← binv .i1 .eq (.v c.off) (ki 0))) slow
+        guard (.v (← binv .i1 .eq (.v stride) (ki 1))) slow
+        pure (c.r, c.store, u, some c.n, some u)
+      | none =>
+        let r ← cellRowd b off slow
+        let field ← ld "i32" .i64 r (ki 40) KHDR
+        guard (.v (← binv .i1 .eq (.v field) (ki 0))) slow
+        let l ← ld "i64" .i64 r (ki 48) KHDR
+        guard (.v (← binv .i1 .eq (.v l) (ki 1))) slow
+        let off0 ← ld "i64" .i64 r (ki 32) KHDR
+        guard (.v (← binv .i1 .eq (.v off0) (ki 0))) slow
+        let stride ← ld "i64" .i64 r (ki 64) KHDR
+        guard (.v (← binv .i1 .eq (.v stride) (ki 1))) slow
+        let u ← ld "i64" .i64 r (ki 56) KHDR
+        let store ← ld "ptr" .ptr r (ki 24) KHDR
+        let sk ← ld "i8" .i64 store (ki 0) KHDR
+        guard (.v (← binv .i1 .eq (.v sk) (ki K_LEAF))) slow
+        let ek ← ld "i16" .i64 store (ki 2) KHDR
+        guard (.v (← binv .i1 .eq (.v ek) (ki info.ek))) slow
+        let rc ← ld "i32" .i64 store (ki 8) KHDR
+        guard (.v (← binv .i1 .le (.v rc) (ki 1))) slow
+        pure (r, store, u, none, none)
+    -- the row is its own owner (not a view) and has room for one more
+    let bk ← ld "i8" .i64 store (ki 0) KHDR
+    guard (.v (← binv .i1 .ne (.v bk) (ki K_ROWD))) slow
+    let cap ← match n? with
+      | some n => pure n
+      | none => ld "i32" .i64 store (ki 4) KHDR
+    guard (.v (← binv .i1 .lt (.v u) (.v cap))) slow
+    if em == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
+    leafSet store u info v n?
+    let u1 ← binv .i64 .addW (.v u) (ki 1)
+    st "i64" r (ki 56) (.v u1) KHDR
+    match uv? with
+    | some uv => emit (.set uv (.opnd (.v u1)))
+    | none => pure ()
+    terminate (.br done)
+    switchTo slow
+    slowPath slow (some (fid, s)) do rt fn #[ku (← rtd d), ku s, v]
+    terminate (.br done)
+    switchTo done
+  | _, _ => rtCell fn fid s #[ku (← rtd d), ku s, v]
 
 /-- `a[i] := v` on the row cell `(d, s)` holds: inline when the cell holds a row value over
     a leaf store of the element's kind that no other kept value shares (`rt.c: store_ref`
@@ -1055,8 +1130,9 @@ def callFree (from_ to : Nat) : L Bool := do
   for b in [from_:to] do
     if slow b then continue
     let some blk := st.fb.blocks[b]? | continue
-    for ins in blk.instrs do
-      match ins with
+    for i in [0:blk.instrs.size] do
+      if st.cellCalls.contains (b, i) then continue
+      match blk.instrs[i]! with
       | .call f _ => if !ok f then return false
       | .set _ (.call f _) => if !ok f then return false
       | _ => pure ()
@@ -1476,19 +1552,20 @@ partial def assignOpVoid (op : String) (m1 m2 : Mode) (l r : Core) : L Bool := d
   -- in place, instead of a reference, a rowing and an operator that rebuilds the row
   if op == "+:=" then
     match tmr, CodeGen.strip l with
-    | .row 1 _ _, .refCell d s =>
+    | .row 1 _ em, .refCell d s =>
       if (← pvarOf d s).isNone then
+        let emr ← resolve em
         match CodeGen.strip r with
         | .rowOf e =>
-          if (← modeOf e) == some .char then
+          if emr == .char && (← modeOf e) == some .char then
             let c ← toScalar (← lower e) .char
-            rt "a68rt_append_char" #[ku (← rtd d), ku s, c]
+            appendElem d s .char c "a68rt_append_char"
           else
             let _ ← lowerStack r
-            rt "a68rt_append" #[ku (← rtd d), ku s]
+            rtCell "a68rt_append" (← cellFid d) s #[ku (← rtd d), ku s]
         | _ =>
           let _ ← lowerStack r
-          rt "a68rt_append" #[ku (← rtd d), ku s]
+          rtCell "a68rt_append" (← cellFid d) s #[ku (← rtd d), ku s]
         return true
     | _, _ => pure ()
   let some _ := tyOf tmr | return false
@@ -2010,11 +2087,14 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
     if slot.isSome && (CodeGen.hasOtherFn body || CodeGen.slotEscapes (fun _ => false) 0 0 body) then
       inlineOk := false
   -- where the united value is: a cell, or an element of a row of unions in a cell
-  let src : Option (Nat × Nat × Option Core × Bool) ← do   -- depth, slot, index, via a name
+  let src : Option (Nat × Nat × Option Core × Bool × List Mode) ← do   -- depth, slot, index, via a name, constituents
     match CodeGen.strip sel with
     | .loadCell d s | .deref (.refCell d s) =>
       match ← slotMode d s with
-      | some m => if (← resolve m) matches .union _ then pure (some (d, s, none, false)) else pure none
+      | some m =>
+        match ← resolve m with
+        | .union cs => pure (some (d, s, none, false, cs))
+        | _ => pure none
       | none => pure none
     | .slice base [.index e] viaRef | .deref (.slice base [.index e] viaRef) =>
       match ← cellBase base with
@@ -2022,13 +2102,16 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
         match ← slotMode d s with
         | some m =>
           match ← resolve m with
-          | .row 1 _ em => if (← resolve em) matches .union _ then pure (some (d, s, some e, viaRef)) else pure none
+          | .row 1 _ em =>
+            match ← resolve em with
+            | .union cs => pure (some (d, s, some e, viaRef, cs))
+            | _ => pure none
           | _ => pure none
         | none => pure none
       | none => pure none
     | _ => pure none
   match inlineOk, src with
-  | true, some (d, s, idx, viaRef) =>
+  | true, some (d, s, idx, viaRef, cs) =>
     match ← cellAddr d s with
     | none => let _ ← lowerStack sel; general; terminate (.br done)
     | some (b, off) =>
@@ -2057,8 +2140,19 @@ partial def lowerConformity (dest : Dest) (sel : Core) (alts : List (Mode × Opt
         k := k + 1
         let mi ← putMode m
         let yes ← newBlock; let no ← newBlock; let ask ← newBlock
-        let eq ← binv .i1 .eq (.v vm) (ki mi)
-        terminate (.condBr (.v eq) yes ask)
+        -- Conformity resolved statically: the value's mode index is one a unite gave it,
+        -- normally that of a constituent of the union (as written or as resolved), and
+        -- whether such a mode conforms to the alternative is known here (`Mode.eqv`, the
+        -- runtime's `mode_eqv`).  Only an index the compiler did not enumerate asks the
+        -- runtime.
+        let tab := (← get).modeTab
+        let mr ← resolve m
+        let mut cands : List (Int × Bool) := [((mi : Int), true)]
+        for c in cs do
+          for c' in [c, Mode.resolve tab c] do
+            let ci ← putMode c'
+            if !(cands.any (·.1 == (ci : Int))) then cands := cands ++ [((ci : Int), Mode.eqv tab mr c')]
+        terminate (.switch (.v vm) (cands.toArray.map fun (ci, ok) => (ci, if ok then yes else no)) ask)
         switchTo ask
         let ok ← rtv "a68rt_conforms" #[ku mi, .v vm]
         terminate (.condBr (.v ok) yes no)
@@ -2112,7 +2206,7 @@ partial def lowerLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
   -- before the loop, the descriptor and store are read once before the loop and kept in
   -- variables (recomputed after any slow path), so that the accesses are register-based.
   let snapshot ← get
-  modify fun st => { st with rowUses := #[], slowRanges := #[] }
+  modify fun st => { st with rowUses := #[], slowRanges := #[], cellCalls := #[] }
   let blk0 := (← get).fb.blocks.size
   lowerLoopBody slot from_ by_ to_ w body
   let blk1 := (← get).fb.blocks.size
