@@ -47,6 +47,7 @@ def rhsReads : Rhs → List Nat
   | .bin _ a b => opndReads a ++ opndReads b
   | .un _ a => opndReads a
   | .call _ args => args.toList.flatMap opndReads
+  | .natTab i => opndReads i
 
 def instrReads : Instr → List Nat
   | .set _ r => rhsReads r
@@ -56,6 +57,7 @@ def instrReads : Instr → List Nat
 def termReads : Term → List Nat
   | .condBr c _ _ => opndReads c
   | .switch o _ _ => opndReads o
+  | .retVal o => opndReads o
   | _ => []
 
 def blockReads (b : Block) : List Nat := b.instrs.toList.flatMap instrReads ++ termReads b.term
@@ -81,10 +83,12 @@ def substRhs (m : Copies) : Rhs → Rhs
   | .bin op a b => .bin op (substOpnd m a) (substOpnd m b)
   | .un op a => .un op (substOpnd m a)
   | .call f args => .call f (args.map (substOpnd m))
+  | .natTab i => .natTab (substOpnd m i)
 
 def substTerm (m : Copies) : Term → Term
   | .condBr c t f => .condBr (substOpnd m c) t f
   | .switch o cs d => .switch (substOpnd m o) cs d
+  | .retVal o => .retVal (substOpnd m o)
   | t => t
 
 /-- Assigning `id` invalidates the copies of it and the copies from it. -/
@@ -194,6 +198,7 @@ def rhsNoDead (dead : Nat → Bool) : Rhs → Bool
   | .bin _ a b => opndNoDead dead a && opndNoDead dead b
   | .un _ a => opndNoDead dead a
   | .call _ args => args.toList.all (opndNoDead dead)
+  | .natTab i => opndNoDead dead i
 
 def instrNoDead (dead : Nat → Bool) : Instr → Bool
   | .set _ r => rhsNoDead dead r
@@ -203,6 +208,7 @@ def instrNoDead (dead : Nat → Bool) : Instr → Bool
 def termNoDead (dead : Nat → Bool) : Term → Bool
   | .condBr c _ _ => opndNoDead dead c
   | .switch o _ _ => opndNoDead dead o
+  | .retVal o => opndNoDead dead o
   | _ => true
 
 def blockNoDead (dead : Nat → Bool) (b : Block) : Bool :=

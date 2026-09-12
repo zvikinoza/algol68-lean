@@ -246,6 +246,9 @@ structure Runtime (R : Type) where
   fn   : Nat → List Val → R → Option (R × Option Val)
   hole : Nat → List Val → R → Option (R × Option Val)
   nat  : String → List Val → R → Option (R × Option Val)
+  nfn  : Nat → List Val → R → Option (R × Option Val)
+  /-- An indirect call: the pointer (the value of the first argument) then the arguments. -/
+  ind  : Array Ty → Option Ty → List Val → R → Option (R × Option Val)
   math : MathFns
 
 def Runtime.call (rt : Runtime R) : Callee → List Val → R → Option (R × Option Val)
@@ -253,11 +256,14 @@ def Runtime.call (rt : Runtime R) : Callee → List Val → R → Option (R × O
   | .fn i => rt.fn i
   | .hole i => rt.hole i
   | .nat name => rt.nat name
+  | .nfn i => rt.nfn i
+  | .ind ptys rty => rt.ind ptys rty
 
 /-- What a run makes observable. -/
 inductive Event where
   | call (f : Callee) (args : List Val) (ret : Option Val)
   | line (n : Nat)
+  | ret (v : Val)
   deriving Repr
 
 /-- How a run ended. -/
@@ -294,6 +300,7 @@ def evalRhs (math : MathFns) (env : Env) : Rhs → Option Val
   | .bin op a b => binSem op (evalOpnd env a) (evalOpnd env b)
   | .un op a => unSem math op (evalOpnd env a)
   | .call _ _ => none
+  | .natTab i => some (evalOpnd env i)   -- a pointer is identified by its routine index
 
 /-- A call: the arguments are evaluated, the runtime steps, the call is recorded. -/
 def execCall (rt : Runtime R) (f : Callee) (args : Array Opnd) (s : State R) :
@@ -342,6 +349,7 @@ def termSuccs : Term → List Nat
   | .condBr _ t f => [t, f]
   | .switch _ cs d => d :: cs.toList.map (·.2)
   | .ret => []
+  | .retVal _ => []
   | .unreachable => []
 
 /-- The result of executing one block: the block to continue with, or the end. -/
@@ -356,6 +364,7 @@ def stepBlock (rt : Runtime R) (blk : Block) (s : State R) : BlockOut R :=
   | .ok s' =>
     match blk.term with
     | .ret => .stop s'.trace .done
+    | .retVal o => .stop (.ret (evalOpnd s'.env o) :: s'.trace) .done
     | .unreachable => .stop s'.trace .trap
     | .br b => .next b s'
     | .condBr c t f => .next (if (evalOpnd s'.env c).truthy then t else f) s'

@@ -13,11 +13,15 @@ namespace A68.LLVM
 open A68.MIR
 
 def tyName : Ty → String
-  | .i64 => "i64" | .f64 => "double" | .i1 => "i1" | .i32 => "i32"
+  | .i64 => "i64" | .f64 => "double" | .i1 => "i1" | .i32 => "i32" | .ptr => "ptr"
 
 /-- The C type of a runtime argument or result of a MIR type. -/
 def cTyName : Ty → String
-  | .i64 => "i64" | .f64 => "double" | .i1 => "i8" | .i32 => "i32"
+  | .i64 => "i64" | .f64 => "double" | .i1 => "i8" | .i32 => "i32" | .ptr => "ptr"
+
+def retTyName : Option Ty → String
+  | some t => tyName t
+  | none => "void"
 
 def retName : RtRet → String
   | .none => "void" | .i64 => "i64" | .f64 => "double" | .u8 => "i8" | .u32 => "i32"
@@ -34,6 +38,7 @@ def constText (ty : Ty) (c : Const) : String :=
   | .f64, .f x => hexDouble x
   | .f64, .i n => hexDouble (Float.ofInt n)
   | .i1, .i n => if n == 0 then "false" else "true"
+  | .ptr, _ => "null"
   | _, .i n => toString n
   | _, .f x => toString x
 
@@ -51,9 +56,13 @@ structure P where
   out  : Array String := #[]
   tmp  : Nat := 0
   used : List String := []      -- runtime and native functions referenced
+  nfnSigs : Array (Array Ty × Option Ty) := #[]   -- the plain routines' signatures
   deriving Inhabited
 
 abbrev M := StateM P
+
+def getNfnSig (i : Nat) : M (Array Ty × Option Ty) := do
+  return (← get).nfnSigs[i]?.getD (#[], none)
 
 def line (s : String) : M Unit := modify fun p => { p with out := p.out.push s }
 def fresh : M String := do
@@ -127,11 +136,36 @@ def coerce (v : String) (from_ to : Ty) : M String := do
   | _, _ => line s!"  {t} = bitcast {tyName from_} {v} to {tyName to}"
   return t
 
+/-- The arguments of a plain routine call, each coerced to the parameter type. -/
+def plainArgs (ptys : Array Ty) (args : Array Opnd) : M String := do
+  let mut as : Array String := #[]
+  for i in [0:args.size] do
+    let a := args[i]!
+    let pty := ptys[i]?.getD a.ty
+    let v ← opnd a
+    let v ← coerce v a.ty pty
+    as := as.push s!"{tyName pty} {v}"
+  return ", ".intercalate as.toList
+
 /-- A call; the C `uint8_t` arguments and results are `i8`. -/
 def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
   match f with
   | .fn i => line s!"  call void @a68_fn{i}()"
   | .hole i => line s!"  call void @a68_hole{i}()"
+  | .nfn i =>
+    let sig ← getNfnSig i
+    let argText ← plainArgs sig.1 args
+    match dst, sig.2 with
+    | some d, some rty => let t ← fresh; line s!"  {t} = call {tyName rty} @a68_nf{i}({argText})"; store d t
+    | _, some rty => let t ← fresh; line s!"  {t} = call {tyName rty} @a68_nf{i}({argText})"
+    | _, none => line s!"  call void @a68_nf{i}({argText})"
+  | .ind ptys rty =>
+    let fp ← opnd args[0]!
+    let argText ← plainArgs ptys (args.extract 1 args.size)
+    match dst, rty with
+    | some d, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"; store d t
+    | _, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"
+    | _, none => line s!"  call void {fp}({argText})"
   | .rt name | .nat name =>
     use name
     let isRt := match f with | .rt _ => true | _ => false
@@ -258,6 +292,12 @@ def instr (i : Instr) : M Unit := do
     | .bin op a b => bin d op a b
     | .un op a => un d op a
     | .call f args => call f args (some d)
+    | .natTab i =>
+      let k ← opnd i
+      let k ← coerce k i.ty .i64
+      let g ← fresh; line s!"  {g} = getelementptr ptr, ptr @a68_nf_of_fn, i64 {k}"
+      let t ← fresh; line s!"  {t} = load ptr, ptr {g}"
+      store d t
 
 def term (t : Term) : M Unit := do
   match t with
@@ -271,14 +311,18 @@ def term (t : Term) : M Unit := do
     let cs := " ".intercalate (cases.toList.map fun (k, b) => s!"{ty} {k}, label %b{b}")
     line s!"  switch {ty} {v}, label %b{d} [ {cs} ]"
   | .ret => line "  ret void"
+  | .retVal o => let v ← opnd o; line s!"  ret {tyName o.ty} {v}"
   | .unreachable => line "  unreachable"
 
 def func (f : Func) : M Unit := do
   modify fun p => { p with tmp := 0 }
-  line ("define void @" ++ f.name ++ "() {")
+  let plist := ", ".intercalate ((List.range f.params.size).map fun i => s!"{tyName f.params[i]!} %p{i}")
+  line ("define " ++ retTyName f.ret ++ " @" ++ f.name ++ "(" ++ plist ++ ") {")
   line "entry:"
   for i in [0:f.vars.size] do
     line s!"  %v{i} = alloca {tyName f.vars[i]!}"
+  for i in [0:f.params.size] do
+    line s!"  store {tyName f.params[i]!} %p{i}, ptr %v{i}"
   line "  br label %b0"
   for i in [0:f.blocks.size] do
     let b := f.blocks[i]!
@@ -291,7 +335,9 @@ def func (f : Func) : M Unit := do
 /-- The whole module. -/
 def print (p : Program) : String := Id.run do
   let ((), st) := (do
+      modify fun st => { st with nfnSigs := p.nfns.map fun f => (f.params, f.ret) }
       for f in p.fns do func f
+      for f in p.nfns do func f
       for h in p.holes do func h
       -- the dispatchers the runtime calls back through
       line "define void @a68_dispatch_proc(i64 %fn) {"
@@ -345,6 +391,12 @@ def print (p : Program) : String := Id.run do
     head := head.push s!"@echo{k} = private constant [{e.utf8ByteSize + 2} x i8] {cstr (e ++ "\n\x00")}"
     k := k + 1
   head := head.push "declare void @a68rt_boot(ptr, i32, i8, i32, ptr, ptr)"
+  -- the plain entry point of each boxed routine, indexed by its boxed index plus one, for
+  -- calls through procedure values; null where there is none
+  let tab := ["ptr null"] ++ (p.nfnTab.toList.map fun e => match e with
+    | some k => s!"ptr @a68_nf{k}"
+    | none => "ptr null")
+  head := head.push s!"@a68_nf_of_fn = internal constant [{tab.length} x ptr] [{", ".intercalate tab}]"
   for n in st.used do
     match rtSigs.find? (·.1 == n) with
     | some (_, sg) =>

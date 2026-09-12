@@ -38,6 +38,9 @@ structure FrameInfo where
   modes  : Array (Option Mode) := #[]
   vars   : Array (Option PVar) := #[]
   pushed : Bool := true
+  /-- per slot: the routine it certainly holds and its plain entry point, once a call can
+      see its declaration -/
+  procs  : Array (Option (Nat × CodeGen.NatSig)) := #[]
   deriving Inhabited
 
 /-- The function under construction. -/
@@ -51,12 +54,15 @@ structure FnB where
   frames   : List FrameInfo := []
   dispatch : Option Nat := none            -- the block that acts on a pending jump
   dispatchSw : Option (Var × Nat) := none  -- its switch operand and the block that leaves the function
+  retTy    : Option Ty := none             -- a plain routine: what it returns
   deriving Inhabited
 
 structure St where
   w        : Serial.Writer := {}
   fns      : Array (Option Func) := #[]
   holes    : Array (Option Func) := #[]
+  nfns     : Array (Option Func) := #[]    -- the plain entry points
+  nfnOf    : Array (Nat × Nat) := #[]      -- boxed routine index, plain entry point usable from any environment
   fb       : FnB := {}
   modeTab  : Mode.Table := {}
   procMode : Option Mode := none
@@ -145,6 +151,16 @@ def tyOf : Mode → Option Ty
 
 def tyOfM (m : Mode) : L (Option Ty) := do return tyOf (← resolve m)
 
+/-- The MIR type of a C type of the C back end's signatures. -/
+def tyOfC : CodeGen.CTy → Ty
+  | .i64 => .i64 | .f64 => .f64 | .u8 => .i1 | .u32 => .i32 | .u64 => .i64
+
+/-- Reserve the index of a plain entry point. -/
+def reserveNative : L Nat := do
+  let s ← get
+  set { s with nfns := s.nfns.push none }
+  return s.nfns.size
+
 /-- The mode of a slot, as recorded by the block or routine that declared it. -/
 def slotMode (d s : Nat) : L (Option Mode) := do
   let fs := (← get).fb.frames
@@ -170,8 +186,49 @@ def pvarOf (d s : Nat) : L (Option PVar) := do
   | some f => return (f.vars[s]?).join
   | none => return none
 
+/-- The routine a call certainly goes to, when it has a plain entry point that can be
+    called right here: the callee is a slot known to hold that routine, and the frame the
+    slot lives in is the innermost run-time frame, so the environment the routine captured
+    is the one in effect and the call needs no environment switch. -/
+def staticNat (f : Core) : L (Option (Nat × CodeGen.NatSig)) := do
+  match CodeGen.strip f with
+  | .loadCell d s =>
+    let some fr := (← get).fb.frames[d]? | return none
+    let some pi := (fr.procs[s]?).join | return none
+    if (← pvarOf d s).isSome || (← rtd d) != 0 then return none
+    return some pi
+  | _ => return none
+
+/-- A call through a procedure-valued slot whose routine cannot be known statically, such as
+    a procedure parameter: the signature a plain entry point for it would have, when the
+    slot's mode allows one.  Which routine the slot holds is looked up at run time. -/
+def dynNat (f : Core) : L (Option CodeGen.NatSig) := do
+  match CodeGen.strip f with
+  | .loadCell d s =>
+    if (← pvarOf d s).isSome || (← staticNat f).isSome then return none
+    let some m ← slotMode d s | return none
+    match ← resolve m with
+    | .proc ps r =>
+      let some ptys := ps.mapM CodeGen.CTy.ofMode | return none
+      let rty : Option (Option CodeGen.CTy) := match r with
+        | .void => some none
+        | _ => (CodeGen.CTy.ofMode r).map some
+      let some rty := rty | return none
+      return some { ptys := ptys.toArray, rty := rty }
+    | _ => return none
+  | _ => return none
+
+/-- The mode of a call whose callee has a plain entry point. -/
+def natResultMode (f : Core) : L (Option Mode) := do
+  match ← staticNat f with
+  | some (_, sg) => return sg.rty.map CodeGen.CTy.toMode
+  | none =>
+    match ← dynNat f with
+    | some sg => return sg.rty.map CodeGen.CTy.toMode
+    | none => return none
+
 def undefKind : Ty → Nat
-  | .i64 => 0 | .f64 => 1 | .i1 => 2 | .i32 => 3
+  | .i64 => 0 | .f64 => 1 | .i1 => 2 | .i32 => 3 | .ptr => 0
 
 /-- Read a promoted variable, reporting an undefined one as the evaluator would. -/
 def readPVar (pv : PVar) : L Opnd := do
@@ -195,8 +252,10 @@ def writePVar (pv : PVar) (o : Opnd) : L Unit := do
 
 def pushFn : Ty → String
   | .i64 => "a68rt_push_int" | .f64 => "a68rt_push_real" | .i1 => "a68rt_push_bool" | .i32 => "a68rt_push_char"
+  | .ptr => "a68rt_push_int"   -- never lowered: a pointer is not an Algol 68 value
 def popFn : Ty → String
   | .i64 => "a68rt_pop_int" | .f64 => "a68rt_pop_real" | .i1 => "a68rt_pop_bool" | .i32 => "a68rt_pop_char"
+  | .ptr => "a68rt_pop_int"
 def cellFn : Mode → String
   | .bits _ => "a68rt_cell_bits" | .int _ => "a68rt_cell_int" | .real _ => "a68rt_cell_real"
   | .bool => "a68rt_cell_bool" | _ => "a68rt_cell_char"
@@ -284,10 +343,10 @@ partial def modeOf (c : Core) : L (Option Mode) := do
     | some m, some m' => return (if (← resolve m) == (← resolve m') then some m else none)
     | _, _ => return none
   | .andThen _ _ | .orElse _ _ | .identRel _ _ _ => return some .bool
-  | .call f [_] =>
-    match CodeGen.strip f with
-    | .lit (.builtin n) => return (if CodeGen.nativeMathFns.contains n then some (.real 0) else none)
-    | _ => return none
+  | .call f args =>
+    match CodeGen.strip f, args with
+    | .lit (.builtin n), [_] => return (if CodeGen.nativeMathFns.contains n then some (.real 0) else none)
+    | _, _ => natResultMode f
   | .seq _ b => modeOf b
   | .skip m => return some m
   | .caseInt _ alts out => do
@@ -366,6 +425,10 @@ def isPlus (op : String) : Bool := op == "+"
 
 -- ## Jumps
 
+/-- Leave the function: a plain routine returns a dummy of its result type. -/
+def retFn : L Unit := do
+  terminate (match (← get).fb.retTy with | some t => .retVal (.k t (.i 0)) | none => .ret)
+
 /-- The block that acts on a pending jump: to a label of this function, or out. -/
 def dispatchBlock : L Nat := do
   match (← get).fb.dispatch with
@@ -384,7 +447,7 @@ def dispatchBlock : L Nat := do
     terminate (.switch (.v k) #[] outB)
     modify fun s => { s with fb := { s.fb with dispatchSw := some (k, outB) } }
     switchTo outB
-    terminate .ret
+    retFn
     switchTo saved
     return b
 
@@ -411,6 +474,12 @@ def jumpCheck : L Unit := do
 
 def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true) : L Unit :=
   modify fun s => { s with fb := { s.fb with frames := { modes := modes, vars := vars, pushed := pushed } :: s.fb.frames } }
+
+/-- The routines the innermost frame's slots are known to hold. -/
+def setProcs (procs : Array (Option (Nat × CodeGen.NatSig))) : L Unit :=
+  modify fun s => match s.fb.frames with
+    | f :: fs => { s with fb := { s.fb with frames := { f with procs := procs } :: fs } }
+    | [] => s
 def popFrame : L Unit :=
   modify fun s => { s with fb := { s.fb with frames := s.fb.frames.tail } }
 
@@ -497,7 +566,11 @@ partial def lower (c : Core) : L Res := do
         emit (.set v (.un (.math n) x))
         return .sc (.v v)
       else lowerCall f args
-    | _, _ => lowerCall f args
+    | _, _ =>
+      match ← natCall f args with
+      | some (some o) => return .sc o
+      | some none => rt "a68rt_push_void"; return .stack
+      | none => lowerCall f args
   | .routine nparams frameSize body =>
     let idx ← lowerFunction nparams frameSize body
     rt "a68rt_push_proc" #[ku idx, ku nparams]
@@ -624,7 +697,7 @@ partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
     | _ => return none
   let fn := match ty with
     | .i64 => if emr matches .bits _ then "a68rt_row_bits" else "a68rt_row_int"
-    | .f64 => "a68rt_row_real" | .i1 => "a68rt_row_bool" | .i32 => "a68rt_row_char"
+    | .f64 => "a68rt_row_real" | .i1 => "a68rt_row_bool" | .i32 => "a68rt_row_char" | .ptr => ""
   let j := is[1]?.getD (ki 0)
   return some (.sc (.v (← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j])))
 
@@ -674,7 +747,7 @@ partial def selRead (c : Core) : L (Option Res) := do
   if fields.isEmpty then return none
   let fn := match ty with
     | .i64 => if mr matches .bits _ then "a68rt_sel_bits" else "a68rt_sel_int"
-    | .f64 => "a68rt_sel_real" | .i1 => "a68rt_sel_bool" | .i32 => "a68rt_sel_char"
+    | .f64 => "a68rt_sel_real" | .i1 => "a68rt_sel_bool" | .i32 => "a68rt_sel_char" | .ptr => ""
   return some (.sc (.v (← rtv fn #[ku d, ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields)])))
 
 /-- The general slice: the row and the indexers on the stack, then the runtime. -/
@@ -718,7 +791,7 @@ partial def storeTyped (dst src : Core) : L Bool := do
     let v ← toScalar (← lower src) mr
     let fn := match ty with
       | .i64 => if mr matches .bits _ then "a68rt_set_row_bits" else "a68rt_set_row_int"
-      | .f64 => "a68rt_set_row_real" | .i1 => "a68rt_set_row_bool" | .i32 => "a68rt_set_row_char"
+      | .f64 => "a68rt_set_row_real" | .i1 => "a68rt_set_row_bool" | .i32 => "a68rt_set_row_char" | .ptr => ""
     rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, is[1]?.getD (ki 0), v]
     return true
   | .select _ _ true =>
@@ -727,7 +800,7 @@ partial def storeTyped (dst src : Core) : L Bool := do
     let v ← toScalar (← lower src) mr
     let fn := match ty with
       | .i64 => if mr matches .bits _ then "a68rt_set_sel_bits" else "a68rt_set_sel_int"
-      | .f64 => "a68rt_set_sel_real" | .i1 => "a68rt_set_sel_bool" | .i32 => "a68rt_set_sel_char"
+      | .f64 => "a68rt_set_sel_real" | .i1 => "a68rt_set_sel_bool" | .i32 => "a68rt_set_sel_char" | .ptr => ""
     rt fn #[ku d, ku s, ku (specOf rank via fields), i, j, ku (fieldsWord fields), v]
     return true
   | _ => return false
@@ -883,6 +956,67 @@ partial def lowerCall (f : Core) (args : List Core) : L Res := do
   jumpCheck
   return .stack
 
+/-- The arguments of a plain call, evaluated left to right into scalars. -/
+partial def natArgs (ptys : Array CodeGen.CTy) (args : List Core) : L (Array Opnd) := do
+  let mut as : Array Opnd := #[]
+  for i in [0:args.length] do
+    as := as.push (← toScalar (← lower args[i]!) (ptys[i]!).toMode)
+  return as
+
+/-- A call that can go to a plain entry point: directly when the routine is known, else
+    through the table of entry points after reading the slot, falling back to the boxed
+    call for a routine without one.  `some none` is a completed VOID call; `none` says the
+    call is not a plain one. -/
+partial def natCall (f : Core) (args : List Core) : L (Option (Option Opnd)) := do
+  match ← staticNat f with
+  | some (k, sg) =>
+    if args.length != sg.ptys.size then return none
+    let as ← natArgs sg.ptys args
+    match sg.rty with
+    | some t =>
+      let v ← newVar (tyOfC t)
+      emit (.set v (.call (.nfn k) as))
+      jumpCheck
+      return some (some (.v v))
+    | none =>
+      emit (.call (.nfn k) as)
+      jumpCheck
+      return some none
+  | none =>
+  match ← dynNat f, CodeGen.strip f with
+  | some sg, .loadCell d s =>
+    if args.length != sg.ptys.size then return none
+    let ptys := sg.ptys.map tyOfC
+    let rty := sg.rty.map tyOfC
+    -- the slot is read first and the arguments are evaluated after it, once, on whichever
+    -- path is taken, which is the evaluator's order
+    let p ← rtv "a68rt_cell_cproc" #[ku (← rtd d), ku s]
+    let fp ← newVar .ptr
+    emit (.set fp (.natTab (.v p)))
+    let c ← newVar .i1
+    emit (.set c (.bin .ne (.v fp) (.k .ptr (.i 0))))
+    let rv : Option Var ← match rty with
+      | some t => pure (some (← newVar t))
+      | none => pure none
+    let thenB ← newBlock; let elseB ← newBlock; let done ← newBlock
+    terminate (.condBr (.v c) thenB elseB)
+    switchTo thenB
+    let as ← natArgs sg.ptys args
+    match rv with
+    | some v => emit (.set v (.call (.ind ptys rty) (#[.v fp] ++ as)))
+    | none => emit (.call (.ind ptys rty) (#[.v fp] ++ as))
+    jumpCheck
+    terminate (.br done)
+    switchTo elseB
+    let _ ← lowerCall f args
+    match rv, sg.rty with
+    | some v, some t => let o ← toScalar .stack t.toMode; emit (.set v (.opnd o))
+    | _, _ => rt "a68rt_pop"
+    terminate (.br done)
+    switchTo done
+    return some (rv.map (.v ·))
+  | _, _ => return none
+
 partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
   let r1 ← resolve m1
   let r2 ← resolve m2
@@ -953,6 +1087,13 @@ partial def lowerVoid (c : Core) : L Unit := do
   | .caseConf sel alts out => lowerConformity sel alts out; rt "a68rt_pop"
   | .goto l => lowerGoto l
   | .stop => rt "a68rt_stop"
+  | .call f args =>
+    match ← natCall f args with
+    | some _ => pure ()
+    | none =>
+      match ← lower c with
+      | .stack => rt "a68rt_pop"
+      | .sc _ => pure ()
   | _ =>
     match ← lower c with
     | .stack => rt "a68rt_pop"
@@ -1040,7 +1181,7 @@ partial def lowerGoto (l : Nat) : L Unit := do
   let fb := (← get).fb
   match fb.labelBlk.find? (·.1 == l) with
   | some (_, b) => terminate (.br b)
-  | none => rt "a68rt_raise_jump" #[ku l]; terminate .ret
+  | none => rt "a68rt_raise_jump" #[ku l]; retFn
   -- whatever follows is unreachable
   let dead ← newBlock
   switchTo dead
@@ -1135,6 +1276,33 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
       pvars := pvars.push (some { v := v, m := m, flag := flag })
     | _, _ => pvars := pvars.push none
   let pushed := plan.pushed || (List.range size).any fun i => (pvars[i]?.join).isNone
+  -- the routines with plain entry points this block declares; a routine sees those of its
+  -- own run of consecutive routine declarations and of the runs before it, since no unit
+  -- can run between the declarations of a run
+  let mut procsAll : Array (Option (Nat × CodeGen.NatSig)) := Array.replicate size none
+  let mut runOf : Array Nat := Array.replicate size 0
+  let mut runNo := 0
+  let mut inRun := false
+  for st in stmts do
+    match st with
+    | .decl sl dm init =>
+      match CodeGen.strip init, ← resolve dm with
+      | .routine np fsz body, dmr@(.proc _ _) =>
+        if !inRun then runNo := runNo + 1
+        inRun := true
+        match CodeGen.natSigOf dmr np fsz body with
+        | some sg =>
+          if sl < size && pushed && (pvars[sl]?.join).isNone then
+            let k ← reserveNative
+            procsAll := procsAll.set! sl (some (k, sg))
+            runOf := runOf.set! sl runNo
+        | none => pure ()
+      | _, _ => inRun := false
+    | _ => inRun := false
+  let visible (r : Nat) : Array (Option (Nat × CodeGen.NatSig)) :=
+    (Array.range size).map fun i => if runOf[i]! ≤ r then procsAll[i]! else none
+  runNo := 0
+  inRun := false
   -- where a jump lands: the depths to return to
   let depths : Option (Var × Var) ← if hasLabels then do
       let e ← rtv "a68rt_env_depth"
@@ -1168,11 +1336,20 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     | some (ty, m) => do let v ← newVar ty; pure (some (ty, v, m))
     | none => pure none
   for i in [0:stmts.size] do
+    -- which routines a call in this statement may go to directly
+    match stmts[i]! with
+    | .decl _ _ init =>
+      match CodeGen.strip init with
+      | .routine _ _ _ => if !inRun then runNo := runNo + 1; inRun := true
+      | _ => inRun := false
+    | _ => inRun := false
+    setProcs (visible runNo)
     match stmts[i]! with
     | .decl slot _ init =>
       match CodeGen.strip init, modes[slot]?.join with
       | .routine _ _ _, some pm@(.proc _ _) => modify fun st => { st with procMode := some pm }
       | _, _ => pure ()
+      let boxedIdx := (← get).fns.size
       match (pvars[slot]?).join with
       | some _ =>
         match CodeGen.strip init with
@@ -1189,6 +1366,12 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
           let _ ← lowerStack init
           rt "a68rt_store" #[ku 0, ku slot]
       modify fun st => { st with procMode := none }
+      match CodeGen.strip init, procsAll[slot]?.join with
+      | .routine np _ body, some (k, sg) =>
+        lowerNative k sg np body
+        if !CodeGen.outerRef 1 body then
+          modify fun st => { st with nfnOf := st.nfnOf.push (boxedIdx, k) }
+      | _, _ => pure ()
     | .unit e =>
       if vp[i]! == true then lowerVoid e
       else if onStack then do let _ ← lowerStack e; rt "a68rt_nip"
@@ -1248,6 +1431,36 @@ partial def lowerFunction (nparams frameSize : Nat) (body : Core) : L Nat := do
   modify fun st => { st with fns := st.fns.set! idx (some f), fb := saved }
   return idx
 
+/-- The plain entry point `a68_nf{k}` of a routine.  Its parameters are variables, no
+    run-time frame is pushed, and the frames outside it are those of its declaration, so
+    its depths translate exactly as they would in the boxed entry point. -/
+partial def lowerNative (k : Nat) (sg : CodeGen.NatSig) (nparams : Nat) (body : Core) : L Unit := do
+  let s ← get
+  let saved := s.fb
+  let outer := s.fb.frames.map fun f => { f with vars := #[] }
+  let ptys := sg.ptys.map tyOfC
+  let rty := sg.rty.map tyOfC
+  set { s with fb := { name := s!"a68_nf{k}", labels := CodeGen.labelsOf body, retTy := rty }, procMode := none }
+  let mut pvars : Array (Option PVar) := #[]
+  for i in [0:nparams] do
+    let v ← newVar (ptys[i]?.getD .i64)
+    pvars := pvars.push (some { v := v, m := (sg.ptys[i]?.getD .i64).toMode })
+  let pmodes : Array (Option Mode) := sg.ptys.map fun t => some t.toMode
+  let _ ← newBlock
+  modify fun st => { st with fb := { st.fb with frames := { modes := pmodes, vars := pvars, pushed := false } :: outer } }
+  match sg.rty with
+  | some t =>
+    let rv ← newVar (tyOfC t)
+    lowerInto (some (tyOfC t, rv, t.toMode)) body
+    terminate (.retVal (.v rv))
+  | none =>
+    lowerVoid body
+    terminate .ret
+  finishDispatch
+  let fb := (← get).fb
+  let f : Func := { name := fb.name, vars := fb.vars, blocks := fb.blocks, params := ptys, ret := rty }
+  modify fun st => { st with nfns := st.nfns.set! k (some f), fb := saved }
+
 /-- Format items: the dynamic parts become holes computed by compiled code. -/
 partial def lowerFmtItem (it : CoreFmt) : L CoreFmt := do
   match it with
@@ -1289,6 +1502,8 @@ def program (core : Core) (modes : Mode.Table) (ll : Nat) (regression : Bool)
       let (_, w) := w.add s!"n {si} {mi}"
       { st with w := w }) st
   return { fns := st.fns.map (·.getD default), holes := st.holes.map (·.getD default),
+           nfns := st.nfns.map (·.getD default),
+           nfnTab := (Array.range st.fns.size).map fun i => (st.nfnOf.find? (·.1 == i)).map (·.2),
            blob := st.w.render ++ "\n", src := srcName, ll := ll, regression := regression, echoes := echoes }
 
 end A68.Lower

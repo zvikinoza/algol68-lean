@@ -19,6 +19,7 @@ inductive Ty where
   | f64      -- REAL
   | i1       -- BOOL
   | i32      -- CHAR
+  | ptr      -- an opaque pointer: a native entry point
   deriving Repr, BEq, Inhabited, DecidableEq
 
 structure Var where
@@ -68,6 +69,8 @@ inductive Callee where
   | fn (idx : Nat)          -- a compiled routine, boxed convention (`a68_fn<idx>`)
   | hole (idx : Nat)        -- a format hole (`a68_hole<idx>`)
   | nat (name : String)     -- a native helper of the LLVM runtime support (`a68n_*`)
+  | nfn (idx : Nat)         -- a compiled routine, plain convention: typed arguments and result (`a68_nf<idx>`)
+  | ind (ptys : Array Ty) (rty : Option Ty)   -- a plain routine reached through a pointer: the first argument
   deriving Repr, BEq, Inhabited
 
 inductive Rhs where
@@ -75,6 +78,7 @@ inductive Rhs where
   | bin (op : BinOp) (a b : Opnd)
   | un (op : UnOp) (a : Opnd)
   | call (f : Callee) (args : Array Opnd)
+  | natTab (i : Opnd)       -- the plain entry point of boxed routine `i - 1`, null when it has none
   deriving Repr, Inhabited
 
 inductive Instr where
@@ -88,6 +92,7 @@ inductive Term where
   | condBr (c : Opnd) (t f : Nat)
   | switch (o : Opnd) (cases : Array (Int × Nat)) (dflt : Nat)
   | ret
+  | retVal (o : Opnd)
   | unreachable
   deriving Repr, Inhabited
 
@@ -100,6 +105,8 @@ structure Func where
   name   : String
   vars   : Array Ty := #[]
   blocks : Array Block := #[]     -- block 0 is the entry
+  params : Array Ty := #[]        -- a plain routine: its parameters are variables 0 .. params.size-1
+  ret    : Option Ty := none
   deriving Repr, Inhabited
 
 /-- A whole program: its routines, its format holes, the tables it carries and what
@@ -107,6 +114,8 @@ structure Func where
 structure Program where
   fns     : Array Func
   holes   : Array Func
+  nfns    : Array Func            -- the plain routines
+  nfnTab  : Array (Option Nat)    -- per boxed routine: its plain entry point, when a call through a value may use it
   blob    : String
   src     : String
   ll      : Nat
@@ -149,7 +158,7 @@ def rtSigs : List (String × RtSig) :=
     ("a68rt_set_cell_bits", ⟨#[u32, u32, .i64], .none⟩),
     ("a68rt_pop_int", ⟨#[], .i64⟩), ("a68rt_pop_real", ⟨#[], .f64⟩), ("a68rt_pop_bool", ⟨#[], .u8⟩),
     ("a68rt_pop_char", ⟨#[], .u32⟩), ("a68rt_pop_bits", ⟨#[], .i64⟩),
-    ("a68rt_cell_isnil", ⟨#[u32, u32], .u8⟩),
+    ("a68rt_cell_isnil", ⟨#[u32, u32], .u8⟩), ("a68rt_cell_cproc", ⟨#[u32, u32], .u32⟩),
     ("a68rt_row_int", ⟨#[u32, u32, u32, .i64, .i64], .i64⟩), ("a68rt_row_real", ⟨#[u32, u32, u32, .i64, .i64], .f64⟩),
     ("a68rt_row_bool", ⟨#[u32, u32, u32, .i64, .i64], .u8⟩), ("a68rt_row_char", ⟨#[u32, u32, u32, .i64, .i64], .u32⟩),
     ("a68rt_row_bits", ⟨#[u32, u32, u32, .i64, .i64], .i64⟩),
@@ -190,7 +199,7 @@ def RtRet.ty : RtRet → Option Ty
 -- ## A readable rendering, for `a68lean dump-mir` and for debugging
 
 def Ty.show : Ty → String
-  | .i64 => "i64" | .f64 => "f64" | .i1 => "i1" | .i32 => "i32"
+  | .i64 => "i64" | .f64 => "f64" | .i1 => "i1" | .i32 => "i32" | .ptr => "ptr"
 
 def Opnd.show : Opnd → String
   | .v x => s!"%{x.id}"
@@ -198,13 +207,14 @@ def Opnd.show : Opnd → String
   | .k _ (.f x) => toString x
 
 def Callee.show : Callee → String
-  | .rt n => n | .fn i => s!"fn{i}" | .hole i => s!"hole{i}" | .nat n => n
+  | .rt n => n | .fn i => s!"fn{i}" | .hole i => s!"hole{i}" | .nat n => n | .nfn i => s!"nf{i}" | .ind _ _ => "*"
 
 def Rhs.show : Rhs → String
   | .opnd o => o.show
   | .bin op a b => s!"{repr op} {a.show} {b.show}"
   | .un op a => s!"{repr op} {a.show}"
   | .call f as => s!"{f.show}({", ".intercalate (as.toList.map Opnd.show)})"
+  | .natTab i => s!"nf_of_fn[{i.show}]"
 
 def Instr.show : Instr → String
   | .set d r => s!"%{d.id} : {d.ty.show} = {r.show}"
@@ -216,10 +226,11 @@ def Term.show : Term → String
   | .condBr c t f => s!"br {c.show} ? b{t} : b{f}"
   | .switch o cs d => s!"switch {o.show} [{", ".intercalate (cs.toList.map fun (k, b) => s!"{k} -> b{b}")}] default b{d}"
   | .ret => "ret"
+  | .retVal o => s!"ret {o.show}"
   | .unreachable => "unreachable"
 
 def Func.show (f : Func) : String := Id.run do
-  let mut out := s!"{f.name}:\n"
+  let mut out := s!"{f.name}({", ".intercalate (f.params.toList.map Ty.show)}):\n"
   for i in [0:f.blocks.size] do
     let b := f.blocks[i]!
     out := out ++ s!"  b{i}:\n"
@@ -228,6 +239,6 @@ def Func.show (f : Func) : String := Id.run do
   return out
 
 def Program.show (p : Program) : String :=
-  String.join (p.fns.toList.map Func.show) ++ String.join (p.holes.toList.map Func.show)
+  String.join (p.fns.toList.map Func.show) ++ String.join (p.nfns.toList.map Func.show) ++ String.join (p.holes.toList.map Func.show)
 
 end A68.MIR
