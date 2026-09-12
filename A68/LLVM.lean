@@ -24,7 +24,7 @@ def retTyName : Option Ty → String
   | none => "void"
 
 def retName : RtRet → String
-  | .none => "void" | .i64 => "i64" | .f64 => "double" | .u8 => "i8" | .u32 => "i32"
+  | .none => "void" | .i64 => "i64" | .f64 => "double" | .u8 => "i8" | .u32 => "i32" | .ptr => "ptr"
 
 /-- A double as LLVM writes it: the IEEE bits in hexadecimal, exact for every value. -/
 def hexDouble (x : Float) : String :=
@@ -147,6 +147,65 @@ def plainArgs (ptys : Array Ty) (args : Array Opnd) : M String := do
     as := as.push s!"{tyName pty} {v}"
   return ", ".intercalate as.toList
 
+/-- A memory access, inline: `mem_ld_<w>(p, off)` loads `w` at byte offset `off` from `p`,
+    `mem_st_<w>(p, off, v)` stores; the narrow loads zero-extend, the narrow stores truncate. -/
+def memOp (name : String) (args : Array Opnd) (dst : Option Var) : M Unit := do
+  let p ← opnd args[0]!
+  let off ← opnd args[1]!
+  let off ← coerce off args[1]!.ty .i64
+  let g ← fresh
+  line s!"  {g} = getelementptr i8, ptr {p}, i64 {off}"
+  let w := name.drop 7
+  let narrow := w == "i8" || w == "i16" || w == "i32"
+  if name.startsWith "mem_ld_" then
+    let some d := dst | return
+    if narrow then
+      let t ← fresh; line s!"  {t} = load {w}, ptr {g}"
+      let z ← fresh; line s!"  {z} = zext {w} {t} to i64"
+      store d z
+    else if w == "f64" then do let t ← fresh; line s!"  {t} = load double, ptr {g}"; store d t
+    else if w == "ptr" then do let t ← fresh; line s!"  {t} = load ptr, ptr {g}"; store d t
+    else do let t ← fresh; line s!"  {t} = load i64, ptr {g}"; store d t
+  else
+    let v ← opnd args[2]!
+    if narrow then
+      let v ← coerce v args[2]!.ty .i64
+      let t ← fresh; line s!"  {t} = trunc i64 {v} to {w}"
+      line s!"  store {w} {t}, ptr {g}"
+    else if w == "f64" then line s!"  store double {v}, ptr {g}"
+    else do let v ← coerce v args[2]!.ty .i64; line s!"  store i64 {v}, ptr {g}"
+
+/-- A call of a runtime entry point (`a68rt_*`, trailing `i32 0`) or a native helper. -/
+def natCall (name : String) (args : Array Opnd) (dst : Option Var) : M Unit := do
+  use name
+  let isRt := name.startsWith "a68rt_"
+  let sg? : Option RtSig := if isRt then (rtSigs.find? (·.1 == name)).map (·.2) else (natSigs.find? (·.1 == name)).map (·.2)
+  let some (sg : RtSig) := sg? | line s!"  ; unknown runtime function {name}"
+  let mut as : Array String := #[]
+  for i in [0:args.size] do
+    let a := args[i]!
+    let pty : Ty := sg.args[i]?.getD a.ty
+    let v ← opnd a
+    let v ← coerce v a.ty pty
+    let v ← if pty == Ty.i1 then do let t ← fresh; line s!"  {t} = zext i1 {v} to i8"; pure t else pure v
+    as := as.push s!"{cTyName pty} {v}"
+  if isRt then as := as.push "i32 0"
+  let argText := ", ".intercalate as.toList
+  let ret : RtRet := sg.ret
+  match dst with
+  | none =>
+    if ret == RtRet.none then line s!"  call void @{name}({argText})"
+    else do let t ← fresh; line s!"  {t} = call {retName ret} @{name}({argText})"
+  | some d =>
+    let t ← fresh
+    line s!"  {t} = call {retName ret} @{name}({argText})"
+    match ret with
+    | RtRet.u8 => let b ← fresh; line s!"  {b} = icmp ne i8 {t}, 0"; store d b
+    | RtRet.u32 =>
+      if d.ty == Ty.i32 then store d t
+      else do let z ← fresh; line s!"  {z} = zext i32 {t} to i64"; store d z
+    | _ => store d t
+
 /-- A call; the C `uint8_t` arguments and results are `i8`. -/
 def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
   match f with
@@ -166,35 +225,9 @@ def call (f : Callee) (args : Array Opnd) (dst : Option Var) : M Unit := do
     | some d, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"; store d t
     | _, some r => let t ← fresh; line s!"  {t} = call {tyName r} {fp}({argText})"
     | _, none => line s!"  call void {fp}({argText})"
-  | .rt name | .nat name =>
-    use name
-    let isRt := match f with | .rt _ => true | _ => false
-    let sg? : Option RtSig := if isRt then (rtSigs.find? (·.1 == name)).map (·.2) else (natSigs.find? (·.1 == name)).map (·.2)
-    let some (sg : RtSig) := sg? | line s!"  ; unknown runtime function {name}"
-    let mut as : Array String := #[]
-    for i in [0:args.size] do
-      let a := args[i]!
-      let pty : Ty := sg.args[i]?.getD a.ty
-      let v ← opnd a
-      let v ← coerce v a.ty pty
-      let v ← if pty == Ty.i1 then do let t ← fresh; line s!"  {t} = zext i1 {v} to i8"; pure t else pure v
-      as := as.push s!"{cTyName pty} {v}"
-    if isRt then as := as.push "i32 0"
-    let argText := ", ".intercalate as.toList
-    let ret : RtRet := sg.ret
-    match dst with
-    | none =>
-      if ret == RtRet.none then line s!"  call void @{name}({argText})"
-      else do let t ← fresh; line s!"  {t} = call {retName ret} @{name}({argText})"
-    | some d =>
-      let t ← fresh
-      line s!"  {t} = call {retName ret} @{name}({argText})"
-      match ret with
-      | RtRet.u8 => let b ← fresh; line s!"  {b} = icmp ne i8 {t}, 0"; store d b
-      | RtRet.u32 =>
-        if d.ty == Ty.i32 then store d t
-        else do let z ← fresh; line s!"  {z} = zext i32 {t} to i64"; store d z
-      | _ => store d t
+  | .nat name =>
+    if name.startsWith "mem_" then memOp name args dst else natCall name args dst
+  | .rt name => natCall name args dst
 
 def bin (d : Var) (op : BinOp) (a b : Opnd) : M Unit := do
   let x ← opnd a
@@ -234,6 +267,13 @@ def bin (d : Var) (op : BinOp) (a b : Opnd) : M Unit := do
   | .andB => line s!"  {t} = and i1 {x}, {y}"
   | .orB => line s!"  {t} = or i1 {x}, {y}"
   | .xorB => line s!"  {t} = xor i1 {x}, {y}"
+  | .addW => line s!"  {t} = add i64 {x}, {y}"
+  | .subW => line s!"  {t} = sub i64 {x}, {y}"
+  | .mulW => line s!"  {t} = mul i64 {x}, {y}"
+  | .shlW => line s!"  {t} = shl i64 {x}, {y}"
+  | .shrW => line s!"  {t} = lshr i64 {x}, {y}"
+  | .andW => line s!"  {t} = and i64 {x}, {y}"
+  | .orW => line s!"  {t} = or i64 {x}, {y}"
   | .andU => line s!"  {t} = and i64 {x}, {y}"
   | .orU => let u ← fresh; line s!"  {u} = or i64 {x}, {y}"; line s!"  {t} = and i64 {u}, 4294967295"
   | .xorU => let u ← fresh; line s!"  {u} = xor i64 {x}, {y}"; line s!"  {t} = and i64 {u}, 4294967295"
@@ -403,6 +443,7 @@ def print (p : Program) : String := Id.run do
       let as := (sg.args.toList.map cTyName) ++ ["i32"]
       head := head.push s!"declare {retName sg.ret} @{n}({", ".intercalate as})"
     | none =>
+      if n.startsWith "mem_" then continue
       match natSigs.find? (·.1 == n) with
       | some (_, sg) =>
         let as := sg.args.toList.map cTyName

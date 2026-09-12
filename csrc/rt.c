@@ -910,12 +910,16 @@ void a68rt_raise_jump(uint32_t l, int w) { (void) w; a68_jump_flag = l + 1; }
 /* ---------------------------------------------------------------- environments */
 
 static int trace_env = -1;
-void a68rt_enter(uint32_t n, int w) {
+/* `enter` and `enter_args` return the new frame's cells, and `frame_cells` those of the
+   frame `depth` levels out, so that compiled code can address cells directly: a frame
+   is never moved, and one on the environment chain is never collected. */
+void* a68rt_enter(uint32_t n, int w) {
   GC_POLL(); (void) w; env = frame_alloc(n);
   if (trace_env < 0) trace_env = getenv("A68LEAN_TRACE") != NULL;
-  if (trace_env) fprintf(stderr, "enter(%u) depth=%u line=%u\n", n, env ? env->depth : 0, a68_line_no); }
+  if (trace_env) fprintf(stderr, "enter(%u) depth=%u line=%u\n", n, env ? env->depth : 0, a68_line_no);
+  return env->c; }
 
-void a68rt_enter_args(uint32_t n, uint32_t nargs, int w) {
+void* a68rt_enter_args(uint32_t n, uint32_t nargs, int w) {
   GC_POLL();
   (void) w;
   a68_frame* f = frame_alloc(n);
@@ -924,6 +928,15 @@ void a68rt_enter_args(uint32_t n, uint32_t nargs, int w) {
     if (i - 1 < n) slot_put(&f->c[i - 1], v);
   }
   env = f;
+  return f->c;
+}
+
+void* a68rt_frame_cells(uint32_t depth, int w) {
+  (void) w;
+  a68_frame* f = env;
+  for (uint32_t k = 0; k < depth && f; k++) f = f->parent;
+  if (!f) { fprintf(stderr, "a68lean: internal: frame depth %u out of range\n", depth); exit(1); }
+  return f->c;
 }
 
 uint32_t a68rt_heap_mark(int w) { (void) w; return 0; }
@@ -1937,7 +1950,10 @@ void a68rt_slice(uint32_t nidx, uint64_t kinds, uint8_t via_ref, int w) {
   push(out);
 }
 
-void a68rt_new_row(uint32_t ndims, uint8_t flex, int w) {
+/* `ek`: the leaf kind the elements will have when the initial value is undefined, so
+   that a row of a primitive mode starts as a leaf with every element undefined rather
+   than as slots of T_UNDEF: the same values, in the layout compiled code reads inline. */
+void a68rt_new_row_of(uint32_t ndims, uint8_t flex, uint32_t ek, int w) {
   GC_POLL();
   (void) w; (void) flex;
   if (sp < 2 * ndims + 1) { fprintf(stderr, "uncaught exception: operand stack underflow\n"); exit(1); }
@@ -1954,13 +1970,17 @@ void a68rt_new_row(uint32_t ndims, uint8_t flex, int w) {
   for (uint32_t k = ndims; k > 0; k--) { d->dim[k - 1].stride = stride; int64_t ext = d->dim[k - 1].u - d->dim[k - 1].l + 1; stride *= ext > 0 ? ext : 0; }
   d->off = 0;
   int64_t n = row_count(d);
-  a68_obj* st = store_alloc_for((uint32_t) n, &init);
-  if (st->kind == K_LEAF) { for (int64_t i = 0; i < n; i++) store_set(st, i, init); }
+  a68_obj* st = (init.tag == T_UNDEF && ek != 0) ? (a68_obj*) leaf_alloc((uint16_t) ek, (uint32_t) n)
+                                                 : store_alloc_for((uint32_t) n, &init);
+  if (init.tag == T_UNDEF && ek != 0) { /* a fresh leaf: every defined bit clear */ }
+  else if (st->kind == K_LEAF) { for (int64_t i = 0; i < n; i++) store_set(st, i, init); }
   else for (int64_t i = 0; i < n; i++) ((a68_slots*) st)->s[i] = unborrow(copy_value(init));
   st->rc = 1;
   d->base = st;
   push(mk_ptr(T_ROW, (a68_obj*) d, 0));
 }
+
+void a68rt_new_row(uint32_t ndims, uint8_t flex, int w) { a68rt_new_row_of(ndims, flex, 0, w); }
 
 void a68rt_gen(int w) {
   GC_POLL();

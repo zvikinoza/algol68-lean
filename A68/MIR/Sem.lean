@@ -184,9 +184,22 @@ def cmpB : BinOp → Bool → Bool → Option Val
   | .ne, a, b => some (.b (decide (a ≠ b)))
   | _, _, _ => none
 
+/-- Two's-complement 64-bit wrapping, as LLVM's `add`/`sub`/`mul` on `i64` compute. -/
+def wrap64 (n : Int) : Int := (n + 2 ^ 63) % 2 ^ 64 - 2 ^ 63
+
+/-- The bit pattern of an `i64` as a natural number. -/
+def toU64 (n : Int) : Nat := (n % 2 ^ 64).toNat
+
 /-- The meaning of a dyadic operation: `none` when its check fails (or its operands are
     of the wrong type). -/
 def binSem : BinOp → Val → Val → Option Val
+  | .addW, .i a, .i b => some (.i (wrap64 (a + b)))
+  | .subW, .i a, .i b => some (.i (wrap64 (a - b)))
+  | .mulW, .i a, .i b => some (.i (wrap64 (a * b)))
+  | .shlW, .i a, .i b => if b < 0 ∨ b ≥ 64 then none else some (.i (wrap64 (a * 2 ^ b.toNat)))
+  | .shrW, .i a, .i b => if b < 0 ∨ b ≥ 64 then none else some (.i ((toU64 a >>> b.toNat : Nat) : Int))
+  | .andW, .i a, .i b => some (.i (wrap64 ((toU64 a &&& toU64 b : Nat) : Int)))
+  | .orW, .i a, .i b => some (.i (wrap64 ((toU64 a ||| toU64 b : Nat) : Int)))
   | .addI, .i a, .i b => checkInt (a + b)
   | .subI, .i a, .i b => checkInt (a - b)
   | .mulI, .i a, .i b => checkInt (a * b)

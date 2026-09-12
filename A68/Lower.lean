@@ -48,6 +48,10 @@ structure FrameInfo where
   /-- per slot: the routine it certainly holds and its plain entry point, once a call can
       see its declaration -/
   procs  : Array (Option (Nat × CodeGen.NatSig)) := #[]
+  /-- the first cell of the run-time frame, when it is pushed: cells are addressed from it -/
+  cells  : Option Var := none
+  /-- a frame of the enclosing function, kept for its `procs`: its cells are captured -/
+  outer  : Bool := false
   deriving Inhabited
 
 /-- The function under construction. -/
@@ -62,6 +66,10 @@ structure FnB where
   dispatch : Option Nat := none            -- the block that acts on a pending jump
   dispatchSw : Option (Var × Nat) := none  -- its switch operand and the block that leaves the function
   retTy    : Option Ty := none             -- a plain routine: what it returns
+  hoist    : Array Instr := #[]            -- instructions to insert at the entry, after the frame is pushed
+  hoistAt  : Nat := 0                      -- where in block 0 they go
+  entryDepth : Nat := 0                    -- how many frames the entry pushes (0 or 1)
+  outerCells : List (Nat × Var) := []      -- per captured frame (0 = the declaring one): its cells
   deriving Inhabited
 
 structure St where
@@ -73,6 +81,7 @@ structure St where
   fb       : FnB := {}
   modeTab  : Mode.Table := {}
   procMode : Option Mode := none
+  rowHint  : Option Int := none            -- the leaf kind of the row generator being lowered
   deriving Inhabited
 
 abbrev L := StateM St
@@ -192,6 +201,189 @@ def pvarOf (d s : Nat) : L (Option PVar) := do
   match (← get).fb.frames[d]? with
   | some f => return (f.vars[s]?).join
   | none => return none
+
+/-- The address of cell `(d, s)`: a pointer to the first cell of its frame and a byte
+    offset.  The frames of this function keep their cells pointer; a captured frame's is
+    read once at the entry of the function (`hoist`), since frames never move and one on
+    the environment chain is never collected. -/
+def cellAddr (d s : Nat) : L (Option (Var × Int)) := do
+  let fb := (← get).fb
+  let own := (fb.frames.takeWhile (!·.outer)).length
+  match fb.frames[d]? with
+  | some f => if !f.outer then return f.cells.map fun b => (b, 16 * s) else captured fb (d - own) s
+  | none => captured fb (d - own) s
+where
+  /-- captured frame `k` (0 = the declaring one): its cells, read at the entry -/
+  captured (fb : FnB) (k s : Nat) : L (Option (Var × Int)) := do
+    match fb.outerCells.find? (·.1 == k) with
+    | some (_, b) => return some (b, 16 * s)
+    | none =>
+      let b ← newVar .ptr
+      modify fun st => { st with fb := { st.fb with
+        hoist := st.fb.hoist.push (.set b (.call (.rt "a68rt_frame_cells") #[ku (st.fb.entryDepth + k)])),
+        outerCells := (k, b) :: st.fb.outerCells } }
+      return some (b, 16 * s)
+
+/-- Put the hoisted instructions of the function in place. -/
+def finishHoist : L Unit :=
+  modify fun st =>
+    let fb := st.fb
+    if fb.hoist.isEmpty then st else
+    let b0 := fb.blocks[0]!
+    let instrs := b0.instrs.extract 0 fb.hoistAt ++ fb.hoist ++ b0.instrs.extract fb.hoistAt b0.instrs.size
+    { st with fb := { fb with blocks := fb.blocks.set! 0 { b0 with instrs := instrs }, hoist := #[] } }
+
+-- ## Memory: the runtime's objects, addressed inline
+
+def ld (w : String) (ty : Ty) (p : Var) (off : Opnd) : L Var := do
+  let v ← newVar ty
+  emit (.set v (.call (.nat s!"mem_ld_{w}") #[.v p, off]))
+  return v
+
+def st (w : String) (p : Var) (off : Opnd) (v : Opnd) : L Unit :=
+  emit (.call (.nat s!"mem_st_{w}") #[.v p, off, v])
+
+def binv (ty : Ty) (op : BinOp) (a b : Opnd) : L Var := do
+  let v ← newVar ty
+  emit (.set v (.bin op a b))
+  return v
+
+/-- Continue in a fresh block when `c` holds, else go to `no`. -/
+def guard (c : Opnd) (no : Nat) : L Unit := do
+  let yes ← newBlock
+  terminate (.condBr c yes no)
+  switchTo yes
+
+/-- The layout of the runtime's objects (`csrc/a68rt.h`). -/
+def T_ROW : Int := 9
+def K_LEAF : Int := 2
+def K_ROWD : Int := 3
+
+/-- A primitive element mode in a leaf store: its tag, its size in bytes, the memory width
+    it is read and written with, and the kind of `a68rt_undef_error`. -/
+structure ElemInfo where
+  ek   : Int
+  es   : Nat
+  w    : String
+  kind : Nat
+
+def elemInfo : Mode → Option ElemInfo
+  | .int 0 => some ⟨1, 8, "i64", 0⟩
+  | .real 0 => some ⟨2, 8, "f64", 1⟩
+  | .bool => some ⟨3, 1, "i8", 2⟩
+  | .char => some ⟨4, 1, "i8", 3⟩
+  | .bits 0 => some ⟨5, 8, "i64", 4⟩
+  | _ => none
+
+/-- The store and store index of `a[i]` or `a[i, j]` for the row cell `(b, off)` holds,
+    with the evaluator's subscript checks, continuing in the fast block; `slow` is taken
+    when the cell does not hold a row value itself, when its descriptor selects a field,
+    or when the store is not a leaf of the element's kind (`rt.c: row_elem`). -/
+def rowLeafElem (b : Var) (off : Int) (dims : Nat) (is : Array Opnd) (info : ElemInfo) (slow : Nat) : L (Var × Var × Var) := do
+  let tag ← ld "i32" .i64 b (ki off)
+  guard (.v (← binv .i1 .eq (.v tag) (ki T_ROW))) slow
+  let r ← ld "ptr" .ptr b (ki (off + 8))
+  let field ← ld "i32" .i64 r (ki 40)
+  guard (.v (← binv .i1 .eq (.v field) (ki 0))) slow
+  let mut idx : Var ← ld "i64" .i64 r (ki 32)
+  for k in [0:dims] do
+    let l ← ld "i64" .i64 r (ki (48 + 24 * k))
+    let u ← ld "i64" .i64 r (ki (56 + 24 * k))
+    let stride ← ld "i64" .i64 r (ki (64 + 24 * k))
+    let i := is[k]!
+    let ge ← binv .i1 .ge i (.v l)
+    let le ← binv .i1 .le i (.v u)
+    let inb ← binv .i1 .andB (.v ge) (.v le)
+    let errB ← newBlock
+    guard (.v inb) errB
+    let cur := (← get).fb.cur
+    switchTo errB
+    rt "a68rt_index_error" #[i, .v l, .v u]
+    terminate .unreachable
+    switchTo cur
+    let t ← binv .i64 .subW i (.v l)
+    let m ← binv .i64 .mulW (.v t) (.v stride)
+    idx ← binv .i64 .addW (.v idx) (.v m)
+  -- the store: through the owner when the descriptor is a view of another
+  let base ← ld "ptr" .ptr r (ki 24)
+  let bk ← ld "i8" .i64 base (ki 0)
+  let store ← newVar .ptr
+  emit (.set store (.opnd (.v base)))
+  let isView ← binv .i1 .eq (.v bk) (ki K_ROWD)
+  let viaB ← newBlock; let cont ← newBlock
+  terminate (.condBr (.v isView) viaB cont)
+  switchTo viaB
+  let inner ← ld "ptr" .ptr base (ki 24)
+  emit (.set store (.opnd (.v inner)))
+  terminate (.br cont)
+  switchTo cont
+  let sk ← ld "i8" .i64 store (ki 0)
+  guard (.v (← binv .i1 .eq (.v sk) (ki K_LEAF))) slow
+  let ek ← ld "i16" .i64 store (ki 2)
+  guard (.v (← binv .i1 .eq (.v ek) (ki info.ek))) slow
+  return (r, store, idx)
+
+/-- The byte of the leaf's defined bitmap for store index `idx`, its offset, and the mask
+    of the element's bit. -/
+def leafBit (store idx : Var) (es : Nat) : L (Var × Var × Var) := do
+  let n ← ld "i32" .i64 store (ki 4)
+  let bytes ← binv .i64 .mulW (.v n) (ki es)
+  let hi ← binv .i64 .shrW (.v idx) (ki 3)
+  let o1 ← binv .i64 .addW (.v bytes) (.v hi)
+  let boff ← binv .i64 .addW (.v o1) (ki 24)
+  let byte ← ld "i8" .i64 store (.v boff)
+  let lo ← binv .i64 .andW (.v idx) (ki 7)
+  let mask ← binv .i64 .shlW (ki 1) (.v lo)
+  return (byte, boff, mask)
+
+/-- The element at store index `idx` of a leaf, as a value of the element's MIR type;
+    an undefined element is reported as the evaluator reports it. -/
+def leafGet (store idx : Var) (info : ElemInfo) (ty : Ty) : L Var := do
+  let (byte, _, mask) ← leafBit store idx info.es
+  let bit ← binv .i64 .andW (.v byte) (.v mask)
+  let undefB ← newBlock
+  guard (.v (← binv .i1 .ne (.v bit) (ki 0))) undefB
+  let cur := (← get).fb.cur
+  switchTo undefB
+  rt "a68rt_undef_error" #[ku info.kind]
+  terminate .unreachable
+  switchTo cur
+  let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
+  let eoff ← binv .i64 .addW (.v eoff) (ki 24)
+  let raw ← ld info.w (if info.w == "f64" then .f64 else .i64) store (.v eoff)
+  match ty with
+  | .i1 => binv .i1 .ne (.v raw) (ki 0)
+  | .i32 => do let v ← newVar .i32; emit (.set v (.opnd (.v raw))); return v
+  | _ => return raw
+
+/-- Write the element at store index `idx` of a leaf and mark it defined. -/
+def leafSet (store idx : Var) (info : ElemInfo) (v : Opnd) : L Unit := do
+  let (byte, boff, mask) ← leafBit store idx info.es
+  let nb ← binv .i64 .orW (.v byte) (.v mask)
+  st "i8" store (.v boff) (.v nb)
+  let eoff ← binv .i64 .mulW (.v idx) (ki info.es)
+  let eoff ← binv .i64 .addW (.v eoff) (ki 24)
+  st info.w store (.v eoff) v
+
+/-- `a[i] := v` on the row cell `(d, s)` holds: inline when the cell holds a row value over
+    a leaf store of the element's kind that no other kept value shares (`rt.c: store_ref`
+    would copy it first), else the runtime entry point `fn`. -/
+def rowWrite (d s dims : Nat) (is : Array Opnd) (mr : Mode) (v : Opnd) (fn : String) : L Unit := do
+  let j := is[1]?.getD (ki 0)
+  match ← cellAddr d s, elemInfo mr with
+  | some (b, off), some info =>
+    let slow ← newBlock; let done ← newBlock
+    let (_, store, idx) ← rowLeafElem b off dims is info slow
+    let rc ← ld "i32" .i64 store (ki 8)
+    guard (.v (← binv .i1 .le (.v rc) (ki 1))) slow
+    if mr == .char then guard (.v (← binv .i1 .lt v (.k .i32 (.i 256)))) slow
+    leafSet store idx info v
+    terminate (.br done)
+    switchTo slow
+    rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, j, v]
+    terminate (.br done)
+    switchTo done
+  | _, _ => rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, j, v]
 
 /-- The routine a call certainly goes to, when it has a plain entry point that can be
     called right here: the callee is a slot known to hold that routine, and the frame the
@@ -479,8 +671,9 @@ def jumpCheck : L Unit := do
   terminate (.condBr (.v c) d cont)
   switchTo cont
 
-def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true) : L Unit :=
-  modify fun s => { s with fb := { s.fb with frames := { modes := modes, vars := vars, pushed := pushed } :: s.fb.frames } }
+def pushFrame (modes : Array (Option Mode)) (vars : Array (Option PVar) := #[]) (pushed : Bool := true)
+    (cells : Option Var := none) : L Unit :=
+  modify fun s => { s with fb := { s.fb with frames := { modes := modes, vars := vars, pushed := pushed, cells := cells } :: s.fb.frames } }
 
 /-- The routines the innermost frame's slots are known to hold. -/
 def setProcs (procs : Array (Option (Nat × CodeGen.NatSig))) : L Unit :=
@@ -592,9 +785,13 @@ partial def lower (c : Core) : L Res := do
     rt "a68rt_select" #[ku i, kb viaRef]
     return .stack
   | .newRow bounds init flex =>
+    let hint := (← get).rowHint
+    modify fun st => { st with rowHint := none }
     let _ ← lowerStack init
     for (l, u) in bounds do lowerStackM l (.int 0); lowerStackM u (.int 0)
-    rt "a68rt_new_row" #[ku bounds.length, kb flex]
+    match hint with
+    | some ek => rt "a68rt_new_row_of" #[ku bounds.length, kb flex, ku ek.toNat]
+    | none => rt "a68rt_new_row" #[ku bounds.length, kb flex]
     return .stack
   | .gen init => let _ ← lowerStack init; rt "a68rt_gen"; return .stack
   | .block size stmts _ _ => lowerBlock size stmts true
@@ -706,7 +903,22 @@ partial def rowRead (base : Core) (idx : List CoreIdx) : L (Option Res) := do
     | .i64 => if emr matches .bits _ then "a68rt_row_bits" else "a68rt_row_int"
     | .f64 => "a68rt_row_real" | .i1 => "a68rt_row_bool" | .i32 => "a68rt_row_char" | .ptr => ""
   let j := is[1]?.getD (ki 0)
-  return some (.sc (.v (← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j])))
+  match ← cellAddr d s, elemInfo emr with
+  | some (b, off), some info =>
+    -- inline when the cell holds a row over a leaf store, else the runtime
+    let res ← newVar ty
+    let slow ← newBlock; let done ← newBlock
+    let (_, store, idx) ← rowLeafElem b off dims is info slow
+    let v ← leafGet store idx info ty
+    emit (.set res (.opnd (.v v)))
+    terminate (.br done)
+    switchTo slow
+    let sv ← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j]
+    emit (.set res (.opnd (.v sv)))
+    terminate (.br done)
+    switchTo done
+    return some (.sc (.v res))
+  | _, _ => return some (.sc (.v (← rtv fn #[ku (← rtd d), ku s, ku dims, is[0]!, j])))
 
 /-- The selector chain of `f OF … OF x[i]` rooted at a cell, as the runtime's `sel_*`
     entry points take it: depth, slot, spec, i, j, fields. -/
@@ -799,7 +1011,7 @@ partial def storeTyped (dst src : Core) : L Bool := do
     let fn := match ty with
       | .i64 => if mr matches .bits _ then "a68rt_set_row_bits" else "a68rt_set_row_int"
       | .f64 => "a68rt_set_row_real" | .i1 => "a68rt_set_row_bool" | .i32 => "a68rt_set_row_char" | .ptr => ""
-    rt fn #[ku (← rtd d), ku s, ku dims, is[0]!, is[1]?.getD (ki 0), v]
+    rowWrite d s dims is mr v fn
     return true
   | .select _ _ true =>
     let some (d, s, rank, i, j, fields, via) ← selChain dst | return false
@@ -1024,6 +1236,30 @@ partial def natCall (f : Core) (args : List Core) : L (Option (Option Opnd)) := 
     return some (rv.map (.v ·))
   | _, _ => return none
 
+/-- `k LWB a` or `k UPB a` for a row a cell holds: the bound read from the descriptor when
+    the cell holds a row value, else `slowAct`, which leaves the result on the stack. -/
+partial def rowBound (isUpb : Bool) (k : Nat) (e : Core) (slowAct : L Unit) : L (Option Res) := do
+  let some (d, s, _) ← cellBase e | return none
+  let some m ← slotMode d s | return none
+  let .row dims _ _ ← resolve m | return none
+  if k < 1 || k > dims then return none
+  let some (b, off) ← cellAddr d s | return none
+  let res ← newVar .i64
+  let slow ← newBlock; let done ← newBlock
+  let tag ← ld "i32" .i64 b (ki off)
+  guard (.v (← binv .i1 .eq (.v tag) (ki T_ROW))) slow
+  let r ← ld "ptr" .ptr b (ki (off + 8))
+  let v ← ld "i64" .i64 r (ki (48 + 24 * (k - 1) + (if isUpb then 8 else 0)))
+  emit (.set res (.opnd (.v v)))
+  terminate (.br done)
+  switchTo slow
+  slowAct
+  let sv ← rtv "a68rt_pop_int"
+  emit (.set res (.opnd (.v sv)))
+  terminate (.br done)
+  switchTo done
+  return some (.sc (.v res))
+
 partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
   let r1 ← resolve m1
   let r2 ← resolve m2
@@ -1031,6 +1267,18 @@ partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
     lowerStackM l m1; lowerStackM r m2
     rt "a68rt_dyop" #[ku (← putStr op), ku (← putMode m1), ku (← putMode m2)]
     return .stack
+  -- `k LWB a`, `k UPB a` on a row a cell holds
+  if (op == "LWB" || op == "UPB") && r1 == .int 0 then
+    match CodeGen.strip l with
+    | .lit (.int k) =>
+      if k ≥ 1 then
+        let slowAct : L Unit := do
+          lowerStackM l m1; lowerStackM r m2
+          rt "a68rt_dyop" #[ku (← putStr op), ku (← putMode m1), ku (← putMode m2)]
+        match ← rowBound (op == "UPB") k.toNat r slowAct with
+        | some res => return res
+        | none => pure ()
+    | _ => pure ()
   -- REAL ** INT
   if op == "**" && r1 == .real 0 && r2 == .int 0 then
     let a ← toScalar (← lower l) r1
@@ -1073,6 +1321,13 @@ partial def lowerDyop (op : String) (m1 m2 : Mode) (l r : Core) : L Res := do
 
 partial def lowerMonop (op : String) (m : Mode) (e : Core) : L Res := do
   let mr ← resolve m
+  if op == "LWB" || op == "UPB" then
+    let slowAct : L Unit := do
+      lowerStackM e m
+      rt "a68rt_monop" #[ku (← putStr op), ku (← putMode m)]
+    match ← rowBound (op == "UPB") 1 e slowAct with
+    | some res => return res
+    | none => pure ()
   match tyOf mr, unOf op mr, monopResult op mr with
   | some _, some uop, some res =>
     let x ← toScalar (← lower e) mr
@@ -1192,11 +1447,9 @@ partial def lowerConformity (sel : Core) (alts : List (Mode × Option Nat × Cor
     let yes ← newBlock; let no ← newBlock
     terminate (.condBr (.v ok) yes no)
     switchTo yes
-    if slot.isSome then
-      rt "a68rt_enter" #[ku 1]
-      rt "a68rt_bind_cell" #[ku 0, ku 0]
-    else rt "a68rt_enter" #[ku 0]
-    pushFrame #[if slot.isSome then some m else none]
+    let cells ← rtv "a68rt_enter" #[ku (if slot.isSome then 1 else 0)]
+    if slot.isSome then rt "a68rt_bind_cell" #[ku 0, ku 0]
+    pushFrame #[if slot.isSome then some m else none] #[] true (some cells)
     let _ ← lowerStack body
     popFrame
     rt "a68rt_nip"
@@ -1252,13 +1505,14 @@ partial def lowerLoop (slot : Option Nat) (f b : Core) (t : Option Core) (w : Op
     | none => !others
   let pushed := !promote
   let frameSize := if slot.isSome then 1 else 0
+  let mut cells : Option Var := none
   if pushed then
-    rt "a68rt_enter" #[ku frameSize]
+    cells := some (← rtv "a68rt_enter" #[ku frameSize])
     match slot with
     | some sl => rt "a68rt_set_int" #[ku 0, ku sl, .v i]
     | none => pure ()
   pushFrame (if slot.isSome then #[some (.int 0)] else #[])
-    (if promote && slot.isSome then #[some { v := i, m := .int 0 }] else #[]) pushed
+    (if promote && slot.isSome then #[some { v := i, m := .int 0 }] else #[]) pushed cells
   match w with
   | some wc =>
     let cnd ← toScalar (← lower wc) .bool
@@ -1348,8 +1602,8 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     | .label id => lbl := lbl.push (id, ← newBlock)
     | _ => pure ()
   modify fun s => { s with fb := { s.fb with labelBlk := s.fb.labelBlk ++ lbl } }
-  if pushed then rt "a68rt_enter" #[ku size]
-  pushFrame modes pvars pushed
+  let cells : Option Var ← if pushed then some <$> rtv "a68rt_enter" #[ku size] else pure none
+  pushFrame modes pvars pushed cells
   -- the scalar mode every unit that may yield the block's value has, when they agree: the
   -- value then goes into a variable, so that it survives the frame and needs no stack
   let varTy : Option (Ty × Mode) ← if wantValue then do
@@ -1390,6 +1644,15 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
     | .decl slot _ init =>
       match CodeGen.strip init, modes[slot]?.join with
       | .routine _ _ _, some pm@(.proc _ _) => modify fun st => { st with procMode := some pm }
+      | .newRow _ _ _, some m =>
+        -- a row of a primitive mode starts life as a leaf store, which the inline element
+        -- access reads
+        match ← resolve m with
+        | .row _ _ em =>
+          match elemInfo (← resolve em) with
+          | some info => modify fun st => { st with rowHint := some info.ek }
+          | none => pure ()
+        | _ => pure ()
       | _, _ => pure ()
       let boxedIdx := (← get).fns.size
       match (pvars[slot]?).join with
@@ -1407,7 +1670,7 @@ partial def lowerBlock (size : Nat) (stmts : Array CoreStmt) (wantValue : Bool) 
         | none =>
           let _ ← lowerStack init
           rt "a68rt_store" #[ku 0, ku slot]
-      modify fun st => { st with procMode := none }
+      modify fun st => { st with procMode := none, rowHint := none }
       match CodeGen.strip init, procsAll[slot]?.join with
       | .routine np _ body, some (k, sg) =>
         lowerNative k sg np body
@@ -1459,8 +1722,9 @@ partial def lowerFunction (nparams frameSize : Nat) (body : Core) : L Nat := do
     | _ => none
   set { (← get) with fb := { name := s!"a68_fn{idx}", labels := CodeGen.labelsOf body }, procMode := none }
   let _ ← newBlock
-  rt "a68rt_enter_args" #[ku frameSize, ku nparams]
-  pushFrame pmodes
+  let cells ← rtv "a68rt_enter_args" #[ku frameSize, ku nparams]
+  modify fun st => { st with fb := { st.fb with hoistAt := st.fb.blocks[0]!.instrs.size, entryDepth := 1 } }
+  pushFrame pmodes #[] true (some cells)
   match resultMode with
   | some m => lowerStackM body m
   | none => lowerStack body
@@ -1468,6 +1732,7 @@ partial def lowerFunction (nparams frameSize : Nat) (body : Core) : L Nat := do
   rt "a68rt_leave"
   terminate .ret
   finishDispatch
+  finishHoist
   let fb := (← get).fb
   let f : Func := { name := fb.name, vars := fb.vars, blocks := fb.blocks }
   modify fun st => { st with fns := st.fns.set! idx (some f), fb := saved }
@@ -1479,7 +1744,7 @@ partial def lowerFunction (nparams frameSize : Nat) (body : Core) : L Nat := do
 partial def lowerNative (k : Nat) (sg : CodeGen.NatSig) (nparams : Nat) (body : Core) : L Unit := do
   let s ← get
   let saved := s.fb
-  let outer := s.fb.frames.map fun f => { f with vars := #[] }
+  let outer := s.fb.frames.map fun f => { f with vars := #[], cells := none, outer := true }
   let ptys := sg.ptys.map tyOfC
   let rty := sg.rty.map tyOfC
   set { s with fb := { name := s!"a68_nf{k}", labels := CodeGen.labelsOf body, retTy := rty }, procMode := none }
@@ -1499,6 +1764,7 @@ partial def lowerNative (k : Nat) (sg : CodeGen.NatSig) (nparams : Nat) (body : 
     lowerVoid body
     terminate .ret
   finishDispatch
+  finishHoist
   let fb := (← get).fb
   let f : Func := { name := fb.name, vars := fb.vars, blocks := fb.blocks, params := ptys, ret := rty }
   modify fun st => { st with nfns := st.nfns.set! k (some f), fb := saved }
@@ -1526,6 +1792,7 @@ partial def lowerHole (c : Core) : L Core := do
   lowerStack c
   terminate .ret
   finishDispatch
+  finishHoist
   let fb := (← get).fb
   let f : Func := { name := fb.name, vars := fb.vars, blocks := fb.blocks }
   modify fun st => { st with holes := st.holes.set! idx (some f), fb := saved }

@@ -53,6 +53,8 @@ inductive BinOp where
   | eq | ne | lt | le | gt | ge   -- on i64, f64, i32, i1 (BOOL = and /=)
   | andB | orB | xorB       -- BOOL (both operands evaluated)
   | andU | orU | xorU       -- BITS
+  | addW | subW | mulW      -- i64, wrapping, unchecked: address arithmetic
+  | shlW | shrW | andW | orW   -- i64 bit operations, unchecked: address arithmetic
   deriving Repr, BEq, Inhabited
 
 inductive UnOp where
@@ -127,7 +129,7 @@ structure Program where
     one takes the trailing dummy `int w`.  Result types: `i64`, `f64`, `i1` (a C
     `uint8_t`), `i32`, or none. -/
 inductive RtRet where
-  | none | i64 | f64 | u8 | u32
+  | none | i64 | f64 | u8 | u32 | ptr
   deriving Repr, BEq, Inhabited
 
 structure RtSig where
@@ -139,7 +141,8 @@ structure RtSig where
     `int64_t`/`uint64_t`; `i1` a `uint8_t`; `f64` a `double`. -/
 def rtSigs : List (String × RtSig) :=
   let u32 := Ty.i32
-  [ ("a68rt_enter", ⟨#[u32], .none⟩), ("a68rt_enter_args", ⟨#[u32, u32], .none⟩), ("a68rt_leave", ⟨#[], .none⟩),
+  [ ("a68rt_enter", ⟨#[u32], .ptr⟩), ("a68rt_enter_args", ⟨#[u32, u32], .ptr⟩), ("a68rt_leave", ⟨#[], .none⟩),
+    ("a68rt_frame_cells", ⟨#[u32], .ptr⟩),
     ("a68rt_env_depth", ⟨#[], .u32⟩), ("a68rt_env_truncate", ⟨#[u32], .none⟩),
     ("a68rt_stack_depth", ⟨#[], .u32⟩), ("a68rt_stack_truncate", ⟨#[u32], .none⟩),
     ("a68rt_jump_pending", ⟨#[], .u32⟩), ("a68rt_jump_clear", ⟨#[], .none⟩), ("a68rt_raise_jump", ⟨#[u32], .none⟩),
@@ -179,7 +182,7 @@ def rtSigs : List (String × RtSig) :=
     ("a68rt_voiding", ⟨#[], .none⟩), ("a68rt_assign", ⟨#[.i1], .none⟩), ("a68rt_ident_rel", ⟨#[.i1], .none⟩),
     ("a68rt_dyop", ⟨#[u32, u32, u32], .none⟩), ("a68rt_monop", ⟨#[u32, u32], .none⟩),
     ("a68rt_select", ⟨#[u32, .i1], .none⟩), ("a68rt_slice", ⟨#[u32, .i64, .i1], .none⟩),
-    ("a68rt_new_row", ⟨#[u32, .i1], .none⟩), ("a68rt_gen", ⟨#[], .none⟩),
+    ("a68rt_new_row", ⟨#[u32, .i1], .none⟩), ("a68rt_new_row_of", ⟨#[u32, .i1, u32], .none⟩), ("a68rt_gen", ⟨#[], .none⟩),
     ("a68rt_collateral", ⟨#[u32, .i1, u32], .none⟩), ("a68rt_push_proc", ⟨#[u32, u32], .none⟩),
     ("a68rt_push_format", ⟨#[u32], .none⟩), ("a68rt_case_index", ⟨#[u32], .u32⟩), ("a68rt_conform", ⟨#[u32, .i1], .u8⟩),
     ("a68rt_stop", ⟨#[], .none⟩), ("a68rt_line", ⟨#[u32], .none⟩),
@@ -189,12 +192,18 @@ def rtSigs : List (String × RtSig) :=
     LLVM instruction and a check. -/
 def natSigs : List (String × RtSig) :=
   [ ("a68n_pow_i", ⟨#[.i64, .i64], .i64⟩), ("a68n_pow_ri", ⟨#[.f64, .i64], .f64⟩), ("a68n_pow_rr", ⟨#[.f64, .f64], .f64⟩),
-    ("a68n_entier", ⟨#[.f64], .i64⟩), ("a68n_round", ⟨#[.f64], .i64⟩), ("a68n_echo", ⟨#[u32], .none⟩) ]
+    ("a68n_entier", ⟨#[.f64], .i64⟩), ("a68n_round", ⟨#[.f64], .i64⟩), ("a68n_echo", ⟨#[u32], .none⟩),
+    -- memory access, printed inline: a load or store of the given width at a byte offset from
+    -- a pointer; the narrow loads zero-extend to i64, the narrow stores truncate
+    ("mem_ld_i8", ⟨#[.ptr, .i64], .i64⟩), ("mem_ld_i16", ⟨#[.ptr, .i64], .i64⟩), ("mem_ld_i32", ⟨#[.ptr, .i64], .i64⟩),
+    ("mem_ld_i64", ⟨#[.ptr, .i64], .i64⟩), ("mem_ld_f64", ⟨#[.ptr, .i64], .f64⟩), ("mem_ld_ptr", ⟨#[.ptr, .i64], .ptr⟩),
+    ("mem_st_i8", ⟨#[.ptr, .i64, .i64], .none⟩), ("mem_st_i32", ⟨#[.ptr, .i64, .i64], .none⟩),
+    ("mem_st_i64", ⟨#[.ptr, .i64, .i64], .none⟩), ("mem_st_f64", ⟨#[.ptr, .i64, .f64], .none⟩) ]
 where u32 := Ty.i32
 
 /-- The result type of a runtime call as MIR sees it. -/
 def RtRet.ty : RtRet → Option Ty
-  | .none => Option.none | .i64 => some .i64 | .f64 => some .f64 | .u8 => some .i1 | .u32 => some .i32
+  | .none => Option.none | .i64 => some .i64 | .f64 => some .f64 | .u8 => some .i1 | .u32 => some .i32 | .ptr => some .ptr
 
 -- ## A readable rendering, for `a68lean dump-mir` and for debugging
 
